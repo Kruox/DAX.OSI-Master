@@ -1,0 +1,40 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <!-- Surface unused privates, redundant usings, and similar dead-code
+         signals as build warnings so the solution stays trim over time. -->
+    <AnalysisLevel>latest</AnalysisLevel>
+    <AnalysisMode>Recommended</AnalysisMode>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="12.0.1" />
+    <PackageReference Include="Avalonia.Desktop" Version="12.0.1" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.11.0" />
+    <!-- Explicit reference to expose SkiaSharp's compile-time API (already a transitive
+         dependency via Avalonia.Skia). Used by DOSIScreen to bake a Gaussian blur into
+         the wallpaper bitmap once, so window dragging on top of a blurred backdrop
+         doesn't pay a per-frame blur shader cost (and doesn't show the dirty-rect
+         "trailing blur" artifact that a live BlurEffect produces under the compositor). -->
+    <PackageReference Include="SkiaSharp" Version="3.119.3-preview.1.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AvaloniaResource Include="Resources\Wallpapers\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Remove="Resources\Fonts\CascadiaCode-Regular.ttf" />
+    <None Remove="Resources\Fonts\NotoSans-Regular.ttf" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AvaloniaResource Include="Resources\Fonts\CascadiaCode-Regular.ttf" />
+    <AvaloniaResource Include="Resources\Fonts\NotoSans-Regular.ttf" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="DAX.OSI/DAX.OSI.csproj" />
+  <Project Path="DOSI.CORE/DOSI.CORE.csproj" />
+</Solution>
