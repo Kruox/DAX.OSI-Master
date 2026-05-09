@@ -9,6 +9,7 @@ using Avalonia.Layout;
 using Avalonia.Media;
 using DOSI.CORE.AccentManagement;
 using DOSI.CORE.ProjectSystem;
+using DOSI.CORE.Security;
 using DOSI.CORE.UIComponents;
 using DOSI.CORE.UIComponents.WindowManagement;
 using DOSI.CORE.UserManagement;
@@ -753,7 +754,7 @@ public class DOSIIDE : DOSIWindow
         }
 
         string text;
-        try { text = File.ReadAllText(path); }
+        try { text = UserVault.ReadAllText(path); }
         catch { return; }
 
         var editor = new DOSICodeEditor
@@ -1384,7 +1385,7 @@ public class DOSIIDE : DOSIWindow
                         ShowOutput();
                         foreach (var d in diags) AppendOutput("[CodeBehind] " + d);
                     }
-                    File.WriteAllText(sourceTab.Path,
+                    UserVault.WriteAllText(sourceTab.Path,
                         DOSI.CORE.Designer.DOSIFormSerializer.Serialize(designer.Document));
                     designer.MarkClean();
                     designer.RefreshSelectedProperties();
@@ -1396,12 +1397,12 @@ public class DOSIIDE : DOSIWindow
 
             if (_activeTab.Editor != null)
             {
-                File.WriteAllText(_activeTab.Path, _activeTab.Editor.Text);
+                UserVault.WriteAllText(_activeTab.Path, _activeTab.Editor.Text);
                 _activeTab.Editor.MarkClean();
             }
             else if (_activeTab.Designer != null)
             {
-                File.WriteAllText(_activeTab.Path, _activeTab.Designer.GetSerialized());
+                UserVault.WriteAllText(_activeTab.Path, _activeTab.Designer.GetSerialized());
                 _activeTab.Designer.MarkClean();
             }
             UpdateDirtyState();
@@ -1417,12 +1418,12 @@ public class DOSIIDE : DOSIWindow
             {
                 if (t.Editor != null && t.Editor.IsDirty)
                 {
-                    File.WriteAllText(t.Path, t.Editor.Text);
+                    UserVault.WriteAllText(t.Path, t.Editor.Text);
                     t.Editor.MarkClean();
                 }
                 else if (t.Designer != null && t.Designer.IsDirty)
                 {
-                    File.WriteAllText(t.Path, t.Designer.GetSerialized());
+                    UserVault.WriteAllText(t.Path, t.Designer.GetSerialized());
                     t.Designer.MarkClean();
                 }
             }
@@ -1458,7 +1459,7 @@ public class DOSIIDE : DOSIWindow
             Directory.CreateDirectory(defaultDir);
             var fullPath = IOPath.Combine(defaultDir, name);
             if (!File.Exists(fullPath))
-                File.WriteAllText(fullPath, BuildNewFileContent(fullPath));
+                UserVault.WriteAllText(fullPath, BuildNewFileContent(fullPath));
 
             RefreshTree();
             OpenFile(fullPath);
@@ -1570,7 +1571,7 @@ public class DOSIIDE : DOSIWindow
             try { if (File.Exists(autoProgram)) File.Delete(autoProgram); } catch { /* best-effort */ }
 
             var formPath = IOPath.Combine(project.FolderPath, "Form1.dosiform");
-            File.WriteAllText(formPath, BuildNewFileContent(formPath));
+            UserVault.WriteAllText(formPath, BuildNewFileContent(formPath));
             RefreshTree();
             OpenFile(formPath);
         }
@@ -2114,7 +2115,7 @@ public class {className}
             Directory.CreateDirectory(folder);
             var fullPath = IOPath.Combine(folder, name);
             if (!File.Exists(fullPath))
-                File.WriteAllText(fullPath, BuildNewFileContent(fullPath));
+                UserVault.WriteAllText(fullPath, BuildNewFileContent(fullPath));
 
             _expandedFolders.Add(folder);
             RefreshTree();
@@ -2155,7 +2156,7 @@ public class {className}
             Directory.CreateDirectory(folder);
             var fullPath = IOPath.Combine(folder, name);
             if (!File.Exists(fullPath))
-                File.WriteAllText(fullPath, BuildNewFileContent(fullPath));
+                UserVault.WriteAllText(fullPath, BuildNewFileContent(fullPath));
 
             _expandedFolders.Add(folder);
             RefreshTree();

@@ -45,6 +45,23 @@ public sealed class DOSIUser
 
     /// <summary>Free-form per-user preferences (accent overrides, wallpaper, etc.).</summary>
     public Dictionary<string, string> Preferences { get; set; } = new();
+
+    // ----- File vault (transparent at-rest encryption; see DOSI.CORE.Security.UserVault) -----
+
+    /// <summary>Base64-encoded random salt used to derive the vault password key.</summary>
+    public string? VaultPasswordSalt { get; set; }
+
+    /// <summary>PBKDF2 iteration count used to derive the vault password key.</summary>
+    public int VaultPasswordIterations { get; set; }
+
+    /// <summary>
+    /// Base64-encoded data key wrapped (AES-GCM-encrypted) with the password key.
+    /// Layout: <c>ciphertext || tag</c>.
+    /// </summary>
+    public string? VaultWrappedDataKey { get; set; }
+
+    /// <summary>Base64-encoded AES-GCM nonce used when wrapping the data key.</summary>
+    public string? VaultDataKeyNonce { get; set; }
 }
 
 /// <summary>
@@ -98,6 +115,91 @@ public static class UserManager
 
     /// <summary>Raised when <see cref="CurrentUser"/> changes (sign-in or sign-out).</summary>
     public static event EventHandler<DOSIUser?>? CurrentUserChanged;
+
+    // ----- Security events (consumed by SecurityAuditLog and SessionLockManager) -----
+
+    /// <summary>Raised after a successful authentication. Argument is the username.</summary>
+    public static event EventHandler<string>? LoginSucceeded;
+
+    /// <summary>Raised after a failed authentication attempt. Argument is the username.</summary>
+    public static event EventHandler<string>? LoginFailed;
+
+    /// <summary>
+    /// Raised when an authentication attempt is rejected because the account
+    /// is currently locked out. Argument is (username, secondsUntilUnlock).
+    /// </summary>
+    public static event EventHandler<(string Username, int SecondsUntilUnlock)>? LoginLockedOut;
+
+    /// <summary>Raised after the user signs out (or is signed out by deletion).</summary>
+    public static event EventHandler<string>? UserSignedOut;
+
+    /// <summary>Raised after a password is successfully changed. Argument is the username.</summary>
+    public static event EventHandler<string>? PasswordChanged;
+
+    // ----- Login lockout (in-memory; resets on app restart by design) -----
+
+    /// <summary>Failed-attempt threshold before the lockout cool-down kicks in.</summary>
+    public const int FailedAttemptThreshold = 3;
+
+    /// <summary>Maximum lockout duration in seconds (cap on the exponential back-off).</summary>
+    public const int MaxLockoutSeconds = 300;
+
+    private sealed class LockoutEntry
+    {
+        public int FailureCount;
+        public DateTime? LockedUntilUtc;
+    }
+
+    private static readonly Dictionary<string, LockoutEntry> Lockouts =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Returns the number of seconds <paramref name="username"/> must wait
+    /// before another login attempt will be processed, or <c>0</c> if the
+    /// account is not currently locked out.
+    /// </summary>
+    public static int GetLockoutSecondsRemaining(string username)
+    {
+        if (string.IsNullOrWhiteSpace(username)) return 0;
+        lock (SyncRoot) { return GetLockoutSecondsRemainingNoLock(username); }
+    }
+
+    /// <summary>Clears the failed-attempt counter and lockout for the given user.</summary>
+    public static void ResetLockout(string username)
+    {
+        if (string.IsNullOrWhiteSpace(username)) return;
+        lock (SyncRoot) { Lockouts.Remove(username); }
+    }
+
+    private static int GetLockoutSecondsRemainingNoLock(string username)
+    {
+        if (!Lockouts.TryGetValue(username, out var entry)) return 0;
+        if (entry.LockedUntilUtc == null) return 0;
+        var remaining = (entry.LockedUntilUtc.Value - DateTime.UtcNow).TotalSeconds;
+        return remaining <= 0 ? 0 : (int)Math.Ceiling(remaining);
+    }
+
+    private static void RegisterFailedAttemptNoLock(string username)
+    {
+        if (!Lockouts.TryGetValue(username, out var entry))
+        {
+            entry = new LockoutEntry();
+            Lockouts[username] = entry;
+        }
+        entry.FailureCount++;
+        var seconds = ComputeLockoutSeconds(entry.FailureCount);
+        entry.LockedUntilUtc = seconds > 0 ? DateTime.UtcNow.AddSeconds(seconds) : (DateTime?)null;
+    }
+
+    private static int ComputeLockoutSeconds(int failureCount)
+    {
+        // Exponential back-off after FailedAttemptThreshold failures:
+        // attempt 4 -> 5s, 5 -> 15s, 6 -> 45s, 7 -> 135s, 8+ -> capped at MaxLockoutSeconds.
+        var over = failureCount - FailedAttemptThreshold;
+        if (over <= 0) return 0;
+        var seconds = (int)Math.Min(MaxLockoutSeconds, 5L * (long)Math.Pow(3, over - 1));
+        return seconds;
+    }
 
     /// <summary>The absolute path to the root <c>Users</c> directory.</summary>
     public static string UsersRootPath => Path.Combine(AppContext.BaseDirectory, UsersFolderName);
@@ -361,14 +463,17 @@ public static class UserManager
         return UsernamePattern.IsMatch(username.Trim().ToLowerInvariant());
     }
 
+    /// <summary>Minimum allowed password length for new accounts and password changes.</summary>
+    public const int MinimumPasswordLength = 8;
+
     /// <summary>
     /// Returns <c>true</c> if the password meets minimum complexity requirements
-    /// (at least 4 characters, no leading/trailing whitespace).
+    /// (at least <see cref="MinimumPasswordLength"/> characters, no leading/trailing whitespace).
     /// </summary>
     public static bool IsValidPassword(string? password)
     {
         if (string.IsNullOrEmpty(password)) return false;
-        if (password.Length < 4) return false;
+        if (password.Length < MinimumPasswordLength) return false;
         if (password != password.Trim()) return false;
         return true;
     }
@@ -585,17 +690,38 @@ public static class UserManager
     /// <summary>
     /// Validates credentials and, on success, sets <see cref="CurrentUser"/>, updates
     /// <see cref="DOSIUser.LastLoginUtc"/>, persists the change, and returns the user.
+    /// Failed attempts increment a per-username counter; after
+    /// <see cref="FailedAttemptThreshold"/> failures the account is locked out
+    /// with an exponential cool-down (capped at <see cref="MaxLockoutSeconds"/>).
     /// </summary>
     public static DOSIUser? Authenticate(string username, string password)
     {
         if (!IsValidUsername(username) || string.IsNullOrEmpty(password)) return null;
 
+        var normalized = NormalizeUsername(username);
+
+        // Lockout gate: avoid running PBKDF2 for a known-locked account.
+        int locked;
+        lock (SyncRoot) { locked = GetLockoutSecondsRemainingNoLock(normalized); }
+        if (locked > 0)
+        {
+            LoginLockedOut?.Invoke(null, (normalized, locked));
+            return null;
+        }
+
         DOSIUser? user;
         lock (SyncRoot)
         {
-            user = LoadUserFromDisk(username);
-            if (user == null) return null;
-            if (!VerifyPassword(password, user)) return null;
+            user = LoadUserFromDisk(normalized);
+            if (user == null || !VerifyPassword(password, user))
+            {
+                RegisterFailedAttemptNoLock(normalized);
+                LoginFailed?.Invoke(null, normalized);
+                return null;
+            }
+
+            // Success - clear any prior lockout.
+            Lockouts.Remove(normalized);
 
             user.LastLoginUtc = DateTime.UtcNow;
             try { WriteUserToDisk(user); } catch { /* best-effort */ }
@@ -607,7 +733,22 @@ public static class UserManager
             CurrentUser = user;
         }
 
+        // Vault key handling: if the vault has been enabled, unwrap it now so
+        // file IO that goes through UserVault can transparently decrypt.
+        // If it hasn't been enabled yet, lazily enable it on this sign-in so
+        // future writes are encrypted (but never auto-encrypt existing files -
+        // that requires explicit migration).
+        if (DOSI.CORE.Security.UserVault.IsEnabledForUser(user))
+        {
+            DOSI.CORE.Security.UserVault.Unlock(user, password);
+        }
+        else
+        {
+            DOSI.CORE.Security.UserVault.EnableForUser(user, password);
+        }
+
         CurrentUserChanged?.Invoke(null, user);
+        LoginSucceeded?.Invoke(null, user.Username);
         return user;
     }
 
@@ -626,7 +767,7 @@ public static class UserManager
         }
 
         CurrentUserChanged?.Invoke(null, null);
-        _ = previous;
+        UserSignedOut?.Invoke(null, previous!.Username);
     }
 
     /// <summary>
@@ -649,6 +790,11 @@ public static class UserManager
             try
             {
                 WriteUserToDisk(user);
+                // Re-wrap the vault data key with the new password so encrypted
+                // files remain readable. Requires the vault to be unlocked
+                // (it is, when the active user changes their own password).
+                try { DOSI.CORE.Security.UserVault.RewrapForPasswordChange(user, newPassword); } catch { /* best-effort */ }
+                PasswordChanged?.Invoke(null, user.Username);
                 return true;
             }
             catch
@@ -662,8 +808,10 @@ public static class UserManager
     public static void Logout()
     {
         if (CurrentUser == null) return;
+        var previousName = CurrentUser.Username;
         CurrentUser = null;
         CurrentUserChanged?.Invoke(null, null);
+        UserSignedOut?.Invoke(null, previousName);
     }
 
     #endregion

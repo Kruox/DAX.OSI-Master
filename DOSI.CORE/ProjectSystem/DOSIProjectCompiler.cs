@@ -9,6 +9,7 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Emit;
+using DOSI.CORE.Security;
 
 namespace DOSI.CORE.ProjectSystem;
 
@@ -58,7 +59,7 @@ public static class DOSIProjectCompiler
             .Select(p =>
             {
                 string text;
-                try { text = File.ReadAllText(p); }
+                try { text = UserVault.ReadAllText(p); }
                 catch (Exception ex) { return (Tree: (SyntaxTree?)null, Error: $"{p}: {ex.Message}"); }
 
                 // Allow "script-style" files (top-level statements + no class/namespace)

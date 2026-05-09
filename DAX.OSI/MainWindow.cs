@@ -5,6 +5,7 @@ using Avalonia.Media;
 using DAX.OSI.DefaultApplications;
 using DAX.OSI.UI;
 using DOSI.CORE;
+using DOSI.CORE.Security;
 using DOSI.CORE.UIComponents;
 using DOSI.CORE.UIComponents.WindowManagement;
 using DOSI.CORE.UserManagement;
@@ -48,6 +49,16 @@ public class MainWindow : Window
     /// <summary>Top layer for screen-attached chrome (taskbar, apps menu, popups).</summary>
     private readonly Canvas _popupOverlay;
 
+    /// <summary>
+    /// Topmost overlay used by <see cref="DOSI.CORE.Security.SessionLockManager"/>
+    /// to host the lock screen above all other UI when the session is locked.
+    /// Empty / not hit-testable while the session is unlocked.
+    /// </summary>
+    private readonly Panel _lockOverlay;
+
+    /// <summary>Per-app-instance session lock manager (idle timeout + manual lock).</summary>
+    private readonly SessionLockManager _sessionLock;
+
     /// <summary>Static accessor for the application-wide popup overlay panel.</summary>
     public static Panel? PopupHost { get; private set; }
 
@@ -79,6 +90,13 @@ public class MainWindow : Window
         _popupOverlay = new Canvas { Background = null, ClipToBounds = false };
         PopupHost = _popupOverlay;
 
+        _lockOverlay = new Panel
+        {
+            Background = null,
+            IsHitTestVisible = false,
+            ClipToBounds = false
+        };
+
         var rootGrid = new Grid
         {
             HorizontalAlignment = HorizontalAlignment.Stretch,
@@ -87,10 +105,25 @@ public class MainWindow : Window
             //   1. screenContainer  - active DOSIScreen (wallpaper, login UI, ...)
             //   2. _globalOverlay   - all DOSIWindow instances (persists across screens)
             //   3. _popupOverlay    - taskbar, apps menu, notifications - always on top
-            Children = { screenContainer, _globalOverlay, _popupOverlay }
+            //   4. _lockOverlay     - session lock screen (above EVERYTHING when active)
+            Children = { screenContainer, _globalOverlay, _popupOverlay, _lockOverlay }
         };
 
         Content = rootGrid;
+
+        // One-time wiring of the per-user audit log (no-op if already done).
+        SecurityAuditLog.Initialize();
+
+        // Session lock manager: idle detection + lock screen plumbing.
+        // Started after sign-in (OnSignInCompleted), stopped on sign-out.
+        _sessionLock = new SessionLockManager(
+            lockHost: _lockOverlay,
+            inputSource: this,
+            lockScreenFactory: user => new LockScreen(user));
+        _sessionLock.SignOutRequested += (_, _) =>
+        {
+            try { SystemSignOut.Begin(); } catch { /* best effort */ }
+        };
 
         _screenManager = new ScreenManager(screenContainer);
         _bootScreen = new BootScreen();
@@ -155,6 +188,10 @@ public class MainWindow : Window
     {
         // Capture the user before we clear it so the screen can greet them.
         var leavingUser = UserManager.CurrentUser;
+
+        // Stop the idle-lock tracker (and dismiss the lock screen if active)
+        // before we tear down the user's session.
+        _sessionLock.Stop();
 
         // Disable input on the overlays (windows + desktop chrome) and start
         // their fade-out in parallel with the crossfade to the signout screen.
@@ -381,6 +418,9 @@ public class MainWindow : Window
 
         _globalOverlay.IsHitTestVisible = true;
         _popupOverlay.IsHitTestVisible = true;
+
+        // Begin idle-lock tracking for the freshly signed-in user.
+        _sessionLock.Start();
     }
 }
 
