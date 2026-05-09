@@ -36,6 +36,16 @@ public class DOSIPopNotification : Border
     private static readonly List<DOSIPopNotification> _active = [];
     private static Panel? _host;
 
+    /// <summary>
+    /// Application-wide default host panel for notifications. When set
+    /// (typically once at startup by <c>MainWindow</c> to the popup overlay
+    /// layer that sits ABOVE all <see cref="WindowManagement.DOSIWindow"/>
+    /// instances), the parameterless <see cref="Show(string,TimeSpan?)"/>
+    /// overload will use it. This guarantees toasts float over maximized
+    /// or fullscreen windows.
+    /// </summary>
+    public static Panel? DefaultHost { get; set; }
+
     private static AccentManager Accents => AccentManager.Instance;
 
     /// <summary>
@@ -56,6 +66,19 @@ public class DOSIPopNotification : Border
         ReflowStack(animate: true);
         _ = notif.RunLifecycleAsync(lifetime ?? DefaultLifetime);
         return notif;
+    }
+
+    /// <summary>
+    /// Displays a notification on <see cref="DefaultHost"/> (or the most
+    /// recently used host as a fallback). Throws <see cref="InvalidOperationException"/>
+    /// if no host has been registered yet.
+    /// </summary>
+    public static DOSIPopNotification Show(string text, TimeSpan? lifetime = null)
+    {
+        var host = DefaultHost ?? _host
+            ?? throw new InvalidOperationException(
+                "DOSIPopNotification.DefaultHost has not been set. Call Show(host, text) at least once or assign DefaultHost.");
+        return Show(host, text, lifetime);
     }
 
     private static void ReflowStack(bool animate)

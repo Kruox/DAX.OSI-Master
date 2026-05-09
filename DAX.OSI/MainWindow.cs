@@ -90,6 +90,11 @@ public class MainWindow : Window
         _popupOverlay = new Canvas { Background = null, ClipToBounds = false };
         PopupHost = _popupOverlay;
 
+        // Make the popup overlay the application-wide default host for toast
+        // notifications. This layer sits above _globalOverlay (DOSIWindows),
+        // so toasts always float on top - even over maximized/fullscreen apps.
+        DOSIPopNotification.DefaultHost = _popupOverlay;
+
         _lockOverlay = new Panel
         {
             Background = null,
@@ -131,21 +136,23 @@ public class MainWindow : Window
 
         // Native-rendered controls (e.g. the browser's WebView) are composed
         // by the OS above Avalonia's surface, so they would punch through the
-        // lock overlay. Hide the global window layer and chrome layer entirely
-        // while locked so nothing leaks through; restore on unlock.
-        _sessionLock.Locked += (_, _) =>
+        // lock overlay. Fade out the global window layer and chrome layer
+        // entirely while locked so nothing leaks through; fade back on unlock.
+        _sessionLock.Locked += async (_, _) =>
         {
+            await FadeOverlaysAsync(_globalOverlay.Opacity, 0d, 350);
             _globalOverlay.IsVisible = false;
             _globalOverlay.IsHitTestVisible = false;
             _popupOverlay.IsVisible = false;
             _popupOverlay.IsHitTestVisible = false;
         };
-        _sessionLock.Unlocked += (_, _) =>
+        _sessionLock.Unlocked += async (_, _) =>
         {
             _globalOverlay.IsVisible = true;
             _globalOverlay.IsHitTestVisible = true;
             _popupOverlay.IsVisible = true;
             _popupOverlay.IsHitTestVisible = true;
+            await FadeOverlaysAsync(0d, 1d, 350);
         };
 
         _screenManager = new ScreenManager(screenContainer);

@@ -4,6 +4,8 @@ using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Interactivity;
 using Avalonia.Threading;
+using DOSI.CORE.Animations;
+using DOSI.CORE.UIComponents;
 using DOSI.CORE.UserManagement;
 
 namespace DOSI.CORE.Security;
@@ -44,7 +46,18 @@ public sealed class SessionLockManager : IDisposable
     private DispatcherTimer? _idleTimer;
     private DateTime _lastActivityUtc = DateTime.UtcNow;
     private Control? _activeLockControl;
+    private Tween? _activeFadeTween;
     private bool _running;
+    private bool _idleWarningShown;
+
+    /// <summary>
+    /// Number of seconds before the lock fires that the manager will show a
+    /// "locking soon" toast notification. Set to 0 to disable the warning.
+    /// </summary>
+    public const int IdleWarningSeconds = 60;
+
+    /// <summary>Duration of the lock screen fade-in / fade-out animations.</summary>
+    public const int LockFadeMilliseconds = 350;
 
     /// <summary>The currently-active manager, or <c>null</c> if none has been started.</summary>
     public static SessionLockManager? Instance { get; private set; }
@@ -123,7 +136,7 @@ public sealed class SessionLockManager : IDisposable
 
         if (_idleTimer != null) { _idleTimer.Stop(); _idleTimer.Tick -= OnIdleTick; _idleTimer = null; }
 
-        if (_activeLockControl != null) DismissLockScreenInternal();
+        if (_activeLockControl != null) DismissImmediate();
 
         if (Instance == this) Instance = null;
     }
@@ -162,6 +175,7 @@ public sealed class SessionLockManager : IDisposable
     private void OnActivity(object? sender, RoutedEventArgs e)
     {
         if (_activeLockControl != null) return; // ignore activity while locked
+        _idleWarningShown = false;
         NotifyActivity();
     }
 
@@ -172,7 +186,25 @@ public sealed class SessionLockManager : IDisposable
         if (minutes <= DisabledIdleMinutes) return;
 
         var idle = DateTime.UtcNow - _lastActivityUtc;
-        if (idle.TotalMinutes >= minutes) ShowLockScreenInternal();
+        var lockAtSeconds = minutes * 60d;
+        var idleSeconds = idle.TotalSeconds;
+
+        // One-minute warning: only show when the configured timeout is at
+        // least 2 minutes (a 1-minute timeout would warn immediately).
+        if (IdleWarningSeconds > 0 && !_idleWarningShown && minutes >= 2 &&
+            idleSeconds >= lockAtSeconds - IdleWarningSeconds && idleSeconds < lockAtSeconds)
+        {
+            _idleWarningShown = true;
+            try
+            {
+                DOSIPopNotification.Show(
+                    "Session will lock in 1 minute. Move the mouse to stay signed in.",
+                    TimeSpan.FromSeconds(8));
+            }
+            catch { /* host may not be set yet during early boot - ignore */ }
+        }
+
+        if (idleSeconds >= lockAtSeconds) ShowLockScreenInternal();
     }
 
     private void ShowLockScreenInternal()
@@ -186,24 +218,59 @@ public sealed class SessionLockManager : IDisposable
 
         // Discover Unlocked / SignOutRequested events via reflection so the
         // manager doesn't take a hard dependency on a specific lock-screen type.
-        WireEvent(control, "Unlocked", () => { DismissLockScreenInternal(); Unlocked?.Invoke(this, EventArgs.Empty); });
-        WireEvent(control, "SignOutRequested", () => { DismissLockScreenInternal(); SignOutRequested?.Invoke(this, EventArgs.Empty); });
+        WireEvent(control, "Unlocked", () => DismissWithFade());
+        WireEvent(control, "SignOutRequested", () =>
+        {
+            // Sign-out doesn't need a fade-out (the host runs its own farewell
+            // animation), but we still need to remove our control + fire the
+            // event so the host can react.
+            DismissImmediate();
+            SignOutRequested?.Invoke(this, EventArgs.Empty);
+        });
 
         _activeLockControl = control;
+        control.Opacity = 0;
         _lockHost.Children.Add(control);
         _lockHost.IsHitTestVisible = true;
         _lockHost.IsVisible = true;
 
         SecurityAuditLog.AppendForUser(user.Username, SecurityAuditEventType.SessionLocked, null);
         Locked?.Invoke(this, EventArgs.Empty);
+
+        // Fade in over LockFadeMilliseconds (parallel with the host fading
+        // its own overlays out).
+        _activeFadeTween?.Stop(snapToEnd: true);
+        _activeFadeTween = Tween.Run(
+            durationMs: LockFadeMilliseconds,
+            ease: Easings.EaseOutCubic,
+            apply: t => { if (_activeLockControl != null) _activeLockControl.Opacity = t; });
     }
 
-    private void DismissLockScreenInternal()
+    private void DismissWithFade()
     {
         if (_activeLockControl == null) return;
+        var control = _activeLockControl;
+        // Fire Unlocked immediately so the host can fade its overlays back
+        // in parallel with our fade-out (no perceived dead time).
+        Unlocked?.Invoke(this, EventArgs.Empty);
+
+        _activeFadeTween?.Stop(snapToEnd: true);
+        _activeFadeTween = Tween.Run(
+            durationMs: LockFadeMilliseconds,
+            ease: Easings.EaseInCubic,
+            apply: t => { control.Opacity = 1d - t; },
+            onCompleted: DismissImmediate);
+    }
+
+    private void DismissImmediate()
+    {
+        if (_activeLockControl == null) return;
+        _activeFadeTween?.Stop();
+        _activeFadeTween = null;
         _lockHost.Children.Remove(_activeLockControl);
         _activeLockControl = null;
         _lastActivityUtc = DateTime.UtcNow;
+        _idleWarningShown = false;
     }
 
     private static void WireEvent(object target, string eventName, Action handler)

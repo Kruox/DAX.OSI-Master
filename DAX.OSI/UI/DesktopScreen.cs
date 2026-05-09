@@ -416,7 +416,7 @@ public class DesktopScreen : DOSIScreen
             var name = UserManager.CurrentUser?.DisplayName
                        ?? UserManager.CurrentUser?.Username
                        ?? "User";
-            DOSIPopNotification.Show(_layoutRoot, $"Welcome, {name}");
+            DOSIPopNotification.Show($"Welcome, {name}");
         }, DispatcherPriority.Loaded);
     }
 
