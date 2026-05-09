@@ -1949,13 +1949,16 @@ public class DOSIIDE : DOSIWindow
         AppendOutput($"[Rename] {oldName} -> {renamed.Name}");
     }
 
-    private void RunBuildOrRun(bool runAfter)
+    private async void RunBuildOrRun(bool runAfter)
     {
         ShowOutput();
         StartBuildSpinner(runAfter ? "Running" : "Building");
         bool success = false;
         try
         {
+            // Yield ~one frame so the spinner gets a chance to paint and tick
+            // before the synchronous Roslyn compile blocks the UI thread.
+            await System.Threading.Tasks.Task.Delay(50);
             success = RunBuildOrRunCore(runAfter);
         }
         finally
@@ -2965,24 +2968,26 @@ public class {className}
         {
             Text = "Properties \u2014 " + _activeProject.Name,
             FontSize = 12,
-            VerticalAlignment = VerticalAlignment.Center,
-            Foreground = new SolidColorBrush(Accents.TextOnAccent)
+            FontWeight = FontWeight.SemiBold,
+            Foreground = Accents.TextPrimaryBrush,
+            VerticalAlignment = VerticalAlignment.Center
         };
         var dirtyMark = new TextBlock
         {
             Text = "",
             FontSize = 14,
-            Margin = new Thickness(6, 0, 0, 0),
+            FontWeight = FontWeight.Bold,
+            Foreground = new SolidColorBrush(Accents.AccentPrimary),
             VerticalAlignment = VerticalAlignment.Center,
-            Foreground = new SolidColorBrush(Accents.TextOnAccent)
+            Margin = new Thickness(6, 0, 0, 0)
         };
         var closeBtn = new TextBlock
         {
             Text = "\u2715",
-            FontSize = 12,
-            Margin = new Thickness(8, 0, 0, 0),
+            FontSize = 11,
+            Foreground = Accents.TextSecondaryBrush,
             VerticalAlignment = VerticalAlignment.Center,
-            Foreground = new SolidColorBrush(Accents.TextOnAccent),
+            Margin = new Thickness(8, 0, 0, 0),
             Cursor = new Cursor(StandardCursorType.Hand)
         };
         var contentStack = new StackPanel
@@ -3232,6 +3237,13 @@ public class {className}
             IsVisible = false,
             Child = card
         };
+        // The IDE root is a 3-row Grid (toolbar/body/statusbar). Without an
+        // explicit row span the overlay would sit invisibly inside the
+        // Auto-sized toolbar row.
+        Grid.SetRow(_switcherOverlay, 0);
+        Grid.SetRowSpan(_switcherOverlay, 3);
+        Grid.SetColumn(_switcherOverlay, 0);
+        Grid.SetColumnSpan(_switcherOverlay, 16);
         _switcherOverlay.PointerPressed += (_, e) =>
         {
             // Click outside the card dismisses.
@@ -3391,9 +3403,13 @@ public class {className}
     private void WireTabInteraction(EditorTab tab)
     {
         var border = tab.TabBorder;
+        const Avalonia.Interactivity.RoutingStrategies routes =
+            Avalonia.Interactivity.RoutingStrategies.Tunnel | Avalonia.Interactivity.RoutingStrategies.Bubble;
 
-        // Middle-click closes the tab.
-        border.PointerPressed += (_, e) =>
+        // The site-specific PointerPressed handler that runs on every tab
+        // marks the event Handled to activate the tab. Use handledEventsToo
+        // here so middle-click close + drag-reorder still see the events.
+        border.AddHandler(InputElement.PointerPressedEvent, (object? _, PointerPressedEventArgs e) =>
         {
             var props = e.GetCurrentPoint(border).Properties;
             if (props.IsMiddleButtonPressed)
@@ -3409,9 +3425,9 @@ public class {className}
                 _dragOriginalIndex = _tabs.IndexOf(tab);
                 _dragActive = false;
             }
-        };
+        }, routes, handledEventsToo: true);
 
-        border.PointerMoved += (_, e) =>
+        border.AddHandler(InputElement.PointerMovedEvent, (object? _, PointerEventArgs e) =>
         {
             if (_draggingTab != tab || !e.GetCurrentPoint(border).Properties.IsLeftButtonPressed) return;
             var pos = e.GetPosition(_tabStrip);
@@ -3422,9 +3438,10 @@ public class {className}
                 tab.TabBorder.Opacity = 0.55;     // ghost the dragging tab
             }
             ReorderDraggingTab(pos.X);
-        };
+        }, routes, handledEventsToo: true);
 
-        border.PointerReleased += (_, _) => EndTabDrag(commit: true);
+        border.AddHandler(InputElement.PointerReleasedEvent, (object? _, PointerReleasedEventArgs _) =>
+            EndTabDrag(commit: true), routes, handledEventsToo: true);
     }
 
     private void EndTabDrag(bool commit)
