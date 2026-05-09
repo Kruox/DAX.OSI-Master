@@ -13,6 +13,7 @@
 
 - [What is DAX.OSI?](#what-is-daxosi)
 - [What is DOSI.CORE?](#what-is-dosicore)
+- [Gallery](#gallery)
 - [Architecture Overview](#architecture-overview)
 - [Project Layout](#project-layout)
 - [Getting Started](#getting-started)
@@ -77,6 +78,50 @@ Think of DOSI.CORE as the *kernel + standard library* of the virtual OS:
 - `DOSITerminalManager` — coordinates terminal sessions and command dispatch
 
 > In short: **DAX.OSI is the operating system you see. DOSI.CORE is what makes it tick.**
+
+---
+
+## Gallery
+
+> A visual tour of DAX.OSI in action — boot screens, the desktop, default apps, the IDE, and the visual designer.
+
+<table>
+  <tr>
+    <td width="33%"><a href="img/1.png"><img src="img/1.png" alt="DAX.OSI screenshot 1" width="100%"/></a></td>
+    <td width="33%"><a href="img/2.png"><img src="img/2.png" alt="DAX.OSI screenshot 2" width="100%"/></a></td>
+    <td width="33%"><a href="img/3.png"><img src="img/3.png" alt="DAX.OSI screenshot 3" width="100%"/></a></td>
+  </tr>
+  <tr>
+    <td><a href="img/4.png"><img src="img/4.png" alt="DAX.OSI screenshot 4" width="100%"/></a></td>
+    <td><a href="img/5.png"><img src="img/5.png" alt="DAX.OSI screenshot 5" width="100%"/></a></td>
+    <td><a href="img/6.png"><img src="img/6.png" alt="DAX.OSI screenshot 6" width="100%"/></a></td>
+  </tr>
+  <tr>
+    <td><a href="img/7.png"><img src="img/7.png" alt="DAX.OSI screenshot 7" width="100%"/></a></td>
+    <td><a href="img/8.png"><img src="img/8.png" alt="DAX.OSI screenshot 8" width="100%"/></a></td>
+    <td><a href="img/9.png"><img src="img/9.png" alt="DAX.OSI screenshot 9" width="100%"/></a></td>
+  </tr>
+  <tr>
+    <td><a href="img/10.png"><img src="img/10.png" alt="DAX.OSI screenshot 10" width="100%"/></a></td>
+    <td><a href="img/11.png"><img src="img/11.png" alt="DAX.OSI screenshot 11" width="100%"/></a></td>
+    <td><a href="img/12.png"><img src="img/12.png" alt="DAX.OSI screenshot 12" width="100%"/></a></td>
+  </tr>
+  <tr>
+    <td><a href="img/13.png"><img src="img/13.png" alt="DAX.OSI screenshot 13" width="100%"/></a></td>
+    <td><a href="img/14.png"><img src="img/14.png" alt="DAX.OSI screenshot 14" width="100%"/></a></td>
+    <td><a href="img/15.png"><img src="img/15.png" alt="DAX.OSI screenshot 15" width="100%"/></a></td>
+  </tr>
+  <tr>
+    <td><a href="img/16.png"><img src="img/16.png" alt="DAX.OSI screenshot 16" width="100%"/></a></td>
+    <td><a href="img/17.png"><img src="img/17.png" alt="DAX.OSI screenshot 17" width="100%"/></a></td>
+    <td><a href="img/18.png"><img src="img/18.png" alt="DAX.OSI screenshot 18" width="100%"/></a></td>
+  </tr>
+  <tr>
+    <td colspan="3" align="center"><a href="img/19.png"><img src="img/19.png" alt="DAX.OSI screenshot 19" width="66%"/></a></td>
+  </tr>
+</table>
+
+<p align="center"><sub>Click any thumbnail to open the full-resolution screenshot.</sub></p>
 
 ---
 
