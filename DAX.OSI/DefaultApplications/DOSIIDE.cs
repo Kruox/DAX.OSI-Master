@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text.Json;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
@@ -75,6 +76,33 @@ public class DOSIIDE : DOSIWindow
     // Standalone DOSIWindow that hosts the most recent run (so the user's
     // returned Control behaves like a real OS window: drag, resize, focus).
     private DOSIWindow? _runWindow;
+
+    // ---- Command bar (Find / Go-to-line) ----
+    // Single overlay strip at the top of the editor area used for both Find
+    // (Ctrl+F) and Go-to-line (Ctrl+G). Mode is tracked by _commandMode;
+    // hidden when null.
+    private Border? _commandBar;
+    private TextBlock? _commandLabel;
+    private DOSITextBox? _commandInput;
+    private TextBlock? _commandHint;
+    private string? _commandMode;     // "find" or "goto" or null
+
+    // ---- Closed-tab stack (Ctrl+Shift+T to reopen) ----
+    private readonly Stack<string> _recentlyClosed = new();
+    private const int MaxRecentlyClosed = 16;
+
+    // ---- Session persistence ----
+    // Sidecar JSON at <userHome>/.dosi-ide-session.json. Records the open
+    // tab paths + active tab so the IDE re-opens where you left off.
+    private bool _sessionRestoring;
+    private string SessionFilePath =>
+        IOPath.Combine(_rootPath, ".dosi-ide-session.json");
+
+    private sealed class IdeSessionState
+    {
+        public List<string> OpenPaths { get; set; } = new();
+        public string? ActivePath { get; set; }
+    }
 
     public DOSIIDE()
     {
@@ -244,10 +272,22 @@ public class DOSIIDE : DOSIWindow
         };
         _editorHost.Children.Add(_placeholder);
 
+        // Build the Find / Go-to overlay strip once and stack it above the
+        // editor host. Hidden by default; shown via ShowFindBar / ShowGotoBar.
+        var commandBar = BuildCommandBar();
+
+        var editorStack = new Grid
+        {
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            VerticalAlignment = VerticalAlignment.Stretch
+        };
+        editorStack.Children.Add(_editorHost);
+        editorStack.Children.Add(commandBar);
+
         var editorArea = new Border
         {
             Background = Accents.WindowContentBrush,
-            Child = _editorHost
+            Child = editorStack
         };
         _editorArea = editorArea;
 
@@ -420,7 +460,14 @@ public class DOSIIDE : DOSIWindow
 
         Content = rootGrid;
 
-        AttachedToVisualTree += (_, _) => Accents.AccentChanged += OnAccentChanged;
+        AttachedToVisualTree += (_, _) =>
+        {
+            Accents.AccentChanged += OnAccentChanged;
+            // Restore tabs from the previous session at Loaded priority so the
+            // tab strip is fully wired up before any OpenFile call runs.
+            Avalonia.Threading.Dispatcher.UIThread.Post(LoadSession,
+                Avalonia.Threading.DispatcherPriority.Loaded);
+        };
         DetachedFromVisualTree += (_, _) => Accents.AccentChanged -= OnAccentChanged;
 
         // Tunnel keyboard shortcuts so they fire even when the code editor has focus.
@@ -451,6 +498,10 @@ public class DOSIIDE : DOSIWindow
         else if (ctrl && e.Key == Key.N)     { await CreateNewFileAsync(); e.Handled = true; }
         else if (ctrl && e.Key == Key.O)     { await OpenProjectAsync(); e.Handled = true; }
         else if (ctrl && e.Key == Key.P)     { await PublishActiveProjectAsync(); e.Handled = true; }
+        else if (ctrl && e.Key == Key.F)     { ShowFindBar(); e.Handled = true; }
+        else if (ctrl && e.Key == Key.G)     { ShowGotoBar(); e.Handled = true; }
+        else if (ctrl && shift && e.Key == Key.T) { ReopenLastClosedTab(); e.Handled = true; }
+        else if (e.Key == Key.Escape && _commandMode != null) { HideCommandBar(); e.Handled = true; }
     }
 
     // =====================================================================
@@ -1183,6 +1234,8 @@ public class DOSIIDE : DOSIWindow
         _editorHost.Children.Add(tab.HostContent);
         tab.HostContent.Focus();
 
+        SaveSession();
+
         // Returning to a designer tab from a code-behind tab used to leave
         // the previously-selected control still highlighted (and still
         // driving the property panel). That was confusing - the user just
@@ -1314,6 +1367,20 @@ public class DOSIIDE : DOSIWindow
         _tabs.Remove(tab);
         _tabStrip.Children.Remove(tab.TabBorder);
 
+        // Remember the closed file so Ctrl+Shift+T can reopen it. Don't
+        // remember code-behind tabs (they're auto-spawned from designers).
+        if (tab.CodeBehindFor == null && !string.IsNullOrEmpty(tab.Path) && File.Exists(tab.Path))
+        {
+            _recentlyClosed.Push(tab.Path);
+            while (_recentlyClosed.Count > MaxRecentlyClosed)
+            {
+                var arr = _recentlyClosed.ToArray();
+                _recentlyClosed.Clear();
+                for (int i = MaxRecentlyClosed - 1; i >= 0; i--) _recentlyClosed.Push(arr[i]);
+                break;
+            }
+        }
+
         if (_activeTab == tab)
         {
             _activeTab = null;
@@ -1326,6 +1393,8 @@ public class DOSIIDE : DOSIWindow
                 UpdateStatusBar();
             }
         }
+
+        SaveSession();
     }
 
     private void UpdateDirtyState()
@@ -2470,5 +2539,219 @@ public class {className}
         grid.Children.Add(bg);
         grid.Children.Add(label);
         return grid;
+    }
+
+    // =====================================================================
+    // Find / Go-to-line command bar
+    // =====================================================================
+
+    private Border BuildCommandBar()
+    {
+        _commandLabel = new TextBlock
+        {
+            Text = "Find:",
+            FontSize = 12,
+            Foreground = new SolidColorBrush(AccentManager.Instance.TextOnAccent),
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(8, 0, 8, 0)
+        };
+
+        _commandInput = new DOSITextBox
+        {
+            Width = 280,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        _commandInput.KeyDown += OnCommandInputKeyDown;
+
+        _commandHint = new TextBlock
+        {
+            Text = "",
+            FontSize = 11,
+            Opacity = 0.7,
+            Foreground = new SolidColorBrush(AccentManager.Instance.TextOnAccent),
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(10, 0, 0, 0)
+        };
+
+        var closeBtn = new TextBlock
+        {
+            Text = "\u2715",
+            FontSize = 14,
+            Foreground = new SolidColorBrush(AccentManager.Instance.TextOnAccent),
+            VerticalAlignment = VerticalAlignment.Center,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            Margin = new Thickness(8, 0, 8, 0),
+            Cursor = new Avalonia.Input.Cursor(Avalonia.Input.StandardCursorType.Hand)
+        };
+        closeBtn.PointerReleased += (_, _) => HideCommandBar();
+
+        var row = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            VerticalAlignment = VerticalAlignment.Center,
+            Children = { _commandLabel, _commandInput, _commandHint }
+        };
+
+        var dock = new DockPanel
+        {
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            LastChildFill = false
+        };
+        DockPanel.SetDock(closeBtn, Dock.Right);
+        dock.Children.Add(closeBtn);
+        dock.Children.Add(row);
+
+        _commandBar = new Border
+        {
+            Background = new SolidColorBrush(Color.FromArgb(220, 22, 28, 60)),
+            BorderBrush = new SolidColorBrush(Color.FromArgb(80, 255, 255, 255)),
+            BorderThickness = new Thickness(0, 0, 0, 1),
+            Padding = new Thickness(8, 6),
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            VerticalAlignment = VerticalAlignment.Top,
+            IsVisible = false,
+            Child = dock
+        };
+        return _commandBar;
+    }
+
+    private void ShowFindBar()
+    {
+        if (_commandBar == null || _commandInput == null || _commandLabel == null || _commandHint == null) return;
+        _commandMode = "find";
+        _commandLabel.Text = "Find:";
+        _commandHint.Text = "Enter \u2192 next match    Esc \u2192 close";
+
+        // Pre-fill with the current selection if there is one.
+        if (_activeTab?.Editor is { } ed && ed.HasSelection)
+        {
+            var sel = ed.GetSelectedText();
+            if (!string.IsNullOrEmpty(sel) && !sel.Contains('\n')) _commandInput.Text = sel;
+        }
+
+        _commandBar.IsVisible = true;
+        Avalonia.Threading.Dispatcher.UIThread.Post(() => _commandInput.Focus(),
+            Avalonia.Threading.DispatcherPriority.Loaded);
+    }
+
+    private void ShowGotoBar()
+    {
+        if (_commandBar == null || _commandInput == null || _commandLabel == null || _commandHint == null) return;
+        _commandMode = "goto";
+        _commandLabel.Text = "Go to line:";
+        _commandHint.Text = $"of {_activeTab?.Editor?.LineCount ?? 0}";
+        _commandInput.Text = string.Empty;
+        _commandBar.IsVisible = true;
+        Avalonia.Threading.Dispatcher.UIThread.Post(() => _commandInput.Focus(),
+            Avalonia.Threading.DispatcherPriority.Loaded);
+    }
+
+    private void HideCommandBar()
+    {
+        if (_commandBar == null) return;
+        _commandBar.IsVisible = false;
+        _commandMode = null;
+        _activeTab?.Editor?.Focus();
+    }
+
+    private void OnCommandInputKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (e.Key == Key.Escape) { HideCommandBar(); e.Handled = true; return; }
+        if (e.Key != Key.Enter) return;
+        e.Handled = true;
+
+        var text = _commandInput?.Text ?? string.Empty;
+        if (_commandMode == "find" && _activeTab?.Editor is { } ed && text.Length > 0)
+        {
+            // Start search just past the current selection so repeat-Enter
+            // walks through subsequent matches.
+            var (sl, sc, el, ec) = ed.HasSelection
+                ? ed.GetNormalizedSelection()
+                : (ed.CaretLine - 1, ed.CaretColumn - 1, ed.CaretLine - 1, ed.CaretColumn - 1);
+            int startLine = el, startCol = ec;
+            if (ed.FindNext(text, startLine, startCol, ignoreCase: true,
+                            out var ml, out var mc, out var len))
+            {
+                ed.SetSelection(ml, mc, ml, mc + len);
+                if (_commandHint != null) _commandHint.Text = "Enter \u2192 next match    Esc \u2192 close";
+            }
+            else
+            {
+                if (_commandHint != null) _commandHint.Text = "No match.";
+            }
+        }
+        else if (_commandMode == "goto" && _activeTab?.Editor is { } ed2)
+        {
+            if (int.TryParse(text, out var lineNum))
+            {
+                ed2.GoToLine(lineNum);
+                HideCommandBar();
+            }
+            else if (_commandHint != null) _commandHint.Text = "Enter a number.";
+        }
+    }
+
+    // =====================================================================
+    // Session persistence + reopen-closed-tab
+    // =====================================================================
+
+    private void SaveSession()
+    {
+        if (_sessionRestoring) return;
+        if (_user == null) return;
+        try
+        {
+            var state = new IdeSessionState
+            {
+                OpenPaths = _tabs
+                    .Where(t => t.CodeBehindFor == null && !string.IsNullOrEmpty(t.Path))
+                    .Select(t => t.Path)
+                    .ToList(),
+                ActivePath = _activeTab?.Path
+            };
+            File.WriteAllText(SessionFilePath,
+                JsonSerializer.Serialize(state, new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch { /* best-effort */ }
+    }
+
+    private void LoadSession()
+    {
+        if (_user == null) return;
+        if (!File.Exists(SessionFilePath)) return;
+
+        IdeSessionState? state;
+        try { state = JsonSerializer.Deserialize<IdeSessionState>(File.ReadAllText(SessionFilePath)); }
+        catch { return; }
+        if (state == null || state.OpenPaths.Count == 0) return;
+
+        _sessionRestoring = true;
+        try
+        {
+            foreach (var path in state.OpenPaths)
+            {
+                if (File.Exists(path)) OpenFile(path);
+            }
+            if (!string.IsNullOrEmpty(state.ActivePath))
+            {
+                var match = _tabs.FirstOrDefault(t =>
+                    string.Equals(t.Path, state.ActivePath, StringComparison.OrdinalIgnoreCase));
+                if (match != null) ActivateTab(match);
+            }
+        }
+        finally { _sessionRestoring = false; }
+    }
+
+    private void ReopenLastClosedTab()
+    {
+        while (_recentlyClosed.Count > 0)
+        {
+            var path = _recentlyClosed.Pop();
+            if (!File.Exists(path)) continue;
+            // Skip if it's already open.
+            if (_tabs.Any(t => string.Equals(t.Path, path, StringComparison.OrdinalIgnoreCase))) continue;
+            OpenFile(path);
+            return;
+        }
     }
 }

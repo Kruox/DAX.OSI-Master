@@ -246,6 +246,175 @@ public class DOSICodeEditor : Control
 
     public void Focus() => base.Focus();
 
+    /// <summary>Smallest font size accepted by <see cref="ZoomOut"/>.</summary>
+    public const double MinFontSize = 8;
+
+    /// <summary>Largest font size accepted by <see cref="ZoomIn"/>.</summary>
+    public const double MaxFontSize = 32;
+
+    private double _baseFontSize;
+
+    /// <summary>Increases the editor font size by 1 pt (clamped to <see cref="MaxFontSize"/>).</summary>
+    public void ZoomIn() => SetFontSizeInternal(FontSize + 1);
+
+    /// <summary>Decreases the editor font size by 1 pt (clamped to <see cref="MinFontSize"/>).</summary>
+    public void ZoomOut() => SetFontSizeInternal(FontSize - 1);
+
+    /// <summary>Restores the editor font size to whatever it was when the control was first shown.</summary>
+    public void ResetZoom()
+    {
+        if (_baseFontSize <= 0) _baseFontSize = 13;
+        SetFontSizeInternal(_baseFontSize);
+    }
+
+    private void SetFontSizeInternal(double size)
+    {
+        var clamped = Math.Clamp(size, MinFontSize, MaxFontSize);
+        if (Math.Abs(clamped - FontSize) < 0.01) return;
+        if (_baseFontSize <= 0) _baseFontSize = FontSize;
+        FontSize = clamped;
+        UpdateScrollBar();
+        EnsureCaretVisible();
+        InvalidateVisual();
+    }
+
+    /// <summary>
+    /// Duplicates the line containing the caret (or each fully-selected line).
+    /// The new copy is inserted directly below; caret moves down with the
+    /// duplicate so a repeated press makes consecutive copies.
+    /// </summary>
+    public void DuplicateLine()
+    {
+        if (IsReadOnly) return;
+        BeginEdit();
+
+        var (sl, _, el, _) = HasSelection
+            ? GetNormalizedSelection()
+            : (_caretLine, 0, _caretLine, 0);
+
+        // Snapshot the affected slice so we can append it right after.
+        var slice = new List<string>(el - sl + 1);
+        for (int i = sl; i <= el; i++) slice.Add(_lines[i]);
+        _lines.InsertRange(el + 1, slice);
+
+        var spanCount = slice.Count;
+        _caretLine = Math.Min(_lines.Count - 1, _caretLine + spanCount);
+        _anchorLine = _caretLine;
+        _anchorCol = _caretCol = Math.Min(_caretCol, _lines[_caretLine].Length);
+
+        AfterStructuralEdit();
+    }
+
+    /// <summary>Swaps the current line (or selected lines) with the line(s) above.</summary>
+    public void MoveLineUp()
+    {
+        if (IsReadOnly) return;
+        var (sl, _, el, _) = HasSelection ? GetNormalizedSelection() : (_caretLine, 0, _caretLine, 0);
+        if (sl <= 0) return;     // already at top
+
+        BeginEdit();
+        var line = _lines[sl - 1];
+        _lines.RemoveAt(sl - 1);
+        _lines.Insert(el, line);
+
+        _caretLine--; _anchorLine--;
+        AfterStructuralEdit();
+    }
+
+    /// <summary>Swaps the current line (or selected lines) with the line(s) below.</summary>
+    public void MoveLineDown()
+    {
+        if (IsReadOnly) return;
+        var (sl, _, el, _) = HasSelection ? GetNormalizedSelection() : (_caretLine, 0, _caretLine, 0);
+        if (el >= _lines.Count - 1) return;     // already at bottom
+
+        BeginEdit();
+        var line = _lines[el + 1];
+        _lines.RemoveAt(el + 1);
+        _lines.Insert(sl, line);
+
+        _caretLine++; _anchorLine++;
+        AfterStructuralEdit();
+    }
+
+    private void AfterStructuralEdit()
+    {
+        _isDirty = true;
+        UpdateScrollBar();
+        EnsureCaretVisible();
+        ResetCaretBlink();
+        TextChanged?.Invoke(this, EventArgs.Empty);
+        CaretChanged?.Invoke(this, EventArgs.Empty);
+        InvalidateVisual();
+    }
+
+    /// <summary>
+    /// Programmatically sets the selection to the supplied range. Coordinates
+    /// are 0-based; values are clamped to valid line/column bounds. Used by
+    /// the IDE's Find feature to highlight the next match.
+    /// </summary>
+    public void SetSelection(int startLine, int startCol, int endLine, int endCol)
+    {
+        if (_lines.Count == 0) return;
+        startLine = Math.Clamp(startLine, 0, _lines.Count - 1);
+        endLine = Math.Clamp(endLine, 0, _lines.Count - 1);
+        startCol = Math.Clamp(startCol, 0, _lines[startLine].Length);
+        endCol = Math.Clamp(endCol, 0, _lines[endLine].Length);
+
+        _anchorLine = startLine; _anchorCol = startCol;
+        _caretLine = endLine;    _caretCol = endCol;
+
+        EnsureCaretVisible();
+        ResetCaretBlink();
+        CaretChanged?.Invoke(this, EventArgs.Empty);
+        InvalidateVisual();
+    }
+
+    /// <summary>
+    /// Finds the next occurrence of <paramref name="needle"/> at or after
+    /// (<paramref name="fromLine"/>, <paramref name="fromCol"/>), wrapping
+    /// from the top if not found by the end of the buffer. Returns
+    /// <c>true</c> on a hit and outputs the match position + length.
+    /// </summary>
+    public bool FindNext(string needle, int fromLine, int fromCol, bool ignoreCase,
+                         out int matchLine, out int matchCol, out int matchLength)
+    {
+        matchLine = matchCol = matchLength = 0;
+        if (string.IsNullOrEmpty(needle)) return false;
+
+        var cmp = ignoreCase ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal;
+        fromLine = Math.Clamp(fromLine, 0, _lines.Count - 1);
+        fromCol = Math.Clamp(fromCol, 0, _lines[fromLine].Length);
+
+        // Search from the cursor to the end of the buffer.
+        for (int i = fromLine; i < _lines.Count; i++)
+        {
+            var startCol = i == fromLine ? fromCol : 0;
+            if (startCol > _lines[i].Length) continue;
+            var idx = _lines[i].IndexOf(needle, startCol, cmp);
+            if (idx >= 0)
+            {
+                matchLine = i; matchCol = idx; matchLength = needle.Length;
+                return true;
+            }
+        }
+
+        // Wrap: scan from the top up to the original starting position.
+        for (int i = 0; i <= fromLine; i++)
+        {
+            var endCol = i == fromLine ? fromCol : _lines[i].Length;
+            var slice = i == fromLine ? _lines[i].Substring(0, endCol) : _lines[i];
+            var idx = slice.IndexOf(needle, cmp);
+            if (idx >= 0)
+            {
+                matchLine = i; matchCol = idx; matchLength = needle.Length;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     #endregion
 
     #region Layout
@@ -479,6 +648,16 @@ public class DOSICodeEditor : Control
     protected override void OnPointerWheelChanged(PointerWheelEventArgs e)
     {
         base.OnPointerWheelChanged(e);
+
+        // Ctrl+wheel: zoom font size instead of scrolling.
+        if (e.KeyModifiers.HasFlag(KeyModifiers.Control))
+        {
+            if (e.Delta.Y > 0) ZoomIn();
+            else if (e.Delta.Y < 0) ZoomOut();
+            e.Handled = true;
+            return;
+        }
+
         if (_vScrollBar.IsVisible)
         {
             var delta = e.Delta.Y * LineHeight * 3;
@@ -573,6 +752,29 @@ public class DOSICodeEditor : Control
             InvalidateVisual();
             e.Handled = true;
             return;
+        }
+
+        // Ctrl+D : duplicate the current line (or selected lines) below.
+        if (ctrl && !shift && e.Key == Key.D && !IsReadOnly)
+        {
+            DuplicateLine();
+            e.Handled = true;
+            return;
+        }
+
+        // Alt+Up / Alt+Down : move the current line up/down.
+        if (e.KeyModifiers.HasFlag(KeyModifiers.Alt) && !ctrl && !shift && !IsReadOnly)
+        {
+            if (e.Key == Key.Up)   { MoveLineUp();   e.Handled = true; return; }
+            if (e.Key == Key.Down) { MoveLineDown(); e.Handled = true; return; }
+        }
+
+        // Ctrl+= / Ctrl++ : zoom in.   Ctrl+- : zoom out.   Ctrl+0 : reset zoom.
+        if (ctrl && !shift)
+        {
+            if (e.Key == Key.OemPlus || e.Key == Key.Add)        { ZoomIn();    e.Handled = true; return; }
+            if (e.Key == Key.OemMinus || e.Key == Key.Subtract)  { ZoomOut();   e.Handled = true; return; }
+            if (e.Key == Key.D0 || e.Key == Key.NumPad0)         { ResetZoom(); e.Handled = true; return; }
         }
 
         // Tab on a snippet trigger word: expand it instead of inserting spaces.
