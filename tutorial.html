@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8" />
@@ -141,6 +141,10 @@
   }
   .flow-box small { display: block; color: var(--muted); font-weight: normal; margin-top: 4px; font-size: 0.75rem; }
 
+  table { width: 100%; border-collapse: collapse; margin: 16px 0; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+  th { color: var(--accent-2); font-size: 0.85rem; text-transform: uppercase; letter-spacing: 1px; }
+
   footer {
     text-align: center;
     padding: 32px 16px;
@@ -156,11 +160,12 @@
 
 <header>
   <h1>DAX.OSI · Quick Start</h1>
-  <p>A 5-minute tour of the virtual OS and its engine, <strong>DOSI.CORE</strong>.</p>
+  <p>From boot screen to a published app — a complete tour of the virtual OS and its engine, <strong>DOSI.CORE</strong>.</p>
   <div class="badges">
     <span class="badge">.NET 9</span>
     <span class="badge">Avalonia UI</span>
     <span class="badge">Cross-Platform</span>
+    <span class="badge">Roslyn-Powered IDE</span>
   </div>
 </header>
 
@@ -258,7 +263,7 @@ public class HelloApp : DOSIWindow
         Height = 280;
 
         var button = new DOSIButton { Content = "Click me" };
-        button.Click += (_, _) =>
+        button.Click += (_, _) =&gt;
             DOSIPopNotification.Show("Hi", "You clicked the button!");
 
         Content = button;
@@ -282,6 +287,16 @@ WindowManager.Instance.Open(new HelloApp());</code></pre>
       <div class="flow-box">Output Pane<small>build log + run preview</small></div>
     </div>
     <p>Behind the scenes the IDE uses <strong>Roslyn</strong> to compile your project in-memory, then reflectively invokes its entry point. Anything written to <code>Console.Out</code> is captured into the Output pane, and any returned <code>Control</code> is hosted in a live <code>DOSIWindow</code> on the desktop.</p>
+    <table>
+      <tr><th>Toolbar Button</th><th>What it does</th></tr>
+      <tr><td>New Project</td><td>Scaffold a folder + <code>.dosiproj</code> manifest + starter <code>Program.cs</code></td></tr>
+      <tr><td>New File</td><td>Create a blank <code>.cs</code> or <code>.dosiform</code> file</td></tr>
+      <tr><td>Open Project</td><td>Browse to a project folder under your sandbox</td></tr>
+      <tr><td>Save / Save All</td><td>Flush dirty tabs to disk</td></tr>
+      <tr><td>Build (⚒)</td><td>Compile only; show diagnostics in Output pane</td></tr>
+      <tr><td>Run (▶)</td><td>Compile + invoke <code>Run()</code> + host result</td></tr>
+      <tr><td>Publish (↑)</td><td>Register the app with <code>DOSIPublishedAppRegistry</code></td></tr>
+    </table>
   </section>
 
   <section class="step" id="projects">
@@ -308,6 +323,11 @@ public static class Program
         return stack;
     }
 }</code></pre>
+    <table>
+      <tr><th>Run() returns</th><th>DOSIIDE behavior</th></tr>
+      <tr><td><code>void</code></td><td>Pure execution — stdout streams into the Output pane</td></tr>
+      <tr><td><code>Control</code></td><td>Hosted as the Content of a real <code>DOSIWindow</code></td></tr>
+    </table>
     <div class="note">
       <strong>Even shorter:</strong> DOSIIDE allows top-level statements. A file containing just <code>var btn = new DOSIButton { Content = "Hi" }; return btn;</code> compiles too — the compiler auto-wraps it.
     </div>
@@ -324,7 +344,14 @@ public static class Program
 ├── Views/
 │   └── TodoView.cs       ← your own DOSIWindow subclass
 └── MainForm.dosiform     ← visual designer file (optional)</code></pre>
-<pre><code>// Views/TodoView.cs
+<pre><code>// Models/TodoItem.cs
+public class TodoItem
+{
+    public string Title { get; set; } = "";
+    public bool   Done  { get; set; }
+}
+
+// Views/TodoView.cs
 using DOSI.CORE.UIComponents;
 using DOSI.CORE.UIComponents.WindowManagement;
 
@@ -354,16 +381,22 @@ public static class Program
       <li><strong>Selection</strong> — click to select, arrow keys to nudge, corner handles to resize</li>
       <li><strong>Snap-to-grid</strong> — 8 px grid with overlay</li>
       <li><strong>Property grid</strong> — live edit Name, Text, Width, Dock, etc.</li>
+      <li><strong>Dirty tracking</strong> — tabs show an asterisk when unsaved</li>
     </ul>
     <p>The form is persisted as JSON. At runtime, <code>DOSIFormLoader</code> turns it back into a real <code>DOSIWindow</code> — so even a project with <em>no</em> <code>.cs</code> files can still <strong>Run</strong>.</p>
 <pre><code>// Snippet from a .dosiform document
 {
   "Title": "Login",
   "Width": 400, "Height": 240,
+  "CanMaximize": false,
+  "CanMinimize": true,
   "Controls": [
-    { "Type": "DOSILabel",  "Name": "label1",  "X": 20, "Y": 20, "Properties": { "Text": "Username" } },
+    { "Type": "DOSILabel",  "Name": "label1",  "X": 20, "Y": 20,
+      "Properties": { "Text": "Username" } },
     { "Type": "DOSITextBox","Name": "userBox", "X": 100,"Y": 20, "Width": 260 },
-    { "Type": "DOSIButton", "Name": "okBtn",   "X": 280,"Y": 180,"Properties": { "Content": "Sign In" } }
+    { "Type": "DOSIButton", "Name": "okBtn",   "X": 280,"Y": 180,
+      "Properties": { "Content": "Sign In" },
+      "Handlers":   { "Click": "DOSIPopNotification.Show(\"Hi\", userBox.Text);" } }
   ]
 }</code></pre>
   </section>
@@ -385,30 +418,49 @@ else
       <div class="flow-box">Fill<small>main content</small></div>
       <div class="flow-box">Bottom<small>status strip</small></div>
     </div>
+    <table>
+      <tr><th>DOSIDock</th><th>Behaviour at runtime</th></tr>
+      <tr><td><code>None</code></td><td>Honors absolute X/Y/Width/Height from the designer</td></tr>
+      <tr><td><code>Top</code></td><td>Stretched along the top edge, full width</td></tr>
+      <tr><td><code>Bottom</code></td><td>Stretched along the bottom edge, full width</td></tr>
+      <tr><td><code>Left</code></td><td>Pinned to the left edge, full height</td></tr>
+      <tr><td><code>Right</code></td><td>Pinned to the right edge, full height</td></tr>
+      <tr><td><code>Fill</code></td><td>Consumes whatever space remains</td></tr>
+    </table>
   </section>
 
   <section class="step" id="advanced">
     <h2><span class="step-num">11</span> Advanced Patterns</h2>
     <p>You have the full <code>DOSI.CORE</code> surface available. A few ideas to push further:</p>
-<pre><code>// Persist your own settings alongside SystemSettings.json
-var path = System.IO.Path.Combine(
+
+    <h3>Persist your own settings</h3>
+<pre><code>var path = System.IO.Path.Combine(
     System.AppContext.BaseDirectory, "MyApp.settings.json");
+
 System.IO.File.WriteAllText(path,
-    System.Text.Json.JsonSerializer.Serialize(new { Theme = "Dark" }));
+    System.Text.Json.JsonSerializer.Serialize(new { Theme = "Dark", Volume = 70 }));</code></pre>
 
-// React to accent changes globally
-AccentManager.Instance.AccentChanged += (_, _) =&gt;
-    DOSIPopNotification.Show("Theme", "Accent updated!");
+    <h3>React to accent changes globally</h3>
+<pre><code>AccentManager.Instance.AccentChanged += (_, _) =&gt;
+    DOSIPopNotification.Show("Theme", "Accent updated!");</code></pre>
 
-// Spawn a modal dialog
-var dlg = new DOSIDialog("Confirm", "Delete this item?");
+    <h3>Spawn a modal dialog</h3>
+<pre><code>var dlg = new DOSIDialog("Confirm", "Delete this item?");
 dlg.AddButton("Yes", () =&gt; { /* delete */ });
 dlg.AddButton("No",  () =&gt; { });
-WindowManager.Instance.Open(dlg);
+WindowManager.Instance.Open(dlg);</code></pre>
 
-// Animate a control
-Tween.Animate(myControl, OpacityProperty, from: 0, to: 1,
-              duration: 250, easing: Easings.EaseOutCubic);</code></pre>
+    <h3>Animate a control with Tween + Easings</h3>
+<pre><code>Tween.Animate(myControl, OpacityProperty,
+              from: 0, to: 1,
+              duration: 250,
+              easing: Easings.EaseOutCubic);</code></pre>
+
+    <h3>Embed a code editor inside your own app</h3>
+<pre><code>var editor = new DOSICodeEditor { ShowLineNumbers = true };
+editor.Text = "// edit me\nConsole.WriteLine(\"hi\");";
+Content = editor;</code></pre>
+
     <div class="note">
       <strong>Pro tip:</strong> Open the existing default apps in <code>DAX.OSI/DefaultApplications/</code> as living examples — <code>DOSIFileExplorer</code>, <code>DOSITerminal</code>, and the IDE itself all use the exact same APIs you do.
     </div>
@@ -424,6 +476,12 @@ DOSIPublishedAppRegistry.Register(myProject);
 var window = DOSIPublishedAppRegistry.Launch("MyCoolApp");
 WindowManager.Instance.Open(window);</code></pre>
     <p>Your app now appears on the desktop alongside built-ins like Terminal and File Explorer — a real, first-class DOSI citizen.</p>
+    <div class="flow">
+      <div class="flow-box">Build<small>Roslyn compile</small></div>
+      <div class="flow-box">Run<small>Verify entry</small></div>
+      <div class="flow-box">Publish<small>Register</small></div>
+      <div class="flow-box">Launch<small>From desktop</small></div>
+    </div>
   </section>
 
   <section class="step" id="next">
@@ -434,6 +492,9 @@ WindowManager.Instance.Open(window);</code></pre>
       <li>Inspect <code>DOSI.CORE/ProjectSystem/</code> and <code>DOSI.CORE/Designer/</code> to understand how compilation and the form runtime work.</li>
       <li>Open <strong>DOSIIDE</strong> from the desktop and start building — your first published app is just a few clicks away.</li>
     </ul>
+    <div class="note">
+      <strong>Welcome to DAX.OSI.</strong> An OS that lives inside a window, with its own SDK, IDE, and form designer — entirely written in .NET 9 and Avalonia.
+    </div>
   </section>
 
 </main>
