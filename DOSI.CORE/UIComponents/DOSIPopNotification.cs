@@ -35,6 +35,7 @@ public class DOSIPopNotification : Border
 
     private static readonly List<DOSIPopNotification> _active = [];
     private static Panel? _host;
+    private static bool _hostSizeHooked;
 
     /// <summary>
     /// Application-wide default host panel for notifications. When set
@@ -58,10 +59,18 @@ public class DOSIPopNotification : Border
         ArgumentNullException.ThrowIfNull(host);
 
         _host = host;
+        HookHostIfNeeded(host);
 
         var notif = new DOSIPopNotification(text);
         host.Children.Add(notif);
         _active.Add(notif);
+
+        // On Canvas hosts, HorizontalAlignment.Center is ignored - manually
+        // pin Canvas.Left so the toast stays horizontally centered. We do it
+        // once now (best-effort) and again on the first layout pass via the
+        // notification's own SizeChanged handler so we have a real width.
+        Recenter(notif);
+        notif.SizeChanged += (_, _) => Recenter(notif);
 
         ReflowStack(animate: true);
         _ = notif.RunLifecycleAsync(lifetime ?? DefaultLifetime);
@@ -79,6 +88,37 @@ public class DOSIPopNotification : Border
             ?? throw new InvalidOperationException(
                 "DOSIPopNotification.DefaultHost has not been set. Call Show(host, text) at least once or assign DefaultHost.");
         return Show(host, text, lifetime);
+    }
+
+    private static void HookHostIfNeeded(Panel host)
+    {
+        if (_hostSizeHooked) return;
+        if (host is not Canvas) return;
+        _hostSizeHooked = true;
+        host.SizeChanged += (_, _) => RecenterAll();
+    }
+
+    private static void RecenterAll()
+    {
+        foreach (var n in _active) Recenter(n);
+    }
+
+    private static void Recenter(DOSIPopNotification n)
+    {
+        if (_host is not Canvas canvas) return;     // Grid/Panel hosts: alignment works natively
+        var hostWidth = canvas.Bounds.Width;
+        if (hostWidth <= 0) return;
+
+        var w = n.Bounds.Width;
+        if (w <= 0)
+        {
+            n.Measure(Size.Infinity);
+            w = n.DesiredSize.Width;
+        }
+        if (w <= 0) return;
+
+        Canvas.SetLeft(n, Math.Max(0, (hostWidth - w) / 2));
+        Canvas.SetTop(n, 0); // vertical position is driven by TranslateTransform
     }
 
     private static void ReflowStack(bool animate)
