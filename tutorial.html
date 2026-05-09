@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>DAX.OSI · Quick Start Tutorial</title>
+<style>
+  :root {
+    --bg: #0b1020;
+    --bg-2: #11173a;
+    --panel: #161d44;
+    --panel-2: #1c2557;
+    --accent: #4f8cff;
+    --accent-2: #7aa9ff;
+    --text: #e7ecff;
+    --muted: #98a4d4;
+    --code-bg: #0a0f24;
+    --border: #2a3470;
+    --success: #4ade80;
+    --warn: #facc15;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: radial-gradient(ellipse at top, var(--bg-2), var(--bg) 60%);
+    color: var(--text);
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    line-height: 1.65;
+    min-height: 100vh;
+  }
+  header {
+    text-align: center;
+    padding: 64px 24px 32px;
+    background: linear-gradient(180deg, rgba(79,140,255,0.15), transparent);
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 {
+    font-size: 3rem;
+    margin: 0 0 8px;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2), #c4b5fd);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    letter-spacing: -1px;
+  }
+  header p { color: var(--muted); margin: 0; font-size: 1.1rem; }
+  .badges { margin-top: 16px; display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+  .badge {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 4px 12px;
+    font-size: 0.8rem;
+    color: var(--muted);
+  }
+  main { max-width: 920px; margin: 0 auto; padding: 32px 24px 80px; }
+  nav.toc {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 16px 20px;
+    margin-bottom: 32px;
+  }
+  nav.toc h3 { margin: 0 0 8px; font-size: 0.95rem; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+  nav.toc ol { margin: 0; padding-left: 20px; }
+  nav.toc a { color: var(--accent-2); text-decoration: none; }
+  nav.toc a:hover { color: var(--accent); text-decoration: underline; }
+
+  section.step {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 28px 32px;
+    margin-bottom: 24px;
+    box-shadow: 0 6px 24px rgba(0,0,0,0.25);
+  }
+  section.step h2 {
+    margin-top: 0;
+    color: var(--text);
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 1.5rem;
+  }
+  .step-num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px; height: 36px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent), #8b5cf6);
+    color: white;
+    font-weight: bold;
+    font-size: 1rem;
+    flex-shrink: 0;
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    overflow-x: auto;
+    font-family: 'Cascadia Code', Consolas, monospace;
+    font-size: 0.9rem;
+    color: #d6e2ff;
+  }
+  code { font-family: 'Cascadia Code', Consolas, monospace; }
+  p code, li code {
+    background: var(--panel-2);
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.88em;
+    color: var(--accent-2);
+  }
+  .note {
+    border-left: 4px solid var(--accent);
+    background: rgba(79,140,255,0.08);
+    padding: 12px 16px;
+    border-radius: 6px;
+    margin: 16px 0;
+    color: var(--muted);
+  }
+  .note strong { color: var(--text); }
+
+  .flow {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 12px;
+    margin: 20px 0;
+  }
+  .flow-box {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 12px;
+    text-align: center;
+    font-weight: 600;
+    color: var(--accent-2);
+    position: relative;
+  }
+  .flow-box small { display: block; color: var(--muted); font-weight: normal; margin-top: 4px; font-size: 0.75rem; }
+
+  footer {
+    text-align: center;
+    padding: 32px 16px;
+    color: var(--muted);
+    border-top: 1px solid var(--border);
+    font-size: 0.9rem;
+  }
+  footer strong { color: var(--text); }
+  a { color: var(--accent-2); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>DAX.OSI · Quick Start</h1>
+  <p>A 5-minute tour of the virtual OS and its engine, <strong>DOSI.CORE</strong>.</p>
+  <div class="badges">
+    <span class="badge">.NET 9</span>
+    <span class="badge">Avalonia UI</span>
+    <span class="badge">Cross-Platform</span>
+  </div>
+</header>
+
+<main>
+
+  <nav class="toc">
+    <h3>Contents</h3>
+    <ol>
+      <li><a href="#concept">The Concept</a></li>
+      <li><a href="#run">Run It</a></li>
+      <li><a href="#bootflow">The Boot Flow</a></li>
+      <li><a href="#core">Using DOSI.CORE</a></li>
+      <li><a href="#firstapp">Your First DOSI App</a></li>
+      <li><a href="#ide">Inside DOSIIDE</a></li>
+      <li><a href="#projects">Creating a Real Project</a></li>
+      <li><a href="#multifile">Going Multi-File</a></li>
+      <li><a href="#designer">Using the Visual Designer</a></li>
+      <li><a href="#handlers">Event Handlers &amp; Docking</a></li>
+      <li><a href="#advanced">Advanced Patterns</a></li>
+      <li><a href="#publish">Publishing Your App</a></li>
+      <li><a href="#next">Where to Go Next</a></li>
+    </ol>
+  </nav>
+
+  <section class="step" id="concept">
+    <h2><span class="step-num">1</span> The Concept</h2>
+    <p>
+      <strong>DAX.OSI</strong> is a desktop application that simulates an entire operating system inside a single window — complete with a boot screen, login, desktop, and bundled apps.
+    </p>
+    <p>
+      <strong>DOSI.CORE</strong> is the engine that powers it: window management, system settings, theming, animations, a UI control library, and a project/designer system for building new DOSI apps.
+    </p>
+    <div class="note">
+      <strong>Mental model:</strong> DAX.OSI is the <em>shell</em> you see and click. DOSI.CORE is the <em>library</em> it (and your future apps) depend on.
+    </div>
+  </section>
+
+  <section class="step" id="run">
+    <h2><span class="step-num">2</span> Run It</h2>
+    <p>From the repository root, build and launch the shell:</p>
+<pre><code>git clone https://github.com/Kruox/DAX.OSI-Master.git
+cd DAX.OSI-Master
+dotnet build
+dotnet run --project DAX.OSI</code></pre>
+    <p>On first launch a <code>SystemSettings.json</code> file is created next to the executable. You can edit it to change the default accent or fullscreen behavior.</p>
+  </section>
+
+  <section class="step" id="bootflow">
+    <h2><span class="step-num">3</span> The Boot Flow</h2>
+    <p>What happens when you press play:</p>
+    <div class="flow">
+      <div class="flow-box">Program.Main<small>App startup</small></div>
+      <div class="flow-box">App.Initialize<small>Theme + SystemCore</small></div>
+      <div class="flow-box">BootScreen<small>Splash + animation</small></div>
+      <div class="flow-box">LoginScreen<small>UserManager</small></div>
+      <div class="flow-box">DesktopScreen<small>WindowManager</small></div>
+    </div>
+    <p>
+      <code>ScreenManager</code> swaps between these full-screen surfaces, while <code>WindowManager</code> takes over once the desktop appears, hosting every opened app as a draggable, snappable <code>DOSIWindow</code>.
+    </p>
+  </section>
+
+  <section class="step" id="core">
+    <h2><span class="step-num">4</span> Using DOSI.CORE</h2>
+    <p>Most system features go through a small set of static entry points:</p>
+<pre><code>// Boot the engine + load SystemSettings.json
+SystemCore.Initialize();
+
+// Apply the saved accent to all DOSI controls
+AccentManager.Instance.InitializeFromSettings();
+
+// Show a window on the desktop
+WindowManager.Instance.Open(new MyAppWindow());
+
+// Push a toast notification
+DOSIPopNotification.Show("Welcome", "DAX.OSI is ready.");
+
+// Cleanly shut the system down
+SystemShutdown.Begin();</code></pre>
+    <p>The <code>DOSI.CORE.UIComponents</code> namespace provides the styled controls: <code>DOSIWindow</code>, <code>DOSIButton</code>, <code>DOSITextBox</code>, <code>DOSIDialog</code>, <code>DOSICodeEditor</code>, and more — all themed by the active <code>AccentManager</code>.</p>
+  </section>
+
+  <section class="step" id="firstapp">
+    <h2><span class="step-num">5</span> Your First DOSI App</h2>
+    <p>A DOSI app is, at its simplest, a class that derives from <code>DOSIWindow</code> and is launched through <code>WindowManager</code>:</p>
+<pre><code>using DOSI.CORE.UIComponents;
+using DOSI.CORE.UIComponents.WindowManagement;
+
+public class HelloApp : DOSIWindow
+{
+    public HelloApp()
+    {
+        Title  = "Hello, DOSI!";
+        Width  = 480;
+        Height = 280;
+
+        var button = new DOSIButton { Content = "Click me" };
+        button.Click += (_, _) =>
+            DOSIPopNotification.Show("Hi", "You clicked the button!");
+
+        Content = button;
+    }
+}
+
+// Launch it from anywhere in the shell:
+WindowManager.Instance.Open(new HelloApp());</code></pre>
+    <div class="note">
+      <strong>Tip:</strong> For richer apps, explore <code>DOSI.CORE.ProjectSystem</code> and <code>DOSI.CORE.Designer</code> — they let you author <code>DOSIProject</code> packages with a visual form designer and compile them into apps that register with <code>DOSIPublishedAppRegistry</code>.
+    </div>
+  </section>
+
+  <section class="step" id="ide">
+    <h2><span class="step-num">6</span> Inside DOSIIDE</h2>
+    <p>From the desktop, launch the <strong>Code</strong> app — that's <code>DOSIIDE</code>, your in-OS development environment. It's sandboxed to your user folder and gives you a Visual-Studio-style layout:</p>
+    <div class="flow">
+      <div class="flow-box">Toolbar<small>New · Build · Run · Publish</small></div>
+      <div class="flow-box">Solution Explorer<small>your home folder</small></div>
+      <div class="flow-box">Tabs + Editor<small>code or designer</small></div>
+      <div class="flow-box">Output Pane<small>build log + run preview</small></div>
+    </div>
+    <p>Behind the scenes the IDE uses <strong>Roslyn</strong> to compile your project in-memory, then reflectively invokes its entry point. Anything written to <code>Console.Out</code> is captured into the Output pane, and any returned <code>Control</code> is hosted in a live <code>DOSIWindow</code> on the desktop.</p>
+  </section>
+
+  <section class="step" id="projects">
+    <h2><span class="step-num">7</span> Creating a Real Project</h2>
+    <p>Press the <strong>New Project</strong> button. DOSIIDE scaffolds a folder under <code>~/Projects/&lt;name&gt;/</code> with a <code>.dosiproj</code> manifest:</p>
+<pre><code>{
+  "Name":        "MyCoolApp",
+  "Kind":        "DOSIControl",
+  "EntryType":   "Program",
+  "EntryMethod": "Run",
+  "FormatVersion": 1
+}</code></pre>
+    <p>The convention is simple: write a <code>static Run()</code> method that returns either <code>void</code> (script-like) or an Avalonia <code>Control</code> (UI app):</p>
+<pre><code>using Avalonia.Controls;
+using DOSI.CORE.UIComponents;
+
+public static class Program
+{
+    public static Control Run()
+    {
+        var stack = new StackPanel { Spacing = 8, Margin = new(16) };
+        stack.Children.Add(new DOSILabel  { Text = "Hello from a DOSI app!" });
+        stack.Children.Add(new DOSIButton { Content = "OK" });
+        return stack;
+    }
+}</code></pre>
+    <div class="note">
+      <strong>Even shorter:</strong> DOSIIDE allows top-level statements. A file containing just <code>var btn = new DOSIButton { Content = "Hi" }; return btn;</code> compiles too — the compiler auto-wraps it.
+    </div>
+  </section>
+
+  <section class="step" id="multifile">
+    <h2><span class="step-num">8</span> Going Multi-File</h2>
+    <p>Add as many <code>.cs</code> files as you need. Every source under the project folder (excluding <code>bin/</code> and <code>obj/</code>) is compiled together as one assembly. A typical layout:</p>
+<pre><code>MyCoolApp/
+├── MyCoolApp.dosiproj
+├── Program.cs            ← entry point with static Run()
+├── Models/
+│   └── TodoItem.cs
+├── Views/
+│   └── TodoView.cs       ← your own DOSIWindow subclass
+└── MainForm.dosiform     ← visual designer file (optional)</code></pre>
+<pre><code>// Views/TodoView.cs
+using DOSI.CORE.UIComponents;
+using DOSI.CORE.UIComponents.WindowManagement;
+
+public class TodoView : DOSIWindow
+{
+    public TodoView()
+    {
+        Title = "Todo";
+        WindowWidth  = 420;
+        WindowHeight = 320;
+        Content = new DOSILabel { Text = "My todos go here" };
+    }
+}
+
+// Program.cs
+public static class Program
+{
+    public static void Run() =&gt; WindowManager.Instance.Open(new TodoView());
+}</code></pre>
+  </section>
+
+  <section class="step" id="designer">
+    <h2><span class="step-num">9</span> Using the Visual Designer</h2>
+    <p>Right-click in the Solution Explorer and add a <code>.dosiform</code> file. DOSIIDE will open it in <strong>DOSIDesigner</strong> instead of the code editor:</p>
+    <ul>
+      <li><strong>Toolbox</strong> — drag any DOSI control onto the canvas</li>
+      <li><strong>Selection</strong> — click to select, arrow keys to nudge, corner handles to resize</li>
+      <li><strong>Snap-to-grid</strong> — 8 px grid with overlay</li>
+      <li><strong>Property grid</strong> — live edit Name, Text, Width, Dock, etc.</li>
+    </ul>
+    <p>The form is persisted as JSON. At runtime, <code>DOSIFormLoader</code> turns it back into a real <code>DOSIWindow</code> — so even a project with <em>no</em> <code>.cs</code> files can still <strong>Run</strong>.</p>
+<pre><code>// Snippet from a .dosiform document
+{
+  "Title": "Login",
+  "Width": 400, "Height": 240,
+  "Controls": [
+    { "Type": "DOSILabel",  "Name": "label1",  "X": 20, "Y": 20, "Properties": { "Text": "Username" } },
+    { "Type": "DOSITextBox","Name": "userBox", "X": 100,"Y": 20, "Width": 260 },
+    { "Type": "DOSIButton", "Name": "okBtn",   "X": 280,"Y": 180,"Properties": { "Content": "Sign In" } }
+  ]
+}</code></pre>
+  </section>
+
+  <section class="step" id="handlers">
+    <h2><span class="step-num">10</span> Event Handlers &amp; Docking</h2>
+    <p>Each designed control has a <code>Handlers</code> dictionary mapping <em>event name → C# body</em>. DOSIIDE compiles them into one synthetic class and binds each method to the live instance — no boilerplate required.</p>
+<pre><code>// In the designer, set okBtn.Click handler body to:
+if (string.IsNullOrWhiteSpace(userBox.Text))
+    DOSIPopNotification.Show("Oops", "Username is required.");
+else
+    DOSIPopNotification.Show("Welcome", "Hi, " + userBox.Text + "!");</code></pre>
+    <p>Form-level events (<code>Load</code>, <code>Closing</code>) are stored under the synthetic control name <code>Form</code> and wired to the host window.</p>
+    <p>Make your forms responsive with the <code>Dock</code> property:</p>
+    <div class="flow">
+      <div class="flow-box">None<small>absolute X/Y</small></div>
+      <div class="flow-box">Top<small>full-width header</small></div>
+      <div class="flow-box">Left<small>sidebar</small></div>
+      <div class="flow-box">Fill<small>main content</small></div>
+      <div class="flow-box">Bottom<small>status strip</small></div>
+    </div>
+  </section>
+
+  <section class="step" id="advanced">
+    <h2><span class="step-num">11</span> Advanced Patterns</h2>
+    <p>You have the full <code>DOSI.CORE</code> surface available. A few ideas to push further:</p>
+<pre><code>// Persist your own settings alongside SystemSettings.json
+var path = System.IO.Path.Combine(
+    System.AppContext.BaseDirectory, "MyApp.settings.json");
+System.IO.File.WriteAllText(path,
+    System.Text.Json.JsonSerializer.Serialize(new { Theme = "Dark" }));
+
+// React to accent changes globally
+AccentManager.Instance.AccentChanged += (_, _) =&gt;
+    DOSIPopNotification.Show("Theme", "Accent updated!");
+
+// Spawn a modal dialog
+var dlg = new DOSIDialog("Confirm", "Delete this item?");
+dlg.AddButton("Yes", () =&gt; { /* delete */ });
+dlg.AddButton("No",  () =&gt; { });
+WindowManager.Instance.Open(dlg);
+
+// Animate a control
+Tween.Animate(myControl, OpacityProperty, from: 0, to: 1,
+              duration: 250, easing: Easings.EaseOutCubic);</code></pre>
+    <div class="note">
+      <strong>Pro tip:</strong> Open the existing default apps in <code>DAX.OSI/DefaultApplications/</code> as living examples — <code>DOSIFileExplorer</code>, <code>DOSITerminal</code>, and the IDE itself all use the exact same APIs you do.
+    </div>
+  </section>
+
+  <section class="step" id="publish">
+    <h2><span class="step-num">12</span> Publishing Your App</h2>
+    <p>When your project builds and runs cleanly, hit the <strong>Publish (↑)</strong> button. DOSIIDE registers it with <code>DOSIPublishedAppRegistry</code>:</p>
+<pre><code>// Conceptually equivalent to what Publish does:
+DOSIPublishedAppRegistry.Register(myProject);
+
+// After publishing, any code in the OS can launch it:
+var window = DOSIPublishedAppRegistry.Launch("MyCoolApp");
+WindowManager.Instance.Open(window);</code></pre>
+    <p>Your app now appears on the desktop alongside built-ins like Terminal and File Explorer — a real, first-class DOSI citizen.</p>
+  </section>
+
+  <section class="step" id="next">
+    <h2><span class="step-num">13</span> Where to Go Next</h2>
+    <ul>
+      <li>Browse <code>DAX.OSI/DefaultApplications/</code> for full reference apps (Terminal, IDE, Browser, File Explorer).</li>
+      <li>Read <code>DOSI.CORE/UIComponents/</code> to see every control you can use.</li>
+      <li>Inspect <code>DOSI.CORE/ProjectSystem/</code> and <code>DOSI.CORE/Designer/</code> to understand how compilation and the form runtime work.</li>
+      <li>Open <strong>DOSIIDE</strong> from the desktop and start building — your first published app is just a few clicks away.</li>
+    </ul>
+  </section>
+
+</main>
+
+<footer>
+  <strong>DAX.OSI</strong> · powered by <strong>DOSI.CORE</strong> · built with .NET 9 + Avalonia
+</footer>
+
+</body>
+</html>
