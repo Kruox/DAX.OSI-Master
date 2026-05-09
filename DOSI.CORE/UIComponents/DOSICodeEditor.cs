@@ -1371,6 +1371,26 @@ public class DOSICodeEditor : Control
             }
         }
 
+        // Bracket matching: when the caret sits adjacent to a bracket, find
+        // its mate and outline both. Skipped during active selection so it
+        // doesn't fight the selection highlight visually.
+        if (IsFocused && !HasSelection && TryFindBracketPair(out var b1L, out var b1C, out var b2L, out var b2C))
+        {
+            var matchPen = new Pen(new SolidColorBrush(
+                Color.FromArgb(180, Accents.AccentPrimary.R, Accents.AccentPrimary.G, Accents.AccentPrimary.B)),
+                thickness: 1);
+            void DrawBracketBox(int line, int col)
+            {
+                var x = gutterW + TextPaddingX + col * charWidth;
+                var y = topPad + line * LineHeight - scrollOffset;
+                if (y < -LineHeight || y > Bounds.Height) return;
+                context.DrawRectangle(null, matchPen,
+                    new Rect(x - 0.5, y + 1, charWidth + 1, LineHeight - 2), 2, 2);
+            }
+            DrawBracketBox(b1L, b1C);
+            DrawBracketBox(b2L, b2C);
+        }
+
         // Selection highlight - drawn underneath the text so glyphs remain
         // crisp on top of the accent-tinted background.
         if (HasSelection)
@@ -1886,6 +1906,76 @@ public class DOSICodeEditor : Control
         return true;
     }
 
+    /// <summary>
+    /// If the caret is adjacent to a bracket character, locates its matching
+    /// counterpart and outputs the positions of both. Returns <c>false</c>
+    /// when there's no bracket near the caret or no match is found.
+    /// </summary>
+    private bool TryFindBracketPair(out int aLine, out int aCol, out int bLine, out int bCol)
+    {
+        aLine = aCol = bLine = bCol = 0;
+        if (_caretLine < 0 || _caretLine >= _lines.Count) return false;
+
+        var line = _lines[_caretLine];
+        // Prefer the bracket immediately to the LEFT of the caret (matches VS).
+        char? candidate = null;
+        int candidateCol = -1;
+        if (_caretCol > 0 && IsBracket(line[_caretCol - 1]))
+        {
+            candidate = line[_caretCol - 1]; candidateCol = _caretCol - 1;
+        }
+        else if (_caretCol < line.Length && IsBracket(line[_caretCol]))
+        {
+            candidate = line[_caretCol]; candidateCol = _caretCol;
+        }
+        if (candidate == null) return false;
+
+        var c = candidate.Value;
+        var (open, close, forward) = c switch
+        {
+            '(' => ('(', ')', true),
+            '[' => ('[', ']', true),
+            '{' => ('{', '}', true),
+            ')' => ('(', ')', false),
+            ']' => ('[', ']', false),
+            '}' => ('{', '}', false),
+            _ => ('\0', '\0', true)
+        };
+        if (open == '\0') return false;
+
+        int depth = 1;
+        if (forward)
+        {
+            for (int li = _caretLine; li < _lines.Count; li++)
+            {
+                var s = _lines[li];
+                int colStart = li == _caretLine ? candidateCol + 1 : 0;
+                for (int ci = colStart; ci < s.Length; ci++)
+                {
+                    if (s[ci] == open) depth++;
+                    else if (s[ci] == close) { depth--; if (depth == 0) { aLine = _caretLine; aCol = candidateCol; bLine = li; bCol = ci; return true; } }
+                }
+            }
+        }
+        else
+        {
+            for (int li = _caretLine; li >= 0; li--)
+            {
+                var s = _lines[li];
+                int colStart = li == _caretLine ? candidateCol - 1 : s.Length - 1;
+                for (int ci = colStart; ci >= 0; ci--)
+                {
+                    if (s[ci] == close) depth++;
+                    else if (s[ci] == open) { depth--; if (depth == 0) { aLine = _caretLine; aCol = candidateCol; bLine = li; bCol = ci; return true; } }
+                }
+            }
+        }
+        return false;
+    }
+
+    private static bool IsBracket(char c) =>
+        c == '(' || c == ')' || c == '[' || c == ']' || c == '{' || c == '}';
+
     private bool TryHandleAutoPair(char c)
     {
         var line = _lines[_caretLine];
@@ -1897,7 +1987,6 @@ public class DOSICodeEditor : Control
             _caretCol++;
             return true;
         }
-
         char close = c switch
         {
             '(' => ')',

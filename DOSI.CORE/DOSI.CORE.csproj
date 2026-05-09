@@ -15,6 +15,7 @@
     <PackageReference Include="Avalonia" Version="12.0.1" />
     <PackageReference Include="Avalonia.Desktop" Version="12.0.1" />
     <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.11.0" />
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp.Workspaces" Version="4.11.0" />
     <!-- Explicit reference to expose SkiaSharp's compile-time API (already a transitive
          dependency via Avalonia.Skia). Used by DOSIScreen to bake a Gaussian blur into
          the wallpaper bitmap once, so window dragging on top of a blurred backdrop

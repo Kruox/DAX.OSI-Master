@@ -104,6 +104,41 @@ public class DOSIIDE : DOSIWindow
         public string? ActivePath { get; set; }
     }
 
+    // ---- Recent projects ----
+    private string RecentProjectsFilePath =>
+        IOPath.Combine(_rootPath, ".dosi-ide-recent.json");
+    private const int MaxRecentProjects = 10;
+
+    private sealed class RecentProjectEntry
+    {
+        public string Path { get; set; } = string.Empty;
+        public string Name { get; set; } = string.Empty;
+        public DateTime LastOpenedUtc { get; set; }
+    }
+
+    // ---- Build status spinner ----
+    private Border? _spinnerHost;
+    private TextBlock? _spinnerGlyph;
+    private RotateTransform? _spinnerRotate;
+    private Avalonia.Threading.DispatcherTimer? _spinnerTimer;
+
+    // ---- Format-document chord state (Ctrl+K then Ctrl+D) ----
+    private DateTime _ctrlKDownUtc;
+    private static readonly TimeSpan ChordWindow = TimeSpan.FromSeconds(1.5);
+
+    // ---- Quick file switcher (Ctrl+,) ----
+    private Border? _switcherOverlay;
+    private DOSITextBox? _switcherInput;
+    private StackPanel? _switcherResults;
+    private List<string> _switcherFiles = new();
+    private List<(string Path, Border Row)> _switcherVisible = new();
+    private int _switcherSelectedIndex;
+
+    // ---- Tab drag-reorder state ----
+    private EditorTab? _draggingTab;
+    private Point _dragStartPoint;
+    private bool _dragActive;
+
     public DOSIIDE()
     {
         Title = "Code";
@@ -157,7 +192,7 @@ public class DOSIIDE : DOSIWindow
             Spacing = 4,
             VerticalAlignment = VerticalAlignment.Center,
             Children = { newProjectBtn, newBtn, openBtn, saveBtn, saveAllBtn,
-                         BuildToolDivider(), buildBtn, runBtn, publishBtn, renameBtn }
+                         BuildToolDivider(), buildBtn, runBtn, BuildSpinner(), publishBtn, renameBtn }
         };
 
         var toolbarGrid = new Grid
@@ -501,7 +536,22 @@ public class DOSIIDE : DOSIWindow
         else if (ctrl && e.Key == Key.F)     { ShowFindBar(); e.Handled = true; }
         else if (ctrl && e.Key == Key.G)     { ShowGotoBar(); e.Handled = true; }
         else if (ctrl && shift && e.Key == Key.T) { ReopenLastClosedTab(); e.Handled = true; }
+        else if (ctrl && e.Key == Key.OemComma) { ShowQuickSwitcher(); e.Handled = true; }
+        else if (ctrl && e.Key == Key.K)
+        {
+            // First half of the Ctrl+K, Ctrl+D format-document chord.
+            _ctrlKDownUtc = DateTime.UtcNow;
+            e.Handled = true;
+        }
+        else if (ctrl && e.Key == Key.D &&
+                 (DateTime.UtcNow - _ctrlKDownUtc) < ChordWindow)
+        {
+            _ctrlKDownUtc = DateTime.MinValue;
+            FormatActiveDocument();
+            e.Handled = true;
+        }
         else if (e.Key == Key.Escape && _commandMode != null) { HideCommandBar(); e.Handled = true; }
+        else if (e.Key == Key.Escape && _switcherOverlay?.IsVisible == true) { HideQuickSwitcher(); e.Handled = true; }
     }
 
     // =====================================================================
@@ -539,18 +589,96 @@ public class DOSIIDE : DOSIWindow
 
     private Control BuildEmptyState()
     {
-        var msg = new TextBlock
+        var stack = new StackPanel
         {
-            Text = "No project open.\n\nUse New project to create one,\nor Open project to pick an existing one.",
+            Orientation = Orientation.Vertical,
+            Spacing = 8,
+            Margin = new Thickness(16, 24, 16, 0),
+            HorizontalAlignment = HorizontalAlignment.Stretch
+        };
+
+        stack.Children.Add(new TextBlock
+        {
+            Text = "No project open.",
             FontSize = 12,
+            FontWeight = FontWeight.SemiBold,
+            TextAlignment = TextAlignment.Center,
+            Foreground = Accents.TextSecondaryBrush,
+            Opacity = 0.85
+        });
+        stack.Children.Add(new TextBlock
+        {
+            Text = "Use New project to create one,\nor Open project to pick an existing one.",
+            FontSize = 11,
             TextAlignment = TextAlignment.Center,
             TextWrapping = TextWrapping.Wrap,
             Foreground = Accents.TextSecondaryBrush,
-            Opacity = 0.8,
-            HorizontalAlignment = HorizontalAlignment.Center,
-            Margin = new Thickness(16, 24, 16, 0)
+            Opacity = 0.7
+        });
+
+        var recents = LoadRecentProjects();
+        if (recents.Count > 0)
+        {
+            stack.Children.Add(new TextBlock
+            {
+                Text = "RECENT",
+                FontSize = 10,
+                FontWeight = FontWeight.SemiBold,
+                Foreground = Accents.TextSecondaryBrush,
+                Opacity = 0.6,
+                Margin = new Thickness(8, 18, 0, 4)
+            });
+            foreach (var entry in recents)
+            {
+                var row = BuildRecentProjectRow(entry);
+                if (row != null) stack.Children.Add(row);
+            }
+        }
+        return stack;
+    }
+
+    private Border? BuildRecentProjectRow(RecentProjectEntry entry)
+    {
+        if (string.IsNullOrEmpty(entry.Path) || !Directory.Exists(entry.Path)) return null;
+
+        var nameText = new TextBlock
+        {
+            Text = string.IsNullOrEmpty(entry.Name) ? IOPath.GetFileName(entry.Path) : entry.Name,
+            FontSize = 12,
+            FontWeight = FontWeight.SemiBold,
+            Foreground = Accents.TextPrimaryBrush
         };
-        return msg;
+        var pathText = new TextBlock
+        {
+            Text = entry.Path,
+            FontSize = 10,
+            Foreground = Accents.TextSecondaryBrush,
+            Opacity = 0.7,
+            TextTrimming = TextTrimming.CharacterEllipsis
+        };
+        var stack = new StackPanel { Orientation = Orientation.Vertical, Children = { nameText, pathText } };
+
+        var row = new Border
+        {
+            Padding = new Thickness(8, 6),
+            CornerRadius = new CornerRadius(6),
+            Background = Brushes.Transparent,
+            Cursor = new Cursor(StandardCursorType.Hand),
+            Child = stack
+        };
+        row.PointerEntered += (_, _) =>
+            row.Background = new SolidColorBrush(Color.FromArgb(30, 255, 255, 255));
+        row.PointerExited += (_, _) => row.Background = Brushes.Transparent;
+        row.PointerReleased += (_, _) =>
+        {
+            try
+            {
+                var loaded = DOSIProjectManager.Load(entry.Path);
+                if (loaded != null) SetActiveProject(loaded);
+            }
+            catch { /* ignore - row will silently no-op if the project went stale */ }
+        };
+        return row;
     }
 
     private void RefreshTree()
@@ -883,6 +1011,7 @@ public class DOSIIDE : DOSIWindow
 
         _tabs.Add(tab);
         _tabStrip.Children.Add(tabBorder);
+        WireTabInteraction(tab);
         ActivateTab(tab);
     }
 
@@ -962,6 +1091,7 @@ public class DOSIIDE : DOSIWindow
 
         _tabs.Add(tab);
         _tabStrip.Children.Add(tabBorder);
+        WireTabInteraction(tab);
         ActivateTab(tab);
     }
 
@@ -1150,6 +1280,7 @@ public class DOSIIDE : DOSIWindow
 
         _tabs.Add(tab);
         _tabStrip.Children.Add(tabBorder);
+        WireTabInteraction(tab);
         ActivateTab(tab);
 
         // Land the caret on the freshly-requested handler instead of dumping
@@ -1279,7 +1410,11 @@ public class DOSIIDE : DOSIWindow
     {
         _activeProject = project;
         _expandedFolders.Clear();
-        if (project != null) _expandedFolders.Add(project.FolderPath);
+        if (project != null)
+        {
+            _expandedFolders.Add(project.FolderPath);
+            TouchRecentProject(project);
+        }
         BuildTree();
         _statusProject.Text = project != null ? "Project: " + project.Name : "No project";
     }
@@ -1790,7 +1925,19 @@ public class DOSIIDE : DOSIWindow
     private void RunBuildOrRun(bool runAfter)
     {
         ShowOutput();
+        StartBuildSpinner(runAfter ? "Running" : "Building");
+        try
+        {
+            RunBuildOrRunCore(runAfter);
+        }
+        finally
+        {
+            StopBuildSpinner();
+        }
+    }
 
+    private void RunBuildOrRunCore(bool runAfter)
+    {
         // Tear down any previous standalone run window before starting again.
         CloseRunWindow();
         if (_runPreviewContent != null) _runPreviewContent.Children.Clear();
@@ -2753,5 +2900,416 @@ public class {className}
             OpenFile(path);
             return;
         }
+    }
+
+    // =====================================================================
+    // Format document (Ctrl+K, Ctrl+D)
+    // =====================================================================
+
+    private void FormatActiveDocument()
+    {
+        var ed = _activeTab?.Editor;
+        if (ed == null) return;
+        if (!_activeTab!.Path.EndsWith(".cs", StringComparison.OrdinalIgnoreCase)) return;
+
+        try
+        {
+            var src = ed.Text;
+            var tree = Microsoft.CodeAnalysis.CSharp.CSharpSyntaxTree.ParseText(src);
+            var root = tree.GetRoot();
+            using var workspace = new Microsoft.CodeAnalysis.AdhocWorkspace();
+            var formatted = Microsoft.CodeAnalysis.Formatting.Formatter
+                .Format(root, workspace).ToFullString();
+
+            if (formatted != src)
+            {
+                var line = ed.CaretLine;
+                var col = ed.CaretColumn;
+                ed.Text = formatted;
+                ed.GoToLine(line, col);
+            }
+        }
+        catch (Exception ex)
+        {
+            ShowOutput();
+            AppendOutput($"[Format] Failed: {ex.Message}");
+        }
+    }
+
+    // =====================================================================
+    // Build status spinner
+    // =====================================================================
+
+    private Border BuildSpinner()
+    {
+        _spinnerGlyph = new TextBlock
+        {
+            Text = "\u25D2",
+            FontSize = 14,
+            Foreground = new SolidColorBrush(AccentManager.Instance.TextOnAccent),
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        _spinnerRotate = new RotateTransform(0);
+        _spinnerGlyph.RenderTransform = _spinnerRotate;
+        _spinnerGlyph.RenderTransformOrigin = RelativePoint.Center;
+
+        _spinnerHost = new Border
+        {
+            Width = 18,
+            Height = 18,
+            Margin = new Thickness(8, 0),
+            VerticalAlignment = VerticalAlignment.Center,
+            IsVisible = false,
+            Child = _spinnerGlyph
+        };
+        return _spinnerHost;
+    }
+
+    private void StartBuildSpinner(string label)
+    {
+        if (_spinnerHost == null) return;
+        ToolTip.SetTip(_spinnerHost, label);
+        _spinnerHost.IsVisible = true;
+        _spinnerTimer?.Stop();
+        _spinnerTimer = new Avalonia.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(40) };
+        _spinnerTimer.Tick += (_, _) =>
+        {
+            if (_spinnerRotate != null) _spinnerRotate.Angle = (_spinnerRotate.Angle + 18) % 360;
+        };
+        _spinnerTimer.Start();
+    }
+
+    private void StopBuildSpinner()
+    {
+        if (_spinnerHost == null) return;
+        _spinnerTimer?.Stop();
+        _spinnerTimer = null;
+        if (_spinnerRotate != null) _spinnerRotate.Angle = 0;
+        _spinnerHost.IsVisible = false;
+    }
+
+    // =====================================================================
+    // Quick file switcher (Ctrl+,)
+    // =====================================================================
+
+    private void ShowQuickSwitcher()
+    {
+        if (_activeProject == null) return;
+        if (Content is not Panel host) return;
+
+        if (_switcherOverlay == null) BuildQuickSwitcherOverlay(host);
+        if (_switcherOverlay == null || _switcherInput == null) return;
+
+        // Refresh the file index every time so newly added files appear.
+        _switcherFiles = EnumerateProjectFiles(_activeProject.FolderPath).ToList();
+        _switcherInput.Text = string.Empty;
+        RefreshQuickSwitcherResults();
+
+        _switcherOverlay.IsVisible = true;
+        Avalonia.Threading.Dispatcher.UIThread.Post(() => _switcherInput.Focus(),
+            Avalonia.Threading.DispatcherPriority.Loaded);
+    }
+
+    private void HideQuickSwitcher()
+    {
+        if (_switcherOverlay == null) return;
+        _switcherOverlay.IsVisible = false;
+        _activeTab?.Editor?.Focus();
+    }
+
+    private void BuildQuickSwitcherOverlay(Panel host)
+    {
+        _switcherInput = new DOSITextBox
+        {
+            Width = 480,
+            HorizontalAlignment = HorizontalAlignment.Center
+        };
+        _switcherInput.PropertyChanged += (_, e) =>
+        {
+            if (e.Property.Name == "Text") RefreshQuickSwitcherResults();
+        };
+        _switcherInput.KeyDown += OnQuickSwitcherKey;
+
+        _switcherResults = new StackPanel
+        {
+            Orientation = Orientation.Vertical,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            Margin = new Thickness(0, 8, 0, 0)
+        };
+
+        var card = new Border
+        {
+            Width = 520,
+            Background = new SolidColorBrush(Color.FromArgb(235, 22, 28, 60)),
+            BorderBrush = new SolidColorBrush(Color.FromArgb(80, 255, 255, 255)),
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(10),
+            Padding = new Thickness(14),
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Top,
+            Margin = new Thickness(0, 80, 0, 0),
+            Child = new StackPanel
+            {
+                Orientation = Orientation.Vertical,
+                Children = { _switcherInput, _switcherResults }
+            }
+        };
+
+        _switcherOverlay = new Border
+        {
+            Background = new SolidColorBrush(Color.FromArgb(120, 0, 0, 0)),
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            VerticalAlignment = VerticalAlignment.Stretch,
+            IsVisible = false,
+            Child = card
+        };
+        _switcherOverlay.PointerPressed += (_, e) =>
+        {
+            // Click outside the card dismisses.
+            if (e.Source == _switcherOverlay) HideQuickSwitcher();
+        };
+        host.Children.Add(_switcherOverlay);
+    }
+
+    private static IEnumerable<string> EnumerateProjectFiles(string projectFolder)
+    {
+        if (!Directory.Exists(projectFolder)) return Array.Empty<string>();
+        try
+        {
+            return Directory.EnumerateFiles(projectFolder, "*", SearchOption.AllDirectories)
+                .Where(p =>
+                {
+                    var name = IOPath.GetFileName(p);
+                    if (name.EndsWith(DOSIProjectManager.ManifestExtension, StringComparison.OrdinalIgnoreCase)) return false;
+                    var rel = p.Substring(projectFolder.Length).Replace('\\', '/');
+                    if (rel.Contains("/bin/", StringComparison.OrdinalIgnoreCase)) return false;
+                    if (rel.Contains("/obj/", StringComparison.OrdinalIgnoreCase)) return false;
+                    var ext = IOPath.GetExtension(name).ToLowerInvariant();
+                    return ext is ".cs" or ".dosiform" or ".json" or ".txt" or ".md";
+                })
+                .OrderBy(IOPath.GetFileName, StringComparer.OrdinalIgnoreCase);
+        }
+        catch { return Array.Empty<string>(); }
+    }
+
+    private void RefreshQuickSwitcherResults()
+    {
+        if (_switcherResults == null || _switcherInput == null) return;
+        _switcherResults.Children.Clear();
+        _switcherVisible.Clear();
+
+        var query = _switcherInput.Text ?? string.Empty;
+        var matches = string.IsNullOrEmpty(query)
+            ? _switcherFiles.Take(20)
+            : _switcherFiles
+                .Where(p => FuzzyMatch(IOPath.GetFileName(p), query) || FuzzyMatch(p, query))
+                .Take(20);
+
+        int idx = 0;
+        foreach (var path in matches)
+        {
+            var capturedIdx = idx;
+            var capturedPath = path;
+            var name = new TextBlock
+            {
+                Text = IOPath.GetFileName(path),
+                FontSize = 12,
+                FontWeight = FontWeight.SemiBold,
+                Foreground = Accents.TextPrimaryBrush
+            };
+            var rel = _activeProject != null && path.StartsWith(_activeProject.FolderPath, StringComparison.OrdinalIgnoreCase)
+                ? path.Substring(_activeProject.FolderPath.Length).TrimStart('\\', '/')
+                : path;
+            var sub = new TextBlock
+            {
+                Text = rel,
+                FontSize = 10,
+                Foreground = Accents.TextSecondaryBrush,
+                Opacity = 0.7,
+                TextTrimming = TextTrimming.CharacterEllipsis
+            };
+            var row = new Border
+            {
+                Padding = new Thickness(8, 5),
+                CornerRadius = new CornerRadius(4),
+                Background = Brushes.Transparent,
+                Cursor = new Cursor(StandardCursorType.Hand),
+                Child = new StackPanel { Orientation = Orientation.Vertical, Children = { name, sub } }
+            };
+            row.PointerEntered += (_, _) => { _switcherSelectedIndex = capturedIdx; HighlightQuickSwitcherSelection(); };
+            row.PointerReleased += (_, _) => { OpenFile(capturedPath); HideQuickSwitcher(); };
+            _switcherResults.Children.Add(row);
+            _switcherVisible.Add((path, row));
+            idx++;
+        }
+        _switcherSelectedIndex = 0;
+        HighlightQuickSwitcherSelection();
+    }
+
+    private void HighlightQuickSwitcherSelection()
+    {
+        for (int i = 0; i < _switcherVisible.Count; i++)
+        {
+            _switcherVisible[i].Row.Background = i == _switcherSelectedIndex
+                ? new SolidColorBrush(Color.FromArgb(60, AccentManager.Instance.AccentPrimary.R,
+                    AccentManager.Instance.AccentPrimary.G, AccentManager.Instance.AccentPrimary.B))
+                : Brushes.Transparent;
+        }
+    }
+
+    private void OnQuickSwitcherKey(object? sender, KeyEventArgs e)
+    {
+        if (_switcherVisible.Count == 0) return;
+        switch (e.Key)
+        {
+            case Key.Down:
+                _switcherSelectedIndex = Math.Min(_switcherSelectedIndex + 1, _switcherVisible.Count - 1);
+                HighlightQuickSwitcherSelection();
+                e.Handled = true;
+                return;
+            case Key.Up:
+                _switcherSelectedIndex = Math.Max(_switcherSelectedIndex - 1, 0);
+                HighlightQuickSwitcherSelection();
+                e.Handled = true;
+                return;
+            case Key.Enter:
+                var path = _switcherVisible[_switcherSelectedIndex].Path;
+                OpenFile(path);
+                HideQuickSwitcher();
+                e.Handled = true;
+                return;
+            case Key.Escape:
+                HideQuickSwitcher();
+                e.Handled = true;
+                return;
+        }
+    }
+
+    /// <summary>
+    /// Order-preserving substring fuzzy match: every char in <paramref name="query"/>
+    /// must appear in <paramref name="haystack"/> in order (case-insensitive).
+    /// </summary>
+    private static bool FuzzyMatch(string haystack, string query)
+    {
+        if (string.IsNullOrEmpty(query)) return true;
+        int hi = 0, qi = 0;
+        while (hi < haystack.Length && qi < query.Length)
+        {
+            if (char.ToLowerInvariant(haystack[hi]) == char.ToLowerInvariant(query[qi])) qi++;
+            hi++;
+        }
+        return qi == query.Length;
+    }
+
+    // =====================================================================
+    // Tab interaction (middle-click close + drag-reorder)
+    // =====================================================================
+
+    private void WireTabInteraction(EditorTab tab)
+    {
+        var border = tab.TabBorder;
+
+        // Middle-click closes the tab.
+        border.PointerPressed += (_, e) =>
+        {
+            var props = e.GetCurrentPoint(border).Properties;
+            if (props.IsMiddleButtonPressed)
+            {
+                CloseTab(tab);
+                e.Handled = true;
+                return;
+            }
+            if (props.IsLeftButtonPressed)
+            {
+                _draggingTab = tab;
+                _dragStartPoint = e.GetPosition(_tabStrip);
+                _dragActive = false;
+            }
+        };
+
+        border.PointerMoved += (_, e) =>
+        {
+            if (_draggingTab != tab || !e.GetCurrentPoint(border).Properties.IsLeftButtonPressed) return;
+            var pos = e.GetPosition(_tabStrip);
+            if (!_dragActive)
+            {
+                if (Math.Abs(pos.X - _dragStartPoint.X) < 6) return;
+                _dragActive = true;
+            }
+            ReorderDraggingTab(pos.X);
+        };
+
+        border.PointerReleased += (_, _) =>
+        {
+            _draggingTab = null;
+            _dragActive = false;
+        };
+    }
+
+    private void ReorderDraggingTab(double mouseX)
+    {
+        if (_draggingTab == null) return;
+        var currentIdx = _tabs.IndexOf(_draggingTab);
+        if (currentIdx < 0) return;
+
+        // Find the tab the cursor is hovering over by walking the strip.
+        double accum = 0;
+        int targetIdx = _tabs.Count - 1;
+        for (int i = 0; i < _tabs.Count; i++)
+        {
+            var w = _tabs[i].TabBorder.Bounds.Width;
+            if (mouseX < accum + w / 2) { targetIdx = i; break; }
+            accum += w;
+        }
+
+        if (targetIdx == currentIdx) return;
+
+        // Move in both the model and the visual strip.
+        var moving = _draggingTab;
+        _tabs.RemoveAt(currentIdx);
+        _tabStrip.Children.RemoveAt(currentIdx);
+        _tabs.Insert(targetIdx, moving);
+        _tabStrip.Children.Insert(targetIdx, moving.TabBorder);
+        SaveSession();
+    }
+
+    // =====================================================================
+    // Recent projects
+    // =====================================================================
+
+    private List<RecentProjectEntry> LoadRecentProjects()
+    {
+        if (!File.Exists(RecentProjectsFilePath)) return new List<RecentProjectEntry>();
+        try
+        {
+            var list = JsonSerializer.Deserialize<List<RecentProjectEntry>>(
+                File.ReadAllText(RecentProjectsFilePath)) ?? new();
+            return list
+                .Where(e => Directory.Exists(e.Path))
+                .OrderByDescending(e => e.LastOpenedUtc)
+                .Take(MaxRecentProjects)
+                .ToList();
+        }
+        catch { return new List<RecentProjectEntry>(); }
+    }
+
+    private void TouchRecentProject(DOSIProject project)
+    {
+        try
+        {
+            var list = LoadRecentProjects();
+            list.RemoveAll(e => string.Equals(e.Path, project.FolderPath, StringComparison.OrdinalIgnoreCase));
+            list.Insert(0, new RecentProjectEntry
+            {
+                Path = project.FolderPath,
+                Name = project.Name,
+                LastOpenedUtc = DateTime.UtcNow
+            });
+            if (list.Count > MaxRecentProjects) list = list.Take(MaxRecentProjects).ToList();
+            File.WriteAllText(RecentProjectsFilePath,
+                JsonSerializer.Serialize(list, new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch { /* best-effort */ }
     }
 }
