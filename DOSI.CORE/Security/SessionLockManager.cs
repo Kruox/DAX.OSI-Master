@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Input;
@@ -49,6 +50,19 @@ public sealed class SessionLockManager : IDisposable
     private Tween? _activeFadeTween;
     private bool _running;
     private bool _idleWarningShown;
+    private Point _lastPointerPosition;
+    private bool _pointerPositionInitialized;
+
+    /// <summary>
+    /// Minimum cursor displacement (in pixels, Manhattan distance) that counts
+    /// as real user activity. Smaller moves are ignored so synthesized pointer
+    /// events from hover-state recalculation, animation, or jitter don't keep
+    /// resetting the idle counter.
+    /// </summary>
+    private const double PointerMoveThresholdPixels = 4;
+
+    /// <summary>How often the idle check runs.</summary>
+    private static readonly TimeSpan IdleCheckInterval = TimeSpan.FromSeconds(5);
 
     /// <summary>
     /// Number of seconds before the lock fires that the manager will show a
@@ -111,14 +125,26 @@ public sealed class SessionLockManager : IDisposable
         _running = true;
         Instance = this;
         _lastActivityUtc = DateTime.UtcNow;
+        _pointerPositionInitialized = false;
 
-        _inputSource.AddHandler(InputElement.PointerMovedEvent, OnActivity, RoutingStrategies.Tunnel | RoutingStrategies.Bubble, handledEventsToo: true);
-        _inputSource.AddHandler(InputElement.PointerPressedEvent, OnActivity, RoutingStrategies.Tunnel | RoutingStrategies.Bubble, handledEventsToo: true);
-        _inputSource.AddHandler(InputElement.KeyDownEvent, OnActivity, RoutingStrategies.Tunnel | RoutingStrategies.Bubble, handledEventsToo: true);
+        // Pointer moves are filtered by displacement (see OnPointerMoved); key
+        // presses and pointer presses always count as activity. handledEventsToo
+        // so we still see input that DOSIWindow chrome / focused controls have
+        // already marked Handled.
+        _inputSource.AddHandler(InputElement.PointerMovedEvent, OnPointerMoved,
+            RoutingStrategies.Tunnel | RoutingStrategies.Bubble, handledEventsToo: true);
+        _inputSource.AddHandler(InputElement.PointerPressedEvent, OnPointerPressed,
+            RoutingStrategies.Tunnel | RoutingStrategies.Bubble, handledEventsToo: true);
+        _inputSource.AddHandler(InputElement.KeyDownEvent, OnKeyDown,
+            RoutingStrategies.Tunnel | RoutingStrategies.Bubble, handledEventsToo: true);
 
-        _idleTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(15) };
-        _idleTimer.Tick += OnIdleTick;
+        // DispatcherPriority.Normal so the tick is not starved by background
+        // animations / video repaints.
+        _idleTimer = new DispatcherTimer(IdleCheckInterval, DispatcherPriority.Normal, OnIdleTick);
         _idleTimer.Start();
+
+        Debug.WriteLine($"[SessionLock] Started for user '{UserManager.CurrentUser.Username}', " +
+                        $"timeout={GetIdleMinutesForCurrentUser()}m, check every {IdleCheckInterval.TotalSeconds}s");
     }
 
     /// <summary>
@@ -130,15 +156,16 @@ public sealed class SessionLockManager : IDisposable
         if (!_running) return;
         _running = false;
 
-        _inputSource.RemoveHandler(InputElement.PointerMovedEvent, OnActivity);
-        _inputSource.RemoveHandler(InputElement.PointerPressedEvent, OnActivity);
-        _inputSource.RemoveHandler(InputElement.KeyDownEvent, OnActivity);
+        _inputSource.RemoveHandler(InputElement.PointerMovedEvent, OnPointerMoved);
+        _inputSource.RemoveHandler(InputElement.PointerPressedEvent, OnPointerPressed);
+        _inputSource.RemoveHandler(InputElement.KeyDownEvent, OnKeyDown);
 
         if (_idleTimer != null) { _idleTimer.Stop(); _idleTimer.Tick -= OnIdleTick; _idleTimer = null; }
 
         if (_activeLockControl != null) DismissImmediate();
 
         if (Instance == this) Instance = null;
+        Debug.WriteLine("[SessionLock] Stopped.");
     }
 
     /// <summary>Records user activity, resetting the idle countdown.</summary>
@@ -172,9 +199,43 @@ public sealed class SessionLockManager : IDisposable
     /// </summary>
     public void LockNow() => ShowLockScreenInternal();
 
-    private void OnActivity(object? sender, RoutedEventArgs e)
+    private void OnPointerMoved(object? sender, PointerEventArgs e)
     {
-        if (_activeLockControl != null) return; // ignore activity while locked
+        if (_activeLockControl != null) return;
+
+        Point pos;
+        try { pos = e.GetPosition(_inputSource); }
+        catch { return; }
+
+        if (!_pointerPositionInitialized)
+        {
+            _lastPointerPosition = pos;
+            _pointerPositionInitialized = true;
+            return;     // first sample - no displacement to compare against
+        }
+
+        var dx = Math.Abs(pos.X - _lastPointerPosition.X);
+        var dy = Math.Abs(pos.Y - _lastPointerPosition.Y);
+        if (dx + dy < PointerMoveThresholdPixels) return;     // jitter / synthesized
+
+        _lastPointerPosition = pos;
+        RecordActivity();
+    }
+
+    private void OnPointerPressed(object? sender, PointerPressedEventArgs e)
+    {
+        if (_activeLockControl != null) return;
+        RecordActivity();
+    }
+
+    private void OnKeyDown(object? sender, KeyEventArgs e)
+    {
+        if (_activeLockControl != null) return;
+        RecordActivity();
+    }
+
+    private void RecordActivity()
+    {
         _idleWarningShown = false;
         NotifyActivity();
     }
@@ -189,22 +250,32 @@ public sealed class SessionLockManager : IDisposable
         var lockAtSeconds = minutes * 60d;
         var idleSeconds = idle.TotalSeconds;
 
+        Debug.WriteLine($"[SessionLock] tick: idle={idleSeconds:F0}s / lockAt={lockAtSeconds:F0}s");
+
         // One-minute warning: only show when the configured timeout is at
         // least 2 minutes (a 1-minute timeout would warn immediately).
         if (IdleWarningSeconds > 0 && !_idleWarningShown && minutes >= 2 &&
             idleSeconds >= lockAtSeconds - IdleWarningSeconds && idleSeconds < lockAtSeconds)
         {
             _idleWarningShown = true;
+            Debug.WriteLine("[SessionLock] showing 1-minute warning toast");
             try
             {
                 DOSIPopNotification.Show(
                     "Session will lock in 1 minute. Move the mouse to stay signed in.",
                     TimeSpan.FromSeconds(8));
             }
-            catch { /* host may not be set yet during early boot - ignore */ }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"[SessionLock] warning toast failed: {ex.Message}");
+            }
         }
 
-        if (idleSeconds >= lockAtSeconds) ShowLockScreenInternal();
+        if (idleSeconds >= lockAtSeconds)
+        {
+            Debug.WriteLine("[SessionLock] idle threshold reached - locking session");
+            ShowLockScreenInternal();
+        }
     }
 
     private void ShowLockScreenInternal()
