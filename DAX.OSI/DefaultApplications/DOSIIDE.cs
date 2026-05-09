@@ -3480,21 +3480,34 @@ public class {className}
                 IsHitTestVisible = false
             };
         }
-        // Re-insert at the target index inside the tab strip.
-        _tabStrip.Children.Remove(_dragInsertionIndicator);
+        // Detach from any previous parent before re-inserting; setting
+        // Children.Insert on a control that's already parented (even in the
+        // SAME panel) throws "control already has a visual parent".
+        if (_dragInsertionIndicator.Parent is Panel p)
+            p.Children.Remove(_dragInsertionIndicator);
+
         var safeIdx = Math.Clamp(targetIdx, 0, _tabStrip.Children.Count);
         _tabStrip.Children.Insert(safeIdx, _dragInsertionIndicator);
     }
 
     private void ClearDragInsertionIndicator()
     {
-        if (_dragInsertionIndicator != null)
-            _tabStrip.Children.Remove(_dragInsertionIndicator);
+        if (_dragInsertionIndicator == null) return;
+        if (_dragInsertionIndicator.Parent is Panel p)
+            p.Children.Remove(_dragInsertionIndicator);
     }
 
     private void ReorderDraggingTab(double mouseX)
     {
         if (_draggingTab == null) return;
+
+        // Always strip the insertion indicator before any index math: it lives
+        // in _tabStrip.Children but NOT in _tabs, so leaving it in place
+        // desyncs the two collections and the next RemoveAt yanks the wrong
+        // control (or the same control twice, which crashes Avalonia with
+        // "already has a visual parent").
+        ClearDragInsertionIndicator();
+
         var currentIdx = _tabs.IndexOf(_draggingTab);
         if (currentIdx < 0) return;
 
@@ -3508,16 +3521,19 @@ public class {className}
             accum += w;
         }
 
-        if (targetIdx == currentIdx) return;
+        if (targetIdx != currentIdx)
+        {
+            // Move by reference so we don't depend on _tabStrip.Children
+            // happening to be in lock-step with _tabs at this exact moment.
+            var moving = _draggingTab;
+            _tabs.RemoveAt(currentIdx);
+            _tabStrip.Children.Remove(moving.TabBorder);
+            _tabs.Insert(targetIdx, moving);
+            _tabStrip.Children.Insert(targetIdx, moving.TabBorder);
+            SaveSession();
+        }
 
-        // Move in both the model and the visual strip.
-        var moving = _draggingTab;
-        _tabs.RemoveAt(currentIdx);
-        _tabStrip.Children.RemoveAt(currentIdx);
-        _tabs.Insert(targetIdx, moving);
-        _tabStrip.Children.Insert(targetIdx, moving.TabBorder);
         ShowDragInsertionIndicator(targetIdx + 1);
-        SaveSession();
     }
 
     // =====================================================================
