@@ -197,11 +197,13 @@ public class MainWindow : Window
         var shutdownScreen = new ShutdownScreen();
         _screenManager.RegisterScreen(shutdownScreen);
 
+        var slideTask = _screenManager.GetScreen<DesktopScreen>("desktop")
+            ?.AnimateTaskbarOutAsync() ?? Task.CompletedTask;
         var fadeTask = FadeOverlaysAsync(_globalOverlay.Opacity, 0d, 500);
         var navTask = _screenManager.NavigateToWithCrossfadeAsync(
             "shutdown",
             System.TimeSpan.FromMilliseconds(500));
-        await Task.WhenAll(fadeTask, navTask);
+        await Task.WhenAll(slideTask, fadeTask, navTask);
 
         await shutdownScreen.RunAsync();
     }
@@ -231,11 +233,15 @@ public class MainWindow : Window
         var signoutScreen = new SignoutScreen(leavingUser);
         _screenManager.RegisterScreen(signoutScreen);
 
+        // Slide the desktop taskbar out in parallel with the overlay fade so
+        // the chrome retracts visibly instead of just dissolving.
+        var slideTask = _screenManager.GetScreen<DesktopScreen>("desktop")
+            ?.AnimateTaskbarOutAsync() ?? Task.CompletedTask;
         var fadeTask = FadeOverlaysAsync(_globalOverlay.Opacity, 0d, 450);
         var navTask = _screenManager.NavigateToWithCrossfadeAsync(
             "signout",
             TimeSpan.FromMilliseconds(450));
-        await Task.WhenAll(fadeTask, navTask);
+        await Task.WhenAll(slideTask, fadeTask, navTask);
 
         // Collapse the overlays entirely once they're invisible. With
         // IsVisible=false the persistent DOSIWindow instances drop out of

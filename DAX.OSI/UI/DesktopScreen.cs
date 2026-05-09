@@ -32,11 +32,14 @@ public class DesktopScreen : DOSIScreen
     private static AccentManager Accents => AccentManager.Instance;
 
     private const double TaskbarHeight = 28;
-
     // ----- Layout -----
     private readonly Grid _layoutRoot;
     private readonly Grid _ambientLayer;
     private readonly Border _taskbar;
+    // Drives the taskbar slide-in / slide-out animations. The Border's Y
+    // translation moves between -TaskbarHeight (off-screen above) and 0
+    // (docked at the top of the desktop).
+    private readonly TranslateTransform _taskbarSlide = null!;
     private readonly Border _appsButton;
     private readonly Border _appsButtonAccent;
     private readonly TextBlock _appsButtonLabel;
@@ -249,7 +252,11 @@ public class DesktopScreen : DOSIScreen
             Background = BuildTaskbarBackground(),
             BorderBrush = BuildTaskbarBorderBrush(),
             BorderThickness = new Thickness(0, 0, 0, 1),
-            Child = taskbarGrid
+            Child = taskbarGrid,
+            // Start the bar parked above the screen so the slide-in animation
+            // (kicked off after AttachedToVisualTree) has somewhere to slide
+            // FROM. AnimateTaskbarInAsync drives Y back to 0.
+            RenderTransform = _taskbarSlide = new TranslateTransform(0, -TaskbarHeight)
         };
 
         // ===== Apps menu (popup) =====
@@ -352,6 +359,15 @@ public class DesktopScreen : DOSIScreen
                 popup.LayoutUpdated += SyncSize;
                 SyncSize(null, EventArgs.Empty);
             }
+
+            // Slide the taskbar in from above on first attach. Posted at
+            // Loaded priority so it runs AFTER the parent crossfade has
+            // started and the popup overlay has measured itself - this way
+            // the user sees a clean drop-down even if the desktop is being
+            // crossfaded in from the login screen at the same time.
+            Avalonia.Threading.Dispatcher.UIThread.Post(
+                () => _ = AnimateTaskbarInAsync(),
+                Avalonia.Threading.DispatcherPriority.Loaded);
         };
         DetachedFromVisualTree += (_, _) =>
         {
@@ -362,6 +378,8 @@ public class DesktopScreen : DOSIScreen
             _clockTimer.Stop();
             _appsMenuAnimTimer?.Stop();
             _appsMenuAnimTimer = null;
+            _taskbarAnimTimer?.Stop();
+            _taskbarAnimTimer = null;
 
             // Defensive: if we're being torn down while a window is
             // immersive-fullscreen, restore chrome visibility so the next
@@ -976,6 +994,65 @@ public class DesktopScreen : DOSIScreen
             }
         };
         _appsMenuAnimTimer.Start();
+    }
+
+    // =====================================================================
+    // Taskbar slide animation
+    // =====================================================================
+
+    private DispatcherTimer? _taskbarAnimTimer;
+
+    /// <summary>
+    /// Drops the taskbar in from above. Awaitable so callers can sequence
+    /// other startup work after the chrome is in place. Safe to call when
+    /// the bar is already on-screen (no-op then).
+    /// </summary>
+    public Task AnimateTaskbarInAsync(int durationMs = 380)
+        => AnimateTaskbarAsync(targetY: 0, durationMs, easeOut: true);
+
+    /// <summary>
+    /// Slides the taskbar back up off-screen. Used by the sign-out and
+    /// shutdown flows so the chrome retracts cleanly instead of just fading
+    /// with everything else. Returns when the slide is complete.
+    /// </summary>
+    public Task AnimateTaskbarOutAsync(int durationMs = 280)
+        => AnimateTaskbarAsync(targetY: -TaskbarHeight, durationMs, easeOut: false);
+
+    private Task AnimateTaskbarAsync(double targetY, int durationMs, bool easeOut)
+    {
+        var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var startY = _taskbarSlide.Y;
+        if (Math.Abs(startY - targetY) < 0.5)
+        {
+            _taskbarSlide.Y = targetY;
+            tcs.TrySetResult(true);
+            return tcs.Task;
+        }
+
+        _taskbarAnimTimer?.Stop();
+        var startTime = DateTime.UtcNow;
+        _taskbarAnimTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
+        _taskbarAnimTimer.Tick += (_, _) =>
+        {
+            var elapsed = (DateTime.UtcNow - startTime).TotalMilliseconds;
+            var t = Math.Clamp(elapsed / durationMs, 0d, 1d);
+            var eased = easeOut
+                ? 1 - Math.Pow(1 - t, 3)   // cubic ease-out for entrance
+                : t * t * t;                // cubic ease-in for exit
+
+            _taskbarSlide.Y = startY + (targetY - startY) * eased;
+
+            if (t >= 1d)
+            {
+                _taskbarAnimTimer?.Stop();
+                _taskbarAnimTimer = null;
+                _taskbarSlide.Y = targetY;
+                tcs.TrySetResult(true);
+            }
+        };
+        _taskbarAnimTimer.Start();
+        return tcs.Task;
     }
 
     private static void LaunchApplication(DOSIWindow window)
