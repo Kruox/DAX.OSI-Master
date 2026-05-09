@@ -122,7 +122,30 @@ public class MainWindow : Window
             lockScreenFactory: user => new LockScreen(user));
         _sessionLock.SignOutRequested += (_, _) =>
         {
+            // Restore overlay visibility before kicking off the sign-out
+            // sequence so its fade-out animation has something to fade.
+            _globalOverlay.IsVisible = true;
+            _popupOverlay.IsVisible = true;
             try { SystemSignOut.Begin(); } catch { /* best effort */ }
+        };
+
+        // Native-rendered controls (e.g. the browser's WebView) are composed
+        // by the OS above Avalonia's surface, so they would punch through the
+        // lock overlay. Hide the global window layer and chrome layer entirely
+        // while locked so nothing leaks through; restore on unlock.
+        _sessionLock.Locked += (_, _) =>
+        {
+            _globalOverlay.IsVisible = false;
+            _globalOverlay.IsHitTestVisible = false;
+            _popupOverlay.IsVisible = false;
+            _popupOverlay.IsHitTestVisible = false;
+        };
+        _sessionLock.Unlocked += (_, _) =>
+        {
+            _globalOverlay.IsVisible = true;
+            _globalOverlay.IsHitTestVisible = true;
+            _popupOverlay.IsVisible = true;
+            _popupOverlay.IsHitTestVisible = true;
         };
 
         _screenManager = new ScreenManager(screenContainer);
