@@ -24,6 +24,15 @@ public sealed class DOSIProjectManifest
     /// <summary>Static method on <see cref="EntryType"/> invoked when running.</summary>
     public string EntryMethod { get; set; } = "Run";
 
+    /// <summary>Free-form description shown in published-app listings and project properties.</summary>
+    public string Description { get; set; } = string.Empty;
+
+    /// <summary>Optional semantic version string (e.g. "1.0.0").</summary>
+    public string Version { get; set; } = "1.0.0";
+
+    /// <summary>Optional author / maintainer name.</summary>
+    public string Author { get; set; } = string.Empty;
+
     /// <summary>Project file format version (for future migrations).</summary>
     public int FormatVersion { get; set; } = 1;
 
@@ -338,6 +347,27 @@ public static class DOSIProjectManager
         {
             error = ex.Message;
             return null;
+        }
+    }
+
+    /// <summary>
+    /// Persists <paramref name="project"/>'s in-memory <see cref="DOSIProjectManifest"/>
+    /// back to disk at <see cref="DOSIProject.ManifestPath"/>. Returns <c>true</c>
+    /// on success. Use <see cref="Rename"/> when changing the project's display
+    /// name so the folder + manifest filename are also updated.
+    /// </summary>
+    public static bool SaveManifest(DOSIProject project)
+    {
+        if (project == null) return false;
+        try
+        {
+            File.WriteAllText(project.ManifestPath,
+                JsonSerializer.Serialize(project.Manifest, JsonOptions));
+            return true;
+        }
+        catch
+        {
+            return false;
         }
     }
 

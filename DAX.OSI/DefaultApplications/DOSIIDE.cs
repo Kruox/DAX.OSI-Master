@@ -138,6 +138,8 @@ public class DOSIIDE : DOSIWindow
     private EditorTab? _draggingTab;
     private Point _dragStartPoint;
     private bool _dragActive;
+    private int _dragOriginalIndex;
+    private Border? _dragInsertionIndicator;
 
     public DOSIIDE()
     {
@@ -186,13 +188,16 @@ public class DOSIIDE : DOSIWindow
         var renameBtn = BuildToolButton("\u270E", "Rename");
         renameBtn.PointerReleased += async (_, _) => await RenameActiveProjectAsync();
 
+        var propertiesBtn = BuildToolButton("\u2699", "Properties");
+        propertiesBtn.PointerReleased += (_, _) => OpenActiveProjectProperties();
+
         var toolGroup = new StackPanel
         {
             Orientation = Orientation.Horizontal,
             Spacing = 4,
             VerticalAlignment = VerticalAlignment.Center,
             Children = { newProjectBtn, newBtn, openBtn, saveBtn, saveAllBtn,
-                         BuildToolDivider(), buildBtn, runBtn, BuildSpinner(), publishBtn, renameBtn }
+                         BuildToolDivider(), buildBtn, runBtn, BuildSpinner(), publishBtn, renameBtn, propertiesBtn }
         };
 
         var toolbarGrid = new Grid
@@ -552,6 +557,7 @@ public class DOSIIDE : DOSIWindow
         }
         else if (e.Key == Key.Escape && _commandMode != null) { HideCommandBar(); e.Handled = true; }
         else if (e.Key == Key.Escape && _switcherOverlay?.IsVisible == true) { HideQuickSwitcher(); e.Handled = true; }
+        else if (e.Key == Key.Escape && _draggingTab != null) { EndTabDrag(commit: false); e.Handled = true; }
     }
 
     // =====================================================================
@@ -885,6 +891,9 @@ public class DOSIIDE : DOSIWindow
         // visual forms. The host content for the tab is whichever is set.
         public DOSICodeEditor? Editor;
         public DOSI.CORE.Designer.DOSIDesigner? Designer;
+        // Project Properties tab for editing the .dosiproj manifest. When set,
+        // SaveActive/SaveAll route through the panel's own persistence path.
+        public ProjectPropertiesPanel? Properties;
         // When this tab is a code-behind view for a designer tab, points back
         // to that designer tab. Save reroutes through the form parser instead
         // of writing the editor text to disk.
@@ -893,7 +902,7 @@ public class DOSIIDE : DOSIWindow
         // above a code-behind editor). When set, this is what gets shown
         // instead of Editor directly so the header travels with the tab.
         public Control? HostShell;
-        public Control HostContent => HostShell ?? (Control?)Editor ?? Designer!;
+        public Control HostContent => HostShell ?? (Control?)Editor ?? Designer ?? (Control)Properties!;
     }
 
     /// <summary>
@@ -929,6 +938,13 @@ public class DOSIIDE : DOSIWindow
         if (path.EndsWith(".dosiform", StringComparison.OrdinalIgnoreCase))
         {
             OpenDesignerFile(path);
+            return;
+        }
+
+        // Project manifest? Open the Properties form instead of raw JSON.
+        if (path.EndsWith(DOSIProjectManager.ManifestExtension, StringComparison.OrdinalIgnoreCase))
+        {
+            OpenActiveProjectProperties();
             return;
         }
 
@@ -1503,8 +1519,10 @@ public class DOSIIDE : DOSIWindow
         _tabStrip.Children.Remove(tab.TabBorder);
 
         // Remember the closed file so Ctrl+Shift+T can reopen it. Don't
-        // remember code-behind tabs (they're auto-spawned from designers).
-        if (tab.CodeBehindFor == null && !string.IsNullOrEmpty(tab.Path) && File.Exists(tab.Path))
+        // remember code-behind tabs (auto-spawned from designers) or
+        // Properties tabs (not real source files).
+        if (tab.CodeBehindFor == null && tab.Properties == null &&
+            !string.IsNullOrEmpty(tab.Path) && File.Exists(tab.Path))
         {
             _recentlyClosed.Push(tab.Path);
             while (_recentlyClosed.Count > MaxRecentlyClosed)
@@ -1535,7 +1553,7 @@ public class DOSIIDE : DOSIWindow
     private void UpdateDirtyState()
     {
         if (_activeTab == null) return;
-        var dirty = _activeTab.Editor?.IsDirty ?? _activeTab.Designer?.IsDirty ?? false;
+        var dirty = _activeTab.Editor?.IsDirty ?? _activeTab.Designer?.IsDirty ?? _activeTab.Properties?.IsDirty ?? false;
         _activeTab.DirtyMark.Text = dirty ? "\u25CF" : "";
     }
 
@@ -1572,6 +1590,15 @@ public class DOSIIDE : DOSIWindow
     private void SaveActive()
     {
         if (_activeTab == null) return;
+
+        // Project Properties tab: route through the panel's own save path.
+        if (_activeTab.Properties != null)
+        {
+            _activeTab.Properties.Save();
+            UpdateDirtyState();
+            return;
+        }
+
         try
         {
             if (_activeTab.CodeBehindFor != null && _activeTab.Editor != null)
@@ -1926,17 +1953,18 @@ public class DOSIIDE : DOSIWindow
     {
         ShowOutput();
         StartBuildSpinner(runAfter ? "Running" : "Building");
+        bool success = false;
         try
         {
-            RunBuildOrRunCore(runAfter);
+            success = RunBuildOrRunCore(runAfter);
         }
         finally
         {
-            StopBuildSpinner();
+            StopBuildSpinner(success);
         }
     }
 
-    private void RunBuildOrRunCore(bool runAfter)
+    private bool RunBuildOrRunCore(bool runAfter)
     {
         // Tear down any previous standalone run window before starting again.
         CloseRunWindow();
@@ -1966,12 +1994,13 @@ public class DOSIIDE : DOSIWindow
                     effectiveTab.Designer.Document, out var handlerDiags);
                 foreach (var d in handlerDiags) AppendOutput("[Handlers] " + d);
                 LaunchPrebuiltWindow(window);
+                return true;
             }
             catch (Exception ex)
             {
                 AppendOutput($"[Run] Failed: {ex.Message}");
+                return false;
             }
-            return;
         }
 
         // Build button on a designer (or its code-behind) tab: compile the
@@ -1986,14 +2015,14 @@ public class DOSIIDE : DOSIWindow
             AppendOutput(formCompile.Success
                 ? $"[Build] '{IOPath.GetFileName(effectiveTab.Path)}': succeeded."
                 : $"[Build] '{IOPath.GetFileName(effectiveTab.Path)}': FAILED.");
-            return;
+            return formCompile.Success;
         }
 
         if (_activeProject == null)
         {
             AppendOutput("[Build] No active project. Open a file inside a project first, " +
                          "or create one with the New Project button.");
-            return;
+            return false;
         }
 
         AppendOutput($"[Build] {_activeProject.Name}: starting...");
@@ -2008,12 +2037,12 @@ public class DOSIIDE : DOSIWindow
         if (!result.Success)
         {
             AppendOutput($"[Build] {_activeProject.Name}: FAILED.");
-            return;
+            return false;
         }
 
         AppendOutput($"[Build] {_activeProject.Name}: succeeded.");
 
-        if (!runAfter) return;
+        if (!runAfter) return true;
 
         if (!string.IsNullOrEmpty(result.Output))
         {
@@ -2029,6 +2058,7 @@ public class DOSIIDE : DOSIWindow
         {
             AppendOutput("[Run] Entry point returned no Control to display.");
         }
+        return true;
     }
 
     /// <summary>
@@ -2851,7 +2881,7 @@ public class {className}
             var state = new IdeSessionState
             {
                 OpenPaths = _tabs
-                    .Where(t => t.CodeBehindFor == null && !string.IsNullOrEmpty(t.Path))
+                    .Where(t => t.CodeBehindFor == null && t.Properties == null && !string.IsNullOrEmpty(t.Path))
                     .Select(t => t.Path)
                     .ToList(),
                 ActivePath = _activeTab?.Path
@@ -2900,6 +2930,101 @@ public class {className}
             OpenFile(path);
             return;
         }
+    }
+
+    // =====================================================================
+    // Project Properties tab
+    // =====================================================================
+
+    private void OpenActiveProjectProperties()
+    {
+        if (_activeProject == null)
+        {
+            ShowOutput();
+            AppendOutput("[Properties] No active project. Open one first.");
+            return;
+        }
+
+        var manifestPath = _activeProject.ManifestPath;
+
+        // If the Properties tab for this project is already open, just activate it.
+        var existing = _tabs.FirstOrDefault(t =>
+            t.Properties != null &&
+            string.Equals(t.Path, manifestPath, StringComparison.OrdinalIgnoreCase));
+        if (existing != null) { ActivateTab(existing); return; }
+
+        var panel = new ProjectPropertiesPanel(_activeProject, savedProject =>
+        {
+            // Refresh the tree label / status bar in case the manifest changed
+            // anything user-visible (description, version, author, ...).
+            _statusProject.Text = "Project: " + savedProject.Name;
+        });
+
+        // Build a minimal tab border that matches the existing tab pattern.
+        var label = new TextBlock
+        {
+            Text = "Properties \u2014 " + _activeProject.Name,
+            FontSize = 12,
+            VerticalAlignment = VerticalAlignment.Center,
+            Foreground = new SolidColorBrush(Accents.TextOnAccent)
+        };
+        var dirtyMark = new TextBlock
+        {
+            Text = "",
+            FontSize = 14,
+            Margin = new Thickness(6, 0, 0, 0),
+            VerticalAlignment = VerticalAlignment.Center,
+            Foreground = new SolidColorBrush(Accents.TextOnAccent)
+        };
+        var closeBtn = new TextBlock
+        {
+            Text = "\u2715",
+            FontSize = 12,
+            Margin = new Thickness(8, 0, 0, 0),
+            VerticalAlignment = VerticalAlignment.Center,
+            Foreground = new SolidColorBrush(Accents.TextOnAccent),
+            Cursor = new Cursor(StandardCursorType.Hand)
+        };
+        var contentStack = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            VerticalAlignment = VerticalAlignment.Center,
+            Children = { label, dirtyMark, closeBtn }
+        };
+        var tabBorder = new Border
+        {
+            Padding = new Thickness(14, 0),
+            Background = Brushes.Transparent,
+            BorderBrush = Brushes.Transparent,
+            BorderThickness = new Thickness(0, 0, 1, 0),
+            Cursor = new Cursor(StandardCursorType.Hand),
+            Child = contentStack
+        };
+
+        var tab = new EditorTab
+        {
+            Path = manifestPath,
+            TabBorder = tabBorder,
+            TabLabel = label,
+            DirtyMark = dirtyMark,
+            Properties = panel
+        };
+
+        tabBorder.PointerPressed += (_, e) =>
+        {
+            if (e.Source == closeBtn) { CloseTab(tab); e.Handled = true; return; }
+            ActivateTab(tab);
+            e.Handled = true;
+        };
+        closeBtn.PointerPressed += (_, e) => { CloseTab(tab); e.Handled = true; };
+
+        panel.Modified += (_, _) => UpdateDirtyState();
+        panel.Saved += (_, _) => UpdateDirtyState();
+
+        _tabs.Add(tab);
+        _tabStrip.Children.Add(tabBorder);
+        WireTabInteraction(tab);
+        ActivateTab(tab);
     }
 
     // =====================================================================
@@ -2966,9 +3091,14 @@ public class {className}
         return _spinnerHost;
     }
 
+    private DateTime _spinnerStartedUtc;
+
     private void StartBuildSpinner(string label)
     {
-        if (_spinnerHost == null) return;
+        if (_spinnerHost == null || _spinnerGlyph == null) return;
+        _spinnerStartedUtc = DateTime.UtcNow;
+        _spinnerGlyph.Text = "\u25D2";   // half-circle (rotates)
+        _spinnerGlyph.Foreground = new SolidColorBrush(AccentManager.Instance.TextOnAccent);
         ToolTip.SetTip(_spinnerHost, label);
         _spinnerHost.IsVisible = true;
         _spinnerTimer?.Stop();
@@ -2980,12 +3110,34 @@ public class {className}
         _spinnerTimer.Start();
     }
 
-    private void StopBuildSpinner()
+    private void StopBuildSpinner(bool? success = null)
     {
-        if (_spinnerHost == null) return;
+        if (_spinnerHost == null || _spinnerGlyph == null) return;
         _spinnerTimer?.Stop();
         _spinnerTimer = null;
         if (_spinnerRotate != null) _spinnerRotate.Angle = 0;
+
+        if (success.HasValue)
+        {
+            // Flash a success/failure glyph for ~1.5s before hiding.
+            var elapsed = DateTime.UtcNow - _spinnerStartedUtc;
+            _spinnerGlyph.Text = success.Value ? "\u2713" : "\u2717";
+            _spinnerGlyph.Foreground = success.Value
+                ? new SolidColorBrush(Color.FromRgb(120, 220, 140))
+                : new SolidColorBrush(Color.FromRgb(240, 110, 110));
+            ToolTip.SetTip(_spinnerHost,
+                $"{(success.Value ? "Succeeded" : "Failed")} in {elapsed.TotalSeconds:0.0}s");
+
+            var hideTimer = new Avalonia.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1500) };
+            hideTimer.Tick += (_, _) =>
+            {
+                hideTimer.Stop();
+                if (_spinnerHost != null) _spinnerHost.IsVisible = false;
+            };
+            hideTimer.Start();
+            return;
+        }
+
         _spinnerHost.IsVisible = false;
     }
 
@@ -3007,8 +3159,14 @@ public class {className}
         RefreshQuickSwitcherResults();
 
         _switcherOverlay.IsVisible = true;
-        Avalonia.Threading.Dispatcher.UIThread.Post(() => _switcherInput.Focus(),
-            Avalonia.Threading.DispatcherPriority.Loaded);
+        Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+        {
+            _switcherInput.Focus();
+            // SelectAll isn't on DOSITextBox public API; clearing first then
+            // refocusing is the simplest equivalent.
+            _switcherInput.Text = string.Empty;
+            RefreshQuickSwitcherResults();
+        }, Avalonia.Threading.DispatcherPriority.Loaded);
     }
 
     private void HideQuickSwitcher()
@@ -3038,6 +3196,16 @@ public class {className}
             Margin = new Thickness(0, 8, 0, 0)
         };
 
+        var footerHint = new TextBlock
+        {
+            Text = "\u2191 \u2193 navigate    Enter open    Esc close",
+            FontSize = 10,
+            Foreground = Accents.TextSecondaryBrush,
+            Opacity = 0.6,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            Margin = new Thickness(0, 8, 0, 0)
+        };
+
         var card = new Border
         {
             Width = 520,
@@ -3052,7 +3220,7 @@ public class {className}
             Child = new StackPanel
             {
                 Orientation = Orientation.Vertical,
-                Children = { _switcherInput, _switcherResults }
+                Children = { _switcherInput, _switcherResults, footerHint }
             }
         };
 
@@ -3100,11 +3268,25 @@ public class {className}
         _switcherVisible.Clear();
 
         var query = _switcherInput.Text ?? string.Empty;
-        var matches = string.IsNullOrEmpty(query)
+        var matches = (string.IsNullOrEmpty(query)
             ? _switcherFiles.Take(20)
             : _switcherFiles
                 .Where(p => FuzzyMatch(IOPath.GetFileName(p), query) || FuzzyMatch(p, query))
-                .Take(20);
+                .Take(20)).ToList();
+
+        if (matches.Count == 0)
+        {
+            _switcherResults.Children.Add(new TextBlock
+            {
+                Text = "No matching files in this project.",
+                FontSize = 12,
+                Foreground = Accents.TextSecondaryBrush,
+                Opacity = 0.7,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(0, 12, 0, 6)
+            });
+            return;
+        }
 
         int idx = 0;
         foreach (var path in matches)
@@ -3224,6 +3406,7 @@ public class {className}
             {
                 _draggingTab = tab;
                 _dragStartPoint = e.GetPosition(_tabStrip);
+                _dragOriginalIndex = _tabs.IndexOf(tab);
                 _dragActive = false;
             }
         };
@@ -3236,15 +3419,60 @@ public class {className}
             {
                 if (Math.Abs(pos.X - _dragStartPoint.X) < 6) return;
                 _dragActive = true;
+                tab.TabBorder.Opacity = 0.55;     // ghost the dragging tab
             }
             ReorderDraggingTab(pos.X);
         };
 
-        border.PointerReleased += (_, _) =>
+        border.PointerReleased += (_, _) => EndTabDrag(commit: true);
+    }
+
+    private void EndTabDrag(bool commit)
+    {
+        if (_draggingTab != null)
         {
-            _draggingTab = null;
-            _dragActive = false;
-        };
+            _draggingTab.TabBorder.Opacity = 1d;
+            if (!commit)
+            {
+                // Esc cancel: restore the tab to its original index.
+                var current = _tabs.IndexOf(_draggingTab);
+                if (current >= 0 && current != _dragOriginalIndex && _dragOriginalIndex >= 0 && _dragOriginalIndex <= _tabs.Count)
+                {
+                    var t = _draggingTab;
+                    _tabs.RemoveAt(current);
+                    _tabStrip.Children.RemoveAt(current);
+                    var safeIdx = Math.Min(_dragOriginalIndex, _tabs.Count);
+                    _tabs.Insert(safeIdx, t);
+                    _tabStrip.Children.Insert(safeIdx, t.TabBorder);
+                }
+            }
+        }
+        ClearDragInsertionIndicator();
+        _draggingTab = null;
+        _dragActive = false;
+    }
+
+    private void ShowDragInsertionIndicator(int targetIdx)
+    {
+        if (_dragInsertionIndicator == null)
+        {
+            _dragInsertionIndicator = new Border
+            {
+                Width = 2,
+                Background = new SolidColorBrush(Accents.AccentPrimary),
+                IsHitTestVisible = false
+            };
+        }
+        // Re-insert at the target index inside the tab strip.
+        _tabStrip.Children.Remove(_dragInsertionIndicator);
+        var safeIdx = Math.Clamp(targetIdx, 0, _tabStrip.Children.Count);
+        _tabStrip.Children.Insert(safeIdx, _dragInsertionIndicator);
+    }
+
+    private void ClearDragInsertionIndicator()
+    {
+        if (_dragInsertionIndicator != null)
+            _tabStrip.Children.Remove(_dragInsertionIndicator);
     }
 
     private void ReorderDraggingTab(double mouseX)
@@ -3271,6 +3499,7 @@ public class {className}
         _tabStrip.Children.RemoveAt(currentIdx);
         _tabs.Insert(targetIdx, moving);
         _tabStrip.Children.Insert(targetIdx, moving.TabBorder);
+        ShowDragInsertionIndicator(targetIdx + 1);
         SaveSession();
     }
 
