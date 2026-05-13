@@ -183,6 +183,23 @@ public static class DOSIProjectCompiler
             };
         }
 
+        // Manifest-integrity check: Roslyn is perfectly happy with any class
+        // name, so a typo like 'Program' -> 'Programfhfghfgh' compiles clean
+        // but explodes at Run time. Surface it as a build error here so
+        // Build (not just Run) catches it and the IDE Error List shows the
+        // problem with a fix hint that points at the manifest.
+        var entryDiag = ValidateEntryPoint(assembly, project.Manifest);
+        if (entryDiag != null)
+        {
+            return new DOSIBuildResult
+            {
+                Success = false,
+                Diagnostics = diagnostics.Concat(new[] { entryDiag.Message }).ToList(),
+                StructuredDiagnostics = structured.Concat(new[] { entryDiag }).ToList(),
+                Assembly = assembly
+            };
+        }
+
         return new DOSIBuildResult
         {
             Success = true,
@@ -190,6 +207,65 @@ public static class DOSIProjectCompiler
             StructuredDiagnostics = structured,
             Assembly = assembly
         };
+    }
+
+    /// <summary>
+    /// Verifies that the compiled <paramref name="assembly"/> exposes the
+    /// entry point declared in <paramref name="manifest"/> (a type matching
+    /// <see cref="DOSIProjectManifest.EntryType"/> with a static method
+    /// matching <see cref="DOSIProjectManifest.EntryMethod"/>). Returns a
+    /// structured diagnostic on failure or <c>null</c> when the manifest
+    /// lines up with the code. Pure-form / library-only projects (those
+    /// whose manifest leaves EntryType blank) are exempt.
+    /// </summary>
+    private static DOSIDiagnostic? ValidateEntryPoint(Assembly assembly, DOSIProjectManifest manifest)
+    {
+        if (string.IsNullOrWhiteSpace(manifest.EntryType))
+            return null;
+
+        var entryType = assembly.GetType(manifest.EntryType, throwOnError: false)
+                        ?? assembly.GetTypes()
+                            .FirstOrDefault(t => t.Name.Equals(manifest.EntryType, StringComparison.Ordinal));
+
+        if (entryType == null)
+        {
+            // Suggest the closest-named type so common typos (Programfhfghfgh)
+            // get a "did you mean..." style hint.
+            var candidates = assembly.GetTypes()
+                .Where(t => t.IsClass && !t.IsNested)
+                .Select(t => t.Name)
+                .ToList();
+            var hint = candidates.Count > 0
+                ? $"Define a '{manifest.EntryType}' class in your project, or rename one of: {string.Join(", ", candidates.Take(5))} to '{manifest.EntryType}' (or update EntryType in the project manifest)."
+                : $"Define a '{manifest.EntryType}' class in your project, or update EntryType in the project manifest.";
+
+            return new DOSIDiagnostic
+            {
+                Severity = DOSIDiagnosticSeverity.Error,
+                Code = "DOSI001",
+                Message = $"Entry type '{manifest.EntryType}' was not found in the compiled assembly.",
+                SuggestedFix = hint
+            };
+        }
+
+        if (string.IsNullOrWhiteSpace(manifest.EntryMethod)) return null;
+
+        var entryMethod = entryType.GetMethod(
+            manifest.EntryMethod,
+            BindingFlags.Public | BindingFlags.Static | BindingFlags.NonPublic);
+
+        if (entryMethod == null)
+        {
+            return new DOSIDiagnostic
+            {
+                Severity = DOSIDiagnosticSeverity.Error,
+                Code = "DOSI002",
+                Message = $"Static method '{manifest.EntryMethod}' was not found on '{entryType.FullName}'.",
+                SuggestedFix = $"Add 'public static Control {manifest.EntryMethod}()' to '{entryType.Name}', or update EntryMethod in the project manifest."
+            };
+        }
+
+        return null;
     }
 
     /// <summary>
