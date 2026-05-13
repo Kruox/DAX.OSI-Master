@@ -459,7 +459,18 @@ public class DOSIWebBrowser : DOSIWindow
     private void OnAttachedForOcclusionTracking(object? sender, Avalonia.VisualTreeAttachmentEventArgs e)
     {
         // Manager-level events: any window opens / closes / changes z-order.
-        _trackedManager = DOSI.CORE.UIComponents.WindowManagement.WindowManager.Instance;
+        // PREFER OwnerManager over the global Instance: in a multi-monitor
+        // setup each MonitorWindow has its own WindowManager, but the static
+        // Instance points at whichever monitor was last activated. Capturing
+        // Instance here would silently bind us to a sibling monitor's manager
+        // and we'd never hear about windows opening / moving / being adopted
+        // on OUR canvas - which is exactly what makes the native WebView
+        // refuse to hide when another window lands on top of us after a
+        // cross-monitor drag handoff. OwnerManager is set by OpenWindow /
+        // AdoptWindow BEFORE the canvas adoption that triggers this event,
+        // so it's always the right manager by the time we read it.
+        _trackedManager = OwnerManager
+                          ?? DOSI.CORE.UIComponents.WindowManagement.WindowManager.Instance;
         if (_trackedManager != null)
         {
             _trackedManager.WindowsChanged += OnWindowsChangedForOcclusion;
@@ -470,6 +481,11 @@ public class DOSIWebBrowser : DOSIWindow
         _trackedParent = Parent as Canvas;
         if (_trackedParent != null)
             _trackedParent.LayoutUpdated += OnDesktopLayoutUpdated;
+        // Reset the cached "last applied visibility" so the first
+        // re-evaluation after a cross-monitor handoff is guaranteed to call
+        // SetVisible (the cached value from the source monitor would
+        // otherwise short-circuit the very evaluation we need).
+        _lastOcclusionVisible = null;
         ReevaluateWebViewVisibility();
     }
 
@@ -516,8 +532,9 @@ public class DOSIWebBrowser : DOSIWindow
         if (WebViewWrapper.IsGloballyPaused) return;          // global pause owns the surface
         if (IsBeingDragged) return;                           // drag handler owns the surface
 
-        var manager = _trackedManager ??
-                      DOSI.CORE.UIComponents.WindowManagement.WindowManager.Instance;
+        var manager = _trackedManager
+                      ?? OwnerManager
+                      ?? DOSI.CORE.UIComponents.WindowManagement.WindowManager.Instance;
         bool covered = false;
         if (manager != null)
         {

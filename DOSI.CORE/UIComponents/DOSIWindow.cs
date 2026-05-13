@@ -9,6 +9,7 @@ using Avalonia.Input;
 using Avalonia.Layout;
 using Avalonia.Media;
 using Avalonia.Styling;
+using Avalonia.VisualTree;
 using DOSI.CORE.AccentManagement;
 using DOSI.CORE.UIComponents.WindowManagement;
 
@@ -50,6 +51,39 @@ public class DOSIWindow : UserControl
     private ResizeDirection _resizeDirection;
     private Size _resizeStartSize;
     private Point _resizeStartPosition;
+
+    // Multi-monitor: drag-ghost state. The actual ghost Window is pooled
+    // process-wide on DragGhostWindow.Shared so the transparent topmost
+    // window only gets allocated once (avoiding a per-drag flicker).
+    //
+    // Two-stage activation:
+    //   * "armed"  - drag started on a multi-monitor system; snapshot has
+    //                been taken and ghost is ready to be shown, but source
+    //                is still visible. This stage costs nothing visually
+    //                and avoids the swap-to-ghost flash for same-monitor
+    //                drags (which never need the ghost).
+    //   * "shown"  - cursor has actually crossed outside the source
+    //                TopLevel's bounds, so we now hide the source and show
+    //                the ghost. Toggled back to "armed" if the cursor
+    //                returns to source bounds (e.g. user wiggles back and
+    //                forth across the monitor boundary mid-drag).
+    private bool _dragGhostArmed;
+    private bool _dragGhostShown;
+    private Avalonia.Media.Imaging.RenderTargetBitmap? _dragGhostSnapshot;
+    private Avalonia.PixelPoint _dragGhostCursorOffset;
+    private Avalonia.Controls.TopLevel? _dragSourceTopLevel;
+
+    // Snap-restore-on-drag state. WindowSnapManager calls MarkSnapped after
+    // animating the window into a snap zone (left half / right half / etc.)
+    // with the size the window had BEFORE the snap. The next drag then
+    // restores those dimensions and re-anchors the cursor inside the title
+    // bar - matching Windows' "drag a snapped window to unsnap" gesture.
+    // Cleared when the user explicitly resizes via a grip (so a manually-
+    // sized post-snap state isn't blown away by the next drag) or after
+    // the restore fires.
+    private bool _isSnapped;
+    private double _preSnapWidth;
+    private double _preSnapHeight;
 
     private DOSIWindowState _windowState = DOSIWindowState.Normal;
     private Rect _restoreBounds;
@@ -133,8 +167,12 @@ public class DOSIWindow : UserControl
     /// per-window operations (BringToFront, Close, etc.) target the correct
     /// manager instead of the globally-active <see cref="WindowManager.Instance"/>,
     /// which can change when screens transition.
+    /// Exposed publicly (read-only outside DOSI.CORE) so cross-assembly
+    /// windows can subscribe to events on the manager that actually owns
+    /// them - critical for native-content windows whose occlusion logic must
+    /// follow them across cross-monitor handoffs.
     /// </summary>
-    internal WindowManager? OwnerManager { get; set; }
+    public WindowManager? OwnerManager { get; internal set; }
 
     public double WindowX
     {
@@ -280,6 +318,33 @@ public class DOSIWindow : UserControl
 
     /// <summary>True while the user is currently dragging this window.</summary>
     public bool IsBeingDragged => _isDragging;
+
+    /// <summary>
+    /// Called by <see cref="WindowManagement.WindowSnapManager"/> after it
+    /// animates this window into a snap zone. Records the size the window
+    /// had BEFORE the snap so a subsequent drag-to-unsnap gesture can
+    /// restore it (mirrors Windows behavior). Pre-snap position isn't
+    /// stored - the next drag re-anchors the window under the cursor.
+    /// </summary>
+    public void MarkSnapped(double preSnapWidth, double preSnapHeight)
+    {
+        if (preSnapWidth <= 0 || preSnapHeight <= 0) return;
+        _isSnapped = true;
+        _preSnapWidth = preSnapWidth;
+        _preSnapHeight = preSnapHeight;
+    }
+
+    /// <summary>
+    /// Clears any pending unsnap-restore. Called by the resize-grip handler
+    /// (the user explicitly chose a new size, so the pre-snap dimensions
+    /// are no longer the right thing to restore to).
+    /// </summary>
+    public void ClearSnapMark()
+    {
+        _isSnapped = false;
+        _preSnapWidth = 0;
+        _preSnapHeight = 0;
+    }
 
     #endregion
 
@@ -592,6 +657,20 @@ public class DOSIWindow : UserControl
         if (_isAnimating) return;
         _isAnimating = true;
 
+        // Snapshot the parent at animation start. If the window gets
+        // reparented mid-tween (cross-monitor drag handoff
+        // RelinquishWindow + AdoptWindow swaps it to a different TopLevel's
+        // LayoutManager), every subsequent WindowX/Y/Width/Height write
+        // would queue an InvalidateArrange against the OLD LayoutManager
+        // and throw "Attempt to call InvalidateArrange on wrong
+        // LayoutManager" the moment the dispatcher flushes layout. Bailing
+        // when the parent changes leaves the window at whatever bounds it
+        // had reached so far - the new owner / drag handler takes over.
+        // CRITICAL: also clears _isAnimating before returning so a
+        // subsequent state change (the user clicking maximize again, etc.)
+        // isn't permanently blocked by the latch.
+        var startParent = this.Parent;
+
         var startX = WindowX;
         var startY = WindowY;
         var startWidth = WindowWidth;
@@ -603,6 +682,12 @@ public class DOSIWindow : UserControl
 
         while (true)
         {
+            if (this.Parent != startParent || _isClosing)
+            {
+                _isAnimating = false;
+                return;
+            }
+
             var elapsed = DateTime.Now - startTime;
             var progress = Math.Min(1.0, elapsed.TotalMilliseconds / duration.TotalMilliseconds);
             var easedProgress = easing.Ease(progress);
@@ -617,11 +702,15 @@ public class DOSIWindow : UserControl
             await Task.Delay(8); // ~120fps
         }
 
-        // Ensure final values are set exactly
-        WindowX = targetX;
-        WindowY = targetY;
-        WindowWidth = targetWidth;
-        WindowHeight = targetHeight;
+        // Ensure final values are set exactly - only if we're still in the
+        // same tree.
+        if (this.Parent == startParent && !_isClosing)
+        {
+            WindowX = targetX;
+            WindowY = targetY;
+            WindowWidth = targetWidth;
+            WindowHeight = targetHeight;
+        }
 
         _isAnimating = false;
     }
@@ -629,6 +718,62 @@ public class DOSIWindow : UserControl
     private static double Lerp(double start, double end, double t)
     {
         return start + (end - start) * t;
+    }
+
+    /// <summary>
+    /// Animates only <see cref="WindowWidth"/> / <see cref="WindowHeight"/>
+    /// from the current snapped dimensions to the original pre-snap size,
+    /// matching the easing, duration, and tick rate of
+    /// <see cref="AnimateWindowToAsync"/> (the maximize / restore animation)
+    /// so drag-to-unsnap looks and feels like a sibling of every other
+    /// state-change animation in the window. INTENTIONALLY does not touch
+    /// X/Y - the drag handler keeps anchoring the window under the cursor
+    /// every PointerMoved while the size tweens. Skips the global
+    /// <see cref="_isAnimating"/> latch so it cannot block subsequent
+    /// state changes (drag is the source of truth here).
+    /// </summary>
+    private async Task AnimateUnsnapSizeAsync(double fromW, double fromH, double toW, double toH)
+    {
+        if (Math.Abs(fromW - toW) < 0.5 && Math.Abs(fromH - toH) < 0.5) return;
+
+        // Snapshot the parent at animation start. If the window gets
+        // reparented mid-tween (cross-monitor drag handoff
+        // RelinquishWindow + AdoptWindow swaps it to a different TopLevel's
+        // LayoutManager), every subsequent WindowWidth/Height write would
+        // queue an InvalidateArrange against the OLD LayoutManager - which
+        // throws "Attempt to call InvalidateArrange on wrong LayoutManager"
+        // the moment the dispatcher flushes layout. Bailing immediately
+        // when the parent changes (or is null) leaves the window at
+        // whatever size it had reached so far; the drag handler will
+        // continue moving it under the cursor on the new monitor.
+        var startParent = this.Parent;
+
+        var duration = StateAnimationDuration;
+        var easing = new CubicEaseInOut();
+        var startTime = DateTime.Now;
+
+        while (true)
+        {
+            // Bail if we got reparented OR detached entirely.
+            if (this.Parent != startParent || _isClosing) return;
+
+            var elapsed = DateTime.Now - startTime;
+            var progress = Math.Min(1.0, elapsed.TotalMilliseconds / duration.TotalMilliseconds);
+            var eased = easing.Ease(progress);
+
+            WindowWidth = Lerp(fromW, toW, eased);
+            WindowHeight = Lerp(fromH, toH, eased);
+
+            if (progress >= 1.0) break;
+            await Task.Delay(8); // ~120fps - matches AnimateWindowToAsync
+        }
+
+        // Final snap only if we're still in the same tree.
+        if (this.Parent == startParent && !_isClosing)
+        {
+            WindowWidth = toW;
+            WindowHeight = toH;
+        }
     }
 
     /// <summary>
@@ -1158,6 +1303,134 @@ public class DOSIWindow : UserControl
         e.Pointer.Capture(_chromeRoot);
         e.Handled = true;
         DragStateChanged?.Invoke(this, true);
+
+        // Multi-monitor ghost: when there's more than one host registered,
+        // snapshot this window into a topmost transparent ghost that follows
+        // the cursor in screen-pixel coords. Source goes invisible for the
+        // drag, ghost takes over visually. Without this, dragging across
+        // monitors leaves only the cursor visible in the gap because the
+        // source DOSIWindow can't render outside its parent native window.
+        TryStartDragGhost(e);
+    }
+
+    /// <summary>
+    /// At drag start, captures a <see cref="Avalonia.Media.Imaging.RenderTargetBitmap"/>
+    /// of the source window and ARMS the ghost - but does not yet show it
+    /// or hide the source. The actual swap to the ghost is deferred until
+    /// <see cref="OnChromeDragMoved"/> detects the cursor leaving the source
+    /// TopLevel's bounds (i.e. heading toward another monitor). Same-monitor
+    /// drags never trigger the swap, which avoids the source-vs-ghost flash
+    /// that happens when both share the same screen position.
+    /// No-op on single-monitor systems and best-effort: a snapshot failure
+    /// just leaves the drag with the legacy "window clips at edge" behavior.
+    /// </summary>
+    private void TryStartDragGhost(PointerPressedEventArgs e)
+    {
+        // Only spend the snapshot cost when there's actually somewhere to
+        // drag TO. Single-monitor: legacy in-canvas drag is fine.
+        if (DOSI.CORE.UIComponents.DosiHostRegistry.All.Count <= 1) return;
+
+        var topLevel = Avalonia.Controls.TopLevel.GetTopLevel(this);
+        if (topLevel == null) return;
+
+        try
+        {
+            // Anchor the ghost's screen position to the cursor by capturing
+            // the pixel offset from the cursor to the window's top-left at
+            // drag start. As the cursor moves (in screen space), ghost.Position
+            // tracks (cursor - offset).
+            var cursorLocal = e.GetPosition(topLevel);
+            var cursorScreen = topLevel.PointToScreen(cursorLocal);
+            var windowLocalDip = this.TranslatePoint(new Point(0, 0), topLevel) ?? new Point(0, 0);
+            var windowScreen = topLevel.PointToScreen(windowLocalDip);
+            _dragGhostCursorOffset = new Avalonia.PixelPoint(
+                cursorScreen.X - windowScreen.X,
+                cursorScreen.Y - windowScreen.Y);
+            _dragSourceTopLevel = topLevel;
+
+            // Snapshot at the source TopLevel's render scaling so the ghost
+            // looks pixel-identical when displayed on the same monitor at
+            // its current DPI. Cross-DPI moves get a brief size mismatch.
+            var scaling = topLevel.RenderScaling > 0 ? topLevel.RenderScaling : 1.0;
+            var pixelSize = new Avalonia.PixelSize(
+                System.Math.Max(1, (int)(this.Bounds.Width * scaling)),
+                System.Math.Max(1, (int)(this.Bounds.Height * scaling)));
+            var dpi = new Avalonia.Vector(96 * scaling, 96 * scaling);
+            _dragGhostSnapshot = new Avalonia.Media.Imaging.RenderTargetBitmap(pixelSize, dpi);
+            _dragGhostSnapshot.Render(this);
+
+            // CONFIGURE the pooled ghost (sets bitmap, size, position) but
+            // do NOT show it yet. The OS DWM gets a full composition cycle
+            // to lay out the new content at the new position while we're
+            // still in same-monitor drag mode (source visible, ghost
+            // Opacity=0). When the cursor finally crosses to another
+            // monitor, the only thing that changes is opacities - the
+            // layered window already has the right pixels at the right
+            // place, so the swap is atomic and flicker-free.
+            var ghost = DOSI.CORE.UIComponents.WindowManagement.DragGhostWindow.GetOrCreate();
+            ghost.ConfigureFor(_dragGhostSnapshot, this.Bounds.Width, this.Bounds.Height, windowScreen);
+            ghost.SetVisible(false);
+
+            // Armed but not shown. Source stays visible. The swap fires only
+            // if/when the cursor leaves the source TopLevel's bounds in
+            // OnChromeDragMoved -> EnsureGhostShownIfCursorLeftSource().
+            _dragGhostArmed = true;
+            _dragGhostShown = false;
+        }
+        catch
+        {
+            // Snapshot failed - clean up partial state and let the drag
+            // continue with the legacy behavior.
+            _dragGhostSnapshot = null;
+            _dragGhostArmed = false;
+            _dragGhostShown = false;
+            _dragSourceTopLevel = null;
+        }
+    }
+
+    /// <summary>
+    /// Called from <see cref="OnChromeDragMoved"/> on every pointer move
+    /// while a ghost-armed drag is in flight. Lazily shows the ghost (and
+    /// hides the source) the first time the cursor leaves the source
+    /// TopLevel's DIP bounds, and toggles back if the cursor returns.
+    /// This is what makes same-monitor drags flash-free: the ghost is only
+    /// brought on-screen when the source actually CAN'T render where the
+    /// user is dragging to.
+    /// </summary>
+    private void EnsureGhostShownIfCursorLeftSource(PointerEventArgs e)
+    {
+        if (!_dragGhostArmed || _dragSourceTopLevel == null || _dragGhostSnapshot == null) return;
+
+        var cursorLocal = e.GetPosition(_dragSourceTopLevel);
+        var sourceBounds = _dragSourceTopLevel.ClientSize;
+        bool outside =
+            cursorLocal.X < 0 || cursorLocal.X >= sourceBounds.Width ||
+            cursorLocal.Y < 0 || cursorLocal.Y >= sourceBounds.Height;
+
+        if (outside && !_dragGhostShown)
+        {
+            try
+            {
+                // Ghost is already at the right position with the right
+                // bitmap (kept current by MoveTo on every PointerMoved
+                // since drag start). The crossing is just an atomic
+                // opacity swap - no Show()/Hide() round-trip, no bitmap
+                // re-upload, no layout pass. This is what kills the
+                // initial first-transfer flicker.
+                DOSI.CORE.UIComponents.WindowManagement.DragGhostWindow.Shared?.SetVisible(true);
+                this.Opacity = 0;
+                _dragGhostShown = true;
+            }
+            catch { /* best-effort - leave armed for retry */ }
+        }
+        else if (!outside && _dragGhostShown)
+        {
+            // Cursor returned to the source monitor mid-drag. Restore source
+            // and hide ghost so the user gets crisp live rendering again.
+            try { DOSI.CORE.UIComponents.WindowManagement.DragGhostWindow.Shared?.SetVisible(false); } catch { }
+            this.Opacity = 1;
+            _dragGhostShown = false;
+        }
     }
 
     private void OnChromeDragMoved(object? sender, PointerEventArgs e)
@@ -1167,20 +1440,65 @@ public class DOSIWindow : UserControl
         var currentPoint = e.GetPosition(Parent as Visual);
         var delta = currentPoint - _dragStartPoint;
 
-        // Only restore from maximized when user actually starts dragging
+        // A maximized window has no draggable area in DAX.OSI - it fills
+        // the entire desktop work area, and the OS-style "drag-from-the-
+        // top-to-restore" gesture is INTENTIONALLY not implemented here.
+        // Restore-on-drag is reserved for half/quarter-snapped windows
+        // (handled by the _isSnapped branch below). To bring a maximized
+        // window back to its previous size, the user clicks the
+        // restore/maximize chrome button - same as a real OS Win+Down.
+        //
+        // Returning here also avoids the buggy cursor-anchor math the
+        // previous implementation used (percentX based on Bounds.Width
+        // produced a wildly wrong WindowX after the size collapse, leaving
+        // the window dropped far from the cursor).
         if (WindowState == DOSIWindowState.Maximized)
         {
-            // Check if user moved enough to consider it a drag (not just a click)
-            if (Math.Abs(delta.X) > 5 || Math.Abs(delta.Y) > 5)
-            {
-                var mousePos = currentPoint;
-                var percentX = _dragStartPoint.X / Bounds.Width;
-                WindowState = DOSIWindowState.Normal;
-                WindowX = mousePos.X - (WindowWidth * percentX);
-                WindowY = mousePos.Y - 12; // Center on title bar height
-                _dragStartPoint = currentPoint;
-                _windowStartPosition = new Point(WindowX, WindowY);
-            }
+            return;
+        }
+
+        // Drag-to-unsnap: if this window was previously snapped (left half /
+        // right half / quarter / etc.) by WindowSnapManager, restore it to
+        // its pre-snap dimensions and re-anchor the cursor inside the new
+        // (smaller) title bar. Same gesture and feel as the Maximized restore
+        // above, just for half/quarter snaps that leave WindowState=Normal.
+        // The size shrink is ANIMATED (matching the snap-IN animation) so
+        // the window doesn't pop instantly to its pre-snap dimensions.
+        if (_isSnapped && (Math.Abs(delta.X) > 5 || Math.Abs(delta.Y) > 5))
+        {
+            var mousePos = currentPoint;
+            // Anchor the new window so the cursor stays at the same horizontal
+            // fraction within the title bar that the user originally grabbed.
+            var percentX = Bounds.Width > 0 ? _dragStartPoint.X / Bounds.Width : 0.5;
+            // Clamp the anchor so a near-edge grab on a tiny snapped window
+            // doesn't fling the restored window way off-screen.
+            percentX = Math.Clamp(percentX, 0.05, 0.95);
+
+            // Set X immediately so the cursor lands at the right horizontal
+            // fraction of the FINAL pre-snap width. During the size tween
+            // the title bar will be wider than pre-snap, so the cursor is
+            // briefly left-of-anchor; it settles to the right spot when the
+            // animation completes. Y just hugs the title bar.
+            WindowX = mousePos.X - (_preSnapWidth * percentX);
+            WindowY = mousePos.Y - 12;
+
+            // Snapshot current (snapped) dimensions BEFORE we hand off to
+            // the animation - that's the tween's start frame.
+            var fromW = WindowWidth;
+            var fromH = WindowHeight;
+            var toW = _preSnapWidth;
+            var toH = _preSnapHeight;
+
+            // Consume the snap mark and re-baseline the drag so subsequent
+            // PointerMoved deltas use the new window position as the origin.
+            _isSnapped = false;
+            _dragStartPoint = currentPoint;
+            _windowStartPosition = new Point(WindowX, WindowY);
+
+            // Fire-and-forget size tween. Drag handler keeps controlling X/Y
+            // every PointerMoved (its writes always win the race because they
+            // run on the same UI thread between animation ticks).
+            _ = AnimateUnsnapSizeAsync(fromW, fromH, toW, toH);
             return;
         }
 
@@ -1197,19 +1515,130 @@ public class DOSIWindow : UserControl
             const double titleBarHeight = 26;    // Keep title bar visible at bottom
             var topInset = OwnerManager?.TopWorkAreaInset ?? 0;
 
-            // Clamp X: keep at least minVisibleWidth visible on screen
-            newX = Math.Max(-WindowWidth + minVisibleWidth, newX);  // Left edge
-            newX = Math.Min(canvasWidth - minVisibleWidth, newX);   // Right edge
+            // Multi-monitor: when there's MORE THAN ONE host registered, the
+            // user might be dragging the window toward another monitor. The
+            // pointer is captured by the chrome so events keep flowing even
+            // when the cursor leaves the source window's bounds - which means
+            // we MUST allow the cursor to travel freely onto a neighbouring
+            // monitor without the window's clamps yanking the cursor along
+            // with it. Original strict X clamp was: pin the window so its
+            // left edge can't go past `-WindowWidth + minVisibleWidth` and
+            // its right edge stays at least `minVisibleWidth` inside the
+            // canvas - that pinned the title bar inside the source monitor,
+            // and the cursor (which lives ON the title bar) couldn't escape.
+            //
+            // Multi-monitor relaxation: clamp ONLY enough to prevent the
+            // window from being completely lost off-screen on a single-
+            // monitor system, and to keep some sliver visible on multi-
+            // monitor systems if the drag ends back on the source monitor.
+            // The actual cross-monitor handoff fires on pointer release in
+            // OnChromeDragEnded -> TryHandoffToMonitorAtCursor.
+            var multiMonitor = DOSI.CORE.UIComponents.DosiHostRegistry.All.Count > 1;
+            if (multiMonitor)
+            {
+                // Allow the window to extend FULLY off either side - the user
+                // needs the cursor (which they're still grabbing the title bar
+                // with) to be able to reach a neighbouring monitor's bounds
+                // for the screen-bounds release test in OnChromeDragEnded to
+                // detect the handoff target.
+                newX = Math.Max(-WindowWidth, newX);
+                newX = Math.Min(canvasWidth, newX);
+            }
+            else
+            {
+                // Single-monitor: original strict clamps keep the window on-screen.
+                newX = Math.Max(-WindowWidth + minVisibleWidth, newX);
+                newX = Math.Min(canvasWidth - minVisibleWidth, newX);
+            }
 
             // Clamp Y: top edge respects the host's reserved top area (e.g.
             // taskbar height) so the window's title bar can never disappear
-            // behind persistent chrome.
-            newY = Math.Max(topInset, newY);                          // Top edge
-            newY = Math.Min(canvasHeight - titleBarHeight, newY);     // Bottom edge
+            // behind persistent chrome. Multi-monitor: same relaxation as X
+            // for vertically-stacked displays - the user's cursor must be
+            // able to reach a monitor above or below the source.
+            if (multiMonitor)
+            {
+                newY = Math.Max(-WindowHeight, newY);
+                newY = Math.Min(canvasHeight, newY);
+            }
+            else
+            {
+                newY = Math.Max(topInset, newY);                          // Top edge
+                newY = Math.Min(canvasHeight - titleBarHeight, newY);     // Bottom edge
+            }
         }
 
-        WindowX = newX;
-        WindowY = newY;
+        // Multi-monitor flicker fix: if the cursor JUST crossed out of the
+        // source TopLevel's bounds, hide the source NOW - BEFORE the
+        // WindowX/Y update below pushes its in-canvas position far off the
+        // canvas edge. The drag math below sets newX = _windowStartPosition.X
+        // + delta.X, which on the cross frame becomes a large value (e.g.
+        // 2400 on a 1920-wide canvas). For one frame, between Avalonia's
+        // layout pass applying the new position and its render pass applying
+        // the new opacity, the source can briefly render at its clipped-at-
+        // edge position WHILE STILL VISIBLE - that's the residual cross-
+        // monitor flash. Hiding source first means the position update is
+        // invisible.
+        if (_dragGhostArmed && _dragSourceTopLevel != null && !_dragGhostShown)
+        {
+            try
+            {
+                var probeLocal = e.GetPosition(_dragSourceTopLevel);
+                var probeBounds = _dragSourceTopLevel.ClientSize;
+                bool aboutToCross =
+                    probeLocal.X < 0 || probeLocal.X >= probeBounds.Width ||
+                    probeLocal.Y < 0 || probeLocal.Y >= probeBounds.Height;
+                if (aboutToCross)
+                {
+                    this.Opacity = 0;
+                }
+            }
+            catch { /* probe failed; non-fatal */ }
+        }
+
+        // Defensive: catch the very rare "wrong LayoutManager" exception
+        // that Avalonia's Win32 backend can fire when the cursor crosses
+        // a monitor boundary mid-drag with cross-DPI scaling and pointer
+        // capture in flight. The Win32 pointer-routing layer can briefly
+        // re-target the captured control via a different TopLevel's
+        // LayoutManager during the cross-monitor pointer relay, and the
+        // attached-property writes below would then propagate an arrange
+        // invalidation through that wrong manager. Swallowing here lets
+        // the drag survive a single bad frame instead of crashing the app;
+        // the next PointerMoved with consistent state writes correctly.
+        try
+        {
+            WindowX = newX;
+            WindowY = newY;
+        }
+        catch (System.ArgumentException)
+        {
+            // "Attempt to call InvalidateArrange on wrong LayoutManager."
+            // The drag will recover on the next pointer move.
+        }
+
+        // Multi-monitor ghost: lazy-show the moment the cursor leaves source
+        // monitor bounds (avoids the same-monitor swap flash). Position is
+        // updated EVERY pointer move - even while still invisible - so the
+        // layered window's content is continuously aligned with where the
+        // cursor will be when the swap fires. This pre-positioning is what
+        // makes the first cross-monitor transition atomic and flicker-free:
+        // when SetVisible(true) lands, the bitmap is already at the right
+        // place; the OS just toggles alpha.
+        if (_dragGhostArmed && _dragSourceTopLevel != null)
+        {
+            try
+            {
+                var cursorLocal = e.GetPosition(_dragSourceTopLevel);
+                var cursorScreen = _dragSourceTopLevel.PointToScreen(cursorLocal);
+                DOSI.CORE.UIComponents.WindowManagement.DragGhostWindow.Shared?.MoveTo(
+                    new Avalonia.PixelPoint(
+                        cursorScreen.X - _dragGhostCursorOffset.X,
+                        cursorScreen.Y - _dragGhostCursorOffset.Y));
+            }
+            catch { /* drop frame on PointToScreen failure */ }
+            EnsureGhostShownIfCursorLeftSource(e);
+        }
     }
 
     private void OnChromeDragEnded(object? sender, PointerReleasedEventArgs e)
@@ -1219,7 +1648,217 @@ public class DOSIWindow : UserControl
             _isDragging = false;
             e.Pointer.Capture(null);
             DragStateChanged?.Invoke(this, false);
+
+            // Multi-monitor: if the cursor was released over a different
+            // monitor's host window, transfer this DOSIWindow to that
+            // monitor's WindowManager. NOTE: TryHandoffToMonitorAtCursor
+            // resolves the target SYNCHRONOUSLY but DEFERS the actual
+            // reparent to the next dispatcher tick (see its docs for why -
+            // reparenting mid-PointerReleased throws "wrong LayoutManager"
+            // out of Avalonia's Win32 pointer-routing layer). We capture
+            // whether a handoff is queued so the post-cleanup below can
+            // ALSO defer (otherwise we'd Opacity=1 the source while it's
+            // still on the source canvas at its off-edge drag position,
+            // briefly showing it clipped at the source monitor's edge).
+            bool handoffQueued = TryHandoffToMonitorAtCursor(e);
+
+            // Stash drag-ghost state for the deferred / immediate cleanup
+            // below. Local copies because the field clears must happen
+            // synchronously here (so a fast follow-up drag doesn't see
+            // stale armed=true state) but the ghost.HideGhost call has
+            // to wait for the deferred reparent.
+            bool wasArmed = _dragGhostArmed;
+            _dragGhostArmed = false;
+            _dragGhostShown = false;
+            _dragGhostSnapshot = null;
+            _dragSourceTopLevel = null;
+
+            void CompleteCleanup()
+            {
+                // Restore source visibility AFTER the handoff so the source
+                // reappears at its final position - either at the dragged-
+                // to coordinates on the source monitor (no handoff) or
+                // under the cursor on the target monitor (handoff
+                // succeeded). Then park the ghost (Hide via Opacity +
+                // off-screen position - the pool keeps the native window
+                // alive for the next drag). Order matters: if we hid the
+                // ghost FIRST we'd get a one-frame flash of nothing while
+                // the source is still invisible.
+                this.Opacity = 1;
+                if (wasArmed)
+                {
+                    try { DOSI.CORE.UIComponents.WindowManagement.DragGhostWindow.Shared?.HideGhost(); } catch { }
+                }
+            }
+
+            if (handoffQueued)
+            {
+                // Defer cleanup so it runs in the SAME dispatcher tick as
+                // (and after) the deferred reparent. Background priority
+                // matches what TryHandoffToMonitorAtCursor used; FIFO
+                // ordering at the same priority guarantees the reparent
+                // post runs before this cleanup post.
+                Avalonia.Threading.Dispatcher.UIThread.Post(
+                    CompleteCleanup,
+                    Avalonia.Threading.DispatcherPriority.Background);
+            }
+            else
+            {
+                // Single-monitor or same-monitor release: nothing to wait
+                // for, restore visibility immediately.
+                CompleteCleanup();
+            }
         }
+    }
+
+    /// <summary>
+    /// If the pointer's release-point is over a different <see cref="DOSI.CORE.UIComponents.IDosiHost"/>
+    /// than the one currently owning this window, hand the window over to
+    /// that host's <see cref="WindowManager"/>. Position the window so the
+    /// cursor lands inside the title bar at roughly the same horizontal
+    /// offset the user grabbed it at on the source monitor.
+    ///
+    /// IMPORTANT: this method only RESOLVES the target and computes drop
+    /// coordinates synchronously while the PointerReleased event args are
+    /// still valid. The actual reparent (RelinquishWindow + AdoptWindow)
+    /// is deferred via <see cref="Avalonia.Threading.Dispatcher"/> so it
+    /// runs AFTER the current pointer event has fully unwound. Reparenting
+    /// the captured chrome's visual tree while we're still inside the
+    /// PointerReleased handler causes Avalonia's Win32 backend to call
+    /// InvalidateArrange via the wrong (now-changed) LayoutManager when it
+    /// fires the post-release PointerExited / cursor-update events on the
+    /// way out - that's the "Attempt to call InvalidateArrange on wrong
+    /// LayoutManager" exception. Deferring lets the pointer event delivery
+    /// machinery finish its routing through the ORIGINAL LayoutManager
+    /// before we yank the visual tree out from under it.
+    /// </summary>
+    private bool TryHandoffToMonitorAtCursor(PointerReleasedEventArgs e)
+    {
+        var hosts = DOSI.CORE.UIComponents.DosiHostRegistry.All;
+        if (hosts.Count <= 1) return false;
+
+        // Translate the pointer's local position (relative to the source
+        // host's TopLevel) into screen-pixel coords so we can test it
+        // against every host's TargetScreen.Bounds.
+        var sourceTop = Avalonia.Controls.TopLevel.GetTopLevel(this);
+        if (sourceTop == null) return false;
+        var localPos = e.GetPosition(sourceTop);
+        Avalonia.PixelPoint screenPos;
+        try { screenPos = sourceTop.PointToScreen(localPos); }
+        catch { return false; /* not yet attached */ }
+
+        DOSI.CORE.UIComponents.IDosiHost? targetHost = null;
+        foreach (var h in hosts)
+        {
+            var s = h.TargetScreen;
+            if (s == null) continue;
+            if (ReferenceEquals(h, OwnerManager == null ? null : FindHostFor(OwnerManager, hosts))) continue;
+            if (s.Bounds.Contains(screenPos))
+            {
+                targetHost = h;
+                break;
+            }
+        }
+
+        if (targetHost == null) return false;
+        if (ReferenceEquals(targetHost.WindowManager, OwnerManager)) return false;
+
+        var sourceManager = OwnerManager;
+        if (sourceManager == null) return false;
+
+        // Compute target-canvas-relative position. Map the screen-pixel
+        // release point into the target host's TopLevel DIP coords so the
+        // window appears under the cursor on the new monitor.
+        if (targetHost is not Avalonia.Controls.TopLevel targetTop) return false;
+        Avalonia.Point targetLocal;
+        try
+        {
+            // PointToClient is the inverse of PointToScreen.
+            targetLocal = targetTop.PointToClient(screenPos);
+        }
+        catch { return false; }
+
+        // Preserve the cursor's offset within the title bar from the drag
+        // start so the window slides into place under the user's finger
+        // instead of teleporting to its top-left.
+        //
+        //   offset_in_titlebar = _dragStartPoint - _windowStartPosition
+        //                        (cursor pos relative to source canvas
+        //                         MINUS source window's top-left in same
+        //                         coords = pure intra-window offset)
+        //   newWindowPos       = currentCursor_in_target - offset_in_titlebar
+        //                      = targetLocal - _dragStartPoint + _windowStartPosition
+        var dropX = targetLocal.X - _dragStartPoint.X + _windowStartPosition.X;
+        var dropY = targetLocal.Y - _dragStartPoint.Y + _windowStartPosition.Y;
+
+        // Snapshot the references; the deferred lambda below mustn't close
+        // over `this`'s mutable state any more than necessary.
+        var pendingTargetHost = targetHost;
+        var pendingSourceManager = sourceManager;
+        var pendingDropX = dropX;
+        var pendingDropY = dropY;
+
+        // Defer the actual reparent. DispatcherPriority.Background runs
+        // AFTER pending input / render frames, which is exactly what we
+        // need - the PointerReleased event chain (including any post-
+        // release PointerExited / cursor updates Avalonia's Win32 backend
+        // wants to fire on the captured chrome) finishes routing through
+        // the source TopLevel's LayoutManager before the reparent yanks
+        // the visual tree out from under it.
+        Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+        {
+            // Re-validate: the window may have been closed / re-parented
+            // by some other code path between event time and now.
+            if (_isClosing) return;
+            if (OwnerManager != pendingSourceManager) return;
+
+            try
+            {
+                // CRITICAL: flush any pending layout invalidations queued
+                // against the SOURCE TopLevel's LayoutManager BEFORE we
+                // reparent. Without this, those invalidations would fire
+                // on the next dispatcher iteration AFTER the swap, by
+                // which point the control belongs to the target's
+                // LayoutManager - and Avalonia's layout system would
+                // throw "Attempt to call InvalidateArrange on wrong
+                // LayoutManager" because the queued invalidation still
+                // references the source manager. UpdateLayout() forces
+                // an immediate measure+arrange pass, draining the queue
+                // against the (still correct) source manager.
+                var sourceTopForFlush = Avalonia.Controls.TopLevel.GetTopLevel(this);
+                try { sourceTopForFlush?.UpdateLayout(); } catch { }
+
+                pendingSourceManager.RelinquishWindow(this);
+                pendingTargetHost.WindowManager.AdoptWindow(this, pendingDropX, pendingDropY);
+
+                // Symmetric flush on the target so any layout work the
+                // newly-adopted control needs runs immediately under the
+                // correct manager - not later, possibly racing with
+                // other dispatcher work.
+                var targetTopForFlush = Avalonia.Controls.TopLevel.GetTopLevel(this);
+                try { targetTopForFlush?.UpdateLayout(); } catch { }
+            }
+            catch
+            {
+                // If the handoff fails for any reason, best-effort: re-adopt
+                // back into the source manager so the window doesn't vanish.
+                try { pendingSourceManager.AdoptWindow(this, WindowX, WindowY); } catch { }
+            }
+        }, Avalonia.Threading.DispatcherPriority.Background);
+        return true;
+    }
+
+    /// <summary>
+    /// Reverse-lookup: find the <see cref="DOSI.CORE.UIComponents.IDosiHost"/>
+    /// whose <c>WindowManager</c> equals <paramref name="manager"/>.
+    /// </summary>
+    private static DOSI.CORE.UIComponents.IDosiHost? FindHostFor(
+        WindowManager manager,
+        IReadOnlyList<DOSI.CORE.UIComponents.IDosiHost> hosts)
+    {
+        foreach (var h in hosts)
+            if (ReferenceEquals(h.WindowManager, manager)) return h;
+        return null;
     }
 
     private void OnResizeGripPointerPressed(object? sender, PointerPressedEventArgs e)
@@ -1234,6 +1873,10 @@ public class DOSIWindow : UserControl
         _dragStartPoint = e.GetPosition(Parent as Visual);
         e.Pointer.Capture(grip);
         e.Handled = true;
+
+        // User explicitly chose a new size - the pre-snap dimensions are no
+        // longer the right thing to restore on a future drag.
+        ClearSnapMark();
     }
 
     private void OnResizeGripPointerMoved(object? sender, PointerEventArgs e)
