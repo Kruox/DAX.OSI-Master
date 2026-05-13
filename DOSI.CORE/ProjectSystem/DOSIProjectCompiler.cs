@@ -109,7 +109,18 @@ public static class DOSIProjectCompiler
         var parseErrors = trees.Where(t => t.Error != null).Select(t => t.Error!).ToList();
         if (parseErrors.Count > 0)
         {
-            return new DOSIBuildResult { Success = false, Diagnostics = parseErrors };
+            return new DOSIBuildResult
+            {
+                Success = false,
+                Diagnostics = parseErrors,
+                StructuredDiagnostics = parseErrors
+                    .Select(msg => new DOSIDiagnostic
+                    {
+                        Severity = DOSIDiagnosticSeverity.Error,
+                        Message = msg
+                    })
+                    .ToList()
+            };
         }
 
         var compilation = CSharpCompilation.Create(
@@ -198,12 +209,20 @@ public static class DOSIProjectCompiler
 
         if (entryType == null)
         {
+            var msg = $"Entry type '{project.Manifest.EntryType}' was not found in the compiled assembly.";
             return new DOSIBuildResult
             {
                 Success = false,
-                Diagnostics = build.Diagnostics.Concat(new[]
+                Diagnostics = build.Diagnostics.Concat(new[] { msg }).ToList(),
+                StructuredDiagnostics = build.StructuredDiagnostics.Concat(new[]
                 {
-                    $"Entry type '{project.Manifest.EntryType}' was not found in the compiled assembly."
+                    new DOSIDiagnostic
+                    {
+                        Severity = DOSIDiagnosticSeverity.Error,
+                        Code = "DOSI001",
+                        Message = msg,
+                        SuggestedFix = $"Define a '{project.Manifest.EntryType}' class in your project, or update the project's EntryType in the manifest."
+                    }
                 }).ToList(),
                 Assembly = build.Assembly
             };
@@ -215,12 +234,20 @@ public static class DOSIProjectCompiler
 
         if (entryMethod == null)
         {
+            var msg = $"Static method '{project.Manifest.EntryMethod}' was not found on '{entryType.FullName}'.";
             return new DOSIBuildResult
             {
                 Success = false,
-                Diagnostics = build.Diagnostics.Concat(new[]
+                Diagnostics = build.Diagnostics.Concat(new[] { msg }).ToList(),
+                StructuredDiagnostics = build.StructuredDiagnostics.Concat(new[]
                 {
-                    $"Static method '{project.Manifest.EntryMethod}' was not found on '{entryType.FullName}'."
+                    new DOSIDiagnostic
+                    {
+                        Severity = DOSIDiagnosticSeverity.Error,
+                        Code = "DOSI002",
+                        Message = msg,
+                        SuggestedFix = $"Add 'public static Control {project.Manifest.EntryMethod}()' to '{entryType.Name}', or update the project's EntryMethod in the manifest."
+                    }
                 }).ToList(),
                 Assembly = build.Assembly
             };
@@ -268,14 +295,72 @@ public static class DOSIProjectCompiler
             output += Environment.NewLine + "[Runtime] " + runtimeException.GetType().Name + ": " + runtimeException.Message;
         }
 
+        // Carry the build's structured diagnostics through (the original code
+        // dropped them on the floor here, so even a real Roslyn warning would
+        // never reach the Error List after a Run). When the user's entry point
+        // threw at runtime, append a synthetic diagnostic so the failure shows
+        // up alongside compile diagnostics in the Error List rather than being
+        // buried inside the OUTPUT log.
+        var structured = build.StructuredDiagnostics.ToList();
+        if (runtimeException != null)
+        {
+            structured.Add(BuildRuntimeDiagnostic(runtimeException, project));
+        }
+
         return new DOSIBuildResult
         {
             Success = runtimeException == null,
             Diagnostics = build.Diagnostics,
+            StructuredDiagnostics = structured,
             Assembly = build.Assembly,
             Output = output,
             ReturnedControl = returnedControl,
             RuntimeException = runtimeException
+        };
+    }
+
+    /// <summary>
+    /// Wraps a runtime exception thrown from the user's entry point into a
+    /// <see cref="DOSIDiagnostic"/> so it surfaces in the IDE Error List.
+    /// Tries to recover the originating file + line by walking the exception's
+    /// stack frames for the first one whose file path lives inside the active
+    /// project; falls back to a location-less diagnostic when nothing matches
+    /// (e.g. the exception came from BCL code with no PDB).
+    /// </summary>
+    private static DOSIDiagnostic BuildRuntimeDiagnostic(Exception ex, DOSIProject project)
+    {
+        string file = string.Empty;
+        int line = 0;
+        int column = 0;
+        try
+        {
+            var trace = new System.Diagnostics.StackTrace(ex, fNeedFileInfo: true);
+            var rootFull = Path.GetFullPath(project.FolderPath);
+            for (int i = 0; i < trace.FrameCount; i++)
+            {
+                var frame = trace.GetFrame(i);
+                var f = frame?.GetFileName();
+                if (string.IsNullOrEmpty(f)) continue;
+                if (!f.StartsWith(rootFull, StringComparison.OrdinalIgnoreCase)) continue;
+                file = f;
+                line = frame!.GetFileLineNumber();
+                column = frame!.GetFileColumnNumber();
+                break;
+            }
+        }
+        catch { /* stack-walk is best-effort */ }
+
+        return new DOSIDiagnostic
+        {
+            Severity = DOSIDiagnosticSeverity.Error,
+            Code = "DOSI100",
+            Message = $"{ex.GetType().Name}: {ex.Message}",
+            FilePath = file,
+            Line = line,
+            Column = column,
+            EndLine = line,
+            EndColumn = column,
+            SuggestedFix = "Run threw a " + ex.GetType().Name + ". Check the OUTPUT pane for the full message and the call site shown above."
         };
     }
 
