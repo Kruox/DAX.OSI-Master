@@ -8,6 +8,45 @@ using System.Text.Json.Serialization;
 namespace DOSI.CORE.ProjectSystem;
 
 /// <summary>
+/// How a <see cref="DOSIProjectDependency"/> is grouped under the IDE's
+/// "Dependencies" node. The value is purely organisational (it drives the
+/// folder bucket + badge color in the Solution Explorer); the actual symbol
+/// resolution is currently handled by <c>DOSIProjectCompiler</c>'s
+/// AppDomain + TPA reference scan.
+/// </summary>
+public enum DOSIDependencyKind
+{
+    /// <summary>BCL surface (System.*, Microsoft.*).</summary>
+    Framework,
+    /// <summary>Avalonia / windowing platform assemblies.</summary>
+    Platform,
+    /// <summary>DOSI.CORE.* and other DAX.OSI host assemblies.</summary>
+    DOSI,
+    /// <summary>Reference to another DOSI project in the same workspace.</summary>
+    Project,
+    /// <summary>Reserved for a future package system.</summary>
+    Package
+}
+
+/// <summary>
+/// A single declared dependency of a <see cref="DOSIProjectManifest"/>.
+/// Currently advisory: it is shown in the IDE's Dependencies node and
+/// persisted with the project, but the compiler still implicitly references
+/// every loaded assembly so removing one will not break compilation today.
+/// </summary>
+public sealed class DOSIProjectDependency
+{
+    /// <summary>Display + identity (assembly simple name or sibling project name).</summary>
+    public string Name { get; set; } = string.Empty;
+
+    /// <summary>Optional version string. Empty when unknown.</summary>
+    public string Version { get; set; } = string.Empty;
+
+    /// <summary>Bucket the IDE files this dependency under.</summary>
+    public DOSIDependencyKind Kind { get; set; } = DOSIDependencyKind.Framework;
+}
+
+/// <summary>
 /// Persisted manifest for a DOSI project. Stored as <c>&lt;projectFolder&gt;/&lt;name&gt;.dosiproj</c>.
 /// </summary>
 public sealed class DOSIProjectManifest
@@ -38,6 +77,13 @@ public sealed class DOSIProjectManifest
 
     /// <summary>UTC creation time.</summary>
     public DateTime CreatedUtc { get; set; } = DateTime.UtcNow;
+
+    /// <summary>
+    /// Declared dependencies. Surfaced under the IDE's "Dependencies" node,
+    /// grouped by <see cref="DOSIProjectDependency.Kind"/>. Order in the list
+    /// is preserved on disk so manual reordering survives round-trips.
+    /// </summary>
+    public List<DOSIProjectDependency> Dependencies { get; set; } = new();
 }
 
 /// <summary>
@@ -369,6 +415,137 @@ public static class DOSIProjectManager
         {
             return false;
         }
+    }
+
+    // =====================================================================
+    // Dependencies
+    // =====================================================================
+
+    /// <summary>
+    /// Adds <paramref name="dep"/> to <paramref name="project"/>'s manifest if
+    /// no dependency with the same <see cref="DOSIProjectDependency.Name"/>
+    /// already exists, then persists. Returns true if the dependency was
+    /// added (false if the name was empty or a duplicate).
+    /// </summary>
+    public static bool AddDependency(DOSIProject project, DOSIProjectDependency dep)
+    {
+        if (project == null || dep == null) return false;
+        if (string.IsNullOrWhiteSpace(dep.Name)) return false;
+
+        if (project.Manifest.Dependencies.Any(d =>
+                string.Equals(d.Name, dep.Name, StringComparison.OrdinalIgnoreCase)))
+            return false;
+
+        project.Manifest.Dependencies.Add(dep);
+        return SaveManifest(project);
+    }
+
+    /// <summary>
+    /// Removes the dependency named <paramref name="name"/> (case-insensitive)
+    /// from <paramref name="project"/>'s manifest and persists. Returns true
+    /// if a matching dependency was found + removed.
+    /// </summary>
+    public static bool RemoveDependency(DOSIProject project, string name)
+    {
+        if (project == null || string.IsNullOrWhiteSpace(name)) return false;
+
+        var removed = project.Manifest.Dependencies
+            .RemoveAll(d => string.Equals(d.Name, name, StringComparison.OrdinalIgnoreCase));
+
+        if (removed == 0) return false;
+        return SaveManifest(project);
+    }
+
+    /// <summary>
+    /// Returns a curated, deduplicated list of dependencies the IDE can offer
+    /// in an "Add reference" picker. Sources, in priority order:
+    ///   1. Sibling DOSI projects (folders alongside <paramref name="project"/>)
+    ///   2. Currently-loaded AppDomain assemblies, bucketed into Framework / Platform / DOSI
+    /// Anything already declared in <paramref name="project"/>'s manifest is
+    /// filtered out so the picker only shows things you can still add.
+    /// </summary>
+    public static IReadOnlyList<DOSIProjectDependency> SuggestAvailable(
+        DOSIProject project,
+        string projectsRoot)
+    {
+        if (project == null) return Array.Empty<DOSIProjectDependency>();
+
+        var alreadyDeclared = new HashSet<string>(
+            project.Manifest.Dependencies.Select(d => d.Name),
+            StringComparer.OrdinalIgnoreCase);
+
+        var bucket = new Dictionary<string, DOSIProjectDependency>(StringComparer.OrdinalIgnoreCase);
+
+        // 1) Sibling projects.
+        if (!string.IsNullOrWhiteSpace(projectsRoot))
+        {
+            foreach (var sibling in ListProjects(projectsRoot))
+            {
+                if (string.Equals(sibling.FolderPath, project.FolderPath, StringComparison.OrdinalIgnoreCase))
+                    continue;
+                if (alreadyDeclared.Contains(sibling.Name)) continue;
+                bucket[sibling.Name] = new DOSIProjectDependency
+                {
+                    Name = sibling.Name,
+                    Version = sibling.Manifest.Version,
+                    Kind = DOSIDependencyKind.Project
+                };
+            }
+        }
+
+        // 2) AppDomain assemblies, bucketed.
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            if (asm.IsDynamic) continue;
+
+            string? simpleName;
+            string version;
+            try
+            {
+                var n = asm.GetName();
+                simpleName = n.Name;
+                version = n.Version?.ToString() ?? string.Empty;
+            }
+            catch
+            {
+                continue;
+            }
+            if (string.IsNullOrEmpty(simpleName)) continue;
+            if (alreadyDeclared.Contains(simpleName)) continue;
+            if (bucket.ContainsKey(simpleName)) continue;
+
+            bucket[simpleName] = new DOSIProjectDependency
+            {
+                Name = simpleName,
+                Version = version,
+                Kind = ClassifyAssembly(simpleName)
+            };
+        }
+
+        return bucket.Values
+            .OrderBy(d => d.Kind)
+            .ThenBy(d => d.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
+    }
+
+    /// <summary>
+    /// Best-effort classification of an assembly simple name into a
+    /// <see cref="DOSIDependencyKind"/> bucket for IDE display.
+    /// </summary>
+    public static DOSIDependencyKind ClassifyAssembly(string simpleName)
+    {
+        if (string.IsNullOrEmpty(simpleName)) return DOSIDependencyKind.Framework;
+
+        if (simpleName.StartsWith("DOSI.", StringComparison.OrdinalIgnoreCase) ||
+            simpleName.StartsWith("DAX.", StringComparison.OrdinalIgnoreCase))
+            return DOSIDependencyKind.DOSI;
+
+        if (simpleName.StartsWith("Avalonia", StringComparison.OrdinalIgnoreCase) ||
+            simpleName.StartsWith("HarfBuzzSharp", StringComparison.OrdinalIgnoreCase) ||
+            simpleName.StartsWith("SkiaSharp", StringComparison.OrdinalIgnoreCase))
+            return DOSIDependencyKind.Platform;
+
+        return DOSIDependencyKind.Framework;
     }
 
     private static string BuildStarterProgram(string projectName) =>

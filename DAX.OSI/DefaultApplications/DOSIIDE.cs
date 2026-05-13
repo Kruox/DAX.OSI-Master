@@ -590,7 +590,20 @@ public class DOSIIDE : DOSIWindow
 
         // Auto-expand the project root so files are visible immediately.
         _expandedFolders.Add(_activeProject.FolderPath);
-        PopulateFolderInTree(_activeProject.FolderPath, rootChildren, depth: 1);
+        PopulateProjectRoot(rootChildren);
+    }
+
+    /// <summary>
+    /// Fills the project-root container with the file tree, then prepends the
+    /// virtual "Dependencies" node so it always sits at the top of the project
+    /// (matching Visual Studio). Routed through here so <see cref="ToggleFolder"/>
+    /// can rebuild the project root without losing the Dependencies subtree.
+    /// </summary>
+    private void PopulateProjectRoot(StackPanel container)
+    {
+        if (_activeProject == null) return;
+        PopulateFolderInTree(_activeProject.FolderPath, container, depth: 1);
+        container.Children.Insert(0, BuildDependenciesNode(_activeProject, depth: 1));
     }
 
     private Control BuildEmptyState()
@@ -848,7 +861,18 @@ public class DOSIIDE : DOSIWindow
         else
         {
             _expandedFolders.Add(folder);
-            PopulateFolderInTree(folder, container, GetDepth(folder) + 1);
+            // Project root needs the deps node re-prepended; everything else
+            // is a regular filesystem-backed folder.
+            if (_activeProject != null &&
+                string.Equals(folder, _activeProject.FolderPath, StringComparison.OrdinalIgnoreCase))
+            {
+                container.Children.Clear();
+                PopulateProjectRoot(container);
+            }
+            else
+            {
+                PopulateFolderInTree(folder, container, GetDepth(folder) + 1);
+            }
             container.IsVisible = true;
             twirly.Text = "\u25BE";
         }
@@ -3574,4 +3598,528 @@ public class {className}
         }
         catch { /* best-effort */ }
     }
+
+    // =====================================================================
+    // Dependencies (virtual Solution Explorer node)
+    //
+    // Renders a Visual-Studio-style "Dependencies" branch at the top of every
+    // project. Children are bucketed by DOSIDependencyKind (Framework /
+    // Platform / DOSI / Project / Package). Right-click on the branch opens
+    // an Add Dependency picker; right-click on a leaf offers Remove.
+    //
+    // The node uses synthetic collapse keys ("__dosi_deps__:<projectFolder>"
+    // and "__dosi_deps__:<projectFolder>:<kind>") that are tracked in the
+    // existing _expandedFolders HashSet so collapse state survives any tree
+    // rebuild without conflicting with real filesystem paths.
+    // =====================================================================
+
+    private const string DepsKeyPrefix = "__dosi_deps__:";
+
+    private static string DepsRootKey(DOSIProject project) =>
+        DepsKeyPrefix + project.FolderPath;
+
+    private static string DepsBucketKey(DOSIProject project, DOSIDependencyKind kind) =>
+        DepsKeyPrefix + project.FolderPath + ":" + kind;
+
+    /// <summary>
+    /// Builds the entire "Dependencies" subtree for <paramref name="project"/>:
+    /// a collapsible header, a categorised body, and per-leaf right-click
+    /// removal. Returns a single Control to splice into the project root's
+    /// children list.
+    /// </summary>
+    private Control BuildDependenciesNode(DOSIProject project, int depth)
+    {
+        var container = new StackPanel { Orientation = Orientation.Vertical };
+
+        var rootKey = DepsRootKey(project);
+        var isExpanded = _expandedFolders.Contains(rootKey);
+
+        var header = BuildDepsHeaderRow(
+            label: "Dependencies",
+            depth: depth,
+            isExpanded: isExpanded,
+            glyph: "\u29C9",
+            isRoot: true,
+            onToggle: twirly => ToggleDepsBucket(rootKey, container, twirly,
+                () => RenderDepsBuckets(project, container, depth + 1)),
+            onContextMenu: row =>
+            {
+                var menu = new DOSIContextMenu();
+                var add = new MenuItem { Header = "Add dependency..." };
+                add.Click += async (_, _) => await ShowAddDependencyAsync(project);
+                menu.Items.Add(add);
+                row.ContextMenu = menu;
+            });
+
+        var bucketsHost = new StackPanel
+        {
+            Orientation = Orientation.Vertical,
+            IsVisible = isExpanded
+        };
+
+        var wrapper = new StackPanel { Orientation = Orientation.Vertical };
+        wrapper.Children.Add(header);
+        wrapper.Children.Add(bucketsHost);
+
+        // Keep a stable handle on the buckets host so the toggle can rebuild
+        // it; we stash it on Tag rather than a separate dictionary because
+        // the deps subtree is rebuilt wholesale on every project change.
+        header.Tag = bucketsHost;
+
+        if (isExpanded) RenderDepsBuckets(project, bucketsHost, depth + 1);
+
+        return wrapper;
+    }
+
+    private void RenderDepsBuckets(DOSIProject project, StackPanel host, int depth)
+    {
+        host.Children.Clear();
+
+        var deps = project.Manifest.Dependencies;
+        if (deps.Count == 0)
+        {
+            host.Children.Add(new TextBlock
+            {
+                Text = "No dependencies. Right-click to add one.",
+                FontSize = 11,
+                Foreground = Accents.TextSecondaryBrush,
+                Opacity = 0.7,
+                Margin = new Thickness(depth * 14 + 24, 4, 8, 6),
+                TextWrapping = TextWrapping.Wrap
+            });
+            return;
+        }
+
+        // Group + render each non-empty bucket.
+        var ordered = Enum.GetValues<DOSIDependencyKind>()
+            .Select(k => (Kind: k, Items: deps.Where(d => d.Kind == k)
+                                              .OrderBy(d => d.Name, StringComparer.OrdinalIgnoreCase)
+                                              .ToList()))
+            .Where(g => g.Items.Count > 0);
+
+        foreach (var (kind, items) in ordered)
+        {
+            host.Children.Add(BuildDepsBucket(project, kind, items, depth));
+        }
+    }
+
+    private Control BuildDepsBucket(DOSIProject project,
+                                    DOSIDependencyKind kind,
+                                    IReadOnlyList<DOSIProjectDependency> items,
+                                    int depth)
+    {
+        var container = new StackPanel { Orientation = Orientation.Vertical };
+        var key = DepsBucketKey(project, kind);
+        var isExpanded = _expandedFolders.Contains(key);
+
+        var header = BuildDepsHeaderRow(
+            label: $"{LabelForKind(kind)}  ({items.Count})",
+            depth: depth,
+            isExpanded: isExpanded,
+            glyph: "\u25A2",
+            isRoot: false,
+            onToggle: twirly => ToggleDepsBucket(key, container, twirly,
+                () => FillBucketLeaves(project, container, items, depth + 1)),
+            onContextMenu: null);
+
+        var leavesHost = new StackPanel
+        {
+            Orientation = Orientation.Vertical,
+            IsVisible = isExpanded
+        };
+
+        var wrapper = new StackPanel { Orientation = Orientation.Vertical };
+        wrapper.Children.Add(header);
+        wrapper.Children.Add(leavesHost);
+        header.Tag = leavesHost;
+
+        if (isExpanded) FillBucketLeaves(project, leavesHost, items, depth + 1);
+
+        return wrapper;
+    }
+
+    private void FillBucketLeaves(DOSIProject project,
+                                  StackPanel host,
+                                  IReadOnlyList<DOSIProjectDependency> items,
+                                  int depth)
+    {
+        host.Children.Clear();
+        foreach (var dep in items)
+        {
+            host.Children.Add(BuildDependencyLeafRow(project, dep, depth));
+        }
+    }
+
+    private Border BuildDependencyLeafRow(DOSIProject project, DOSIProjectDependency dep, int depth)
+    {
+        var indent = depth * 14 + 6;
+
+        var spacer = new TextBlock
+        {
+            Text = " ",
+            Width = 12,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+
+        var badge = new Border
+        {
+            Width = 8,
+            Height = 8,
+            CornerRadius = new CornerRadius(2),
+            Background = new SolidColorBrush(ColorForKind(dep.Kind)),
+            Margin = new Thickness(2, 0, 8, 0),
+            VerticalAlignment = VerticalAlignment.Center
+        };
+
+        var name = new TextBlock
+        {
+            Text = dep.Name,
+            FontSize = 12,
+            Foreground = Accents.TextPrimaryBrush,
+            VerticalAlignment = VerticalAlignment.Center,
+            TextTrimming = TextTrimming.CharacterEllipsis
+        };
+
+        var version = new TextBlock
+        {
+            Text = string.IsNullOrEmpty(dep.Version) ? string.Empty : "  " + dep.Version,
+            FontSize = 10,
+            Foreground = Accents.TextSecondaryBrush,
+            Opacity = 0.7,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(6, 0, 0, 0)
+        };
+
+        var stack = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(indent, 0, 8, 0),
+            Children = { spacer, badge, name, version }
+        };
+
+        var row = new Border
+        {
+            Padding = new Thickness(0, 3),
+            Background = Brushes.Transparent,
+            Cursor = new Cursor(StandardCursorType.Hand),
+            Child = stack
+        };
+
+        row.PointerEntered += (_, _) =>
+            row.Background = new SolidColorBrush(Color.FromArgb(28, 255, 255, 255));
+        row.PointerExited += (_, _) => row.Background = Brushes.Transparent;
+
+        var menu = new DOSIContextMenu();
+        var remove = new MenuItem { Header = "Remove dependency" };
+        remove.Click += async (_, _) =>
+        {
+            if (Content is not Panel host) return;
+            var ok = await DOSIDialog.Confirm(host, "Remove dependency",
+                $"Remove '{dep.Name}' from {project.Name}?");
+            if (ok != DialogResult.OK) return;
+            DOSIProjectManager.RemoveDependency(project, dep.Name);
+            RefreshTree();
+        };
+        menu.Items.Add(remove);
+        row.ContextMenu = menu;
+
+        return row;
+    }
+
+    /// <summary>
+    /// Picker dialog opened from "Dependencies > Add dependency...".
+    /// Lists suggestions from <see cref="DOSIProjectManager.SuggestAvailable"/>
+    /// (sibling projects + AppDomain assemblies, classified by kind) with a
+    /// live filter. Selecting a row adds it to the active project's manifest
+    /// and refreshes the tree.
+    /// </summary>
+    private async System.Threading.Tasks.Task ShowAddDependencyAsync(DOSIProject project)
+    {
+        if (Content is not Panel host) return;
+
+        var projectsRoot = IOPath.GetDirectoryName(project.FolderPath) ?? _rootPath;
+        var suggestions = DOSIProjectManager.SuggestAvailable(project, projectsRoot);
+
+        var search = new DOSITextBox
+        {
+            PlaceholderText = "Filter (System, Avalonia, sibling project name...)",
+            FontSize = 12,
+            Padding = new Thickness(10, 6),
+            Margin = new Thickness(0, 0, 0, 8),
+            Width = 420
+        };
+
+        var listHost = new StackPanel { Orientation = Orientation.Vertical };
+        var scroller = new DOSIScrollViewer
+        {
+            Content = listHost,
+            Width = 420,
+            Height = 320,
+            HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled,
+            VerticalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto
+        };
+
+        var emptyHint = new TextBlock
+        {
+            FontSize = 11,
+            Foreground = Accents.TextSecondaryBrush,
+            Opacity = 0.7,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Margin = new Thickness(0, 24, 0, 0)
+        };
+
+        var pickerContent = new StackPanel { Orientation = Orientation.Vertical };
+        pickerContent.Children.Add(search);
+        pickerContent.Children.Add(scroller);
+
+        var dialog = new DOSIDialog(
+            "Add dependency",
+            $"Pick a reference to declare on '{project.Name}'.",
+            DialogType.Custom,
+            pickerContent);
+        dialog.AddButton("Cancel", DialogResult.Cancel, false);
+
+        DOSIProjectDependency? picked = null;
+
+        void Repopulate()
+        {
+            listHost.Children.Clear();
+            var query = (search.Text ?? string.Empty).Trim();
+            var filtered = string.IsNullOrEmpty(query)
+                ? suggestions
+                : suggestions.Where(d =>
+                    d.Name.Contains(query, StringComparison.OrdinalIgnoreCase)).ToList();
+
+            if (filtered.Count == 0)
+            {
+                emptyHint.Text = suggestions.Count == 0
+                    ? "Nothing left to add - every loaded assembly is already declared."
+                    : $"No matches for \"{query}\".";
+                listHost.Children.Add(emptyHint);
+                return;
+            }
+
+            DOSIDependencyKind? lastKind = null;
+            foreach (var dep in filtered)
+            {
+                if (dep.Kind != lastKind)
+                {
+                    listHost.Children.Add(new TextBlock
+                    {
+                        Text = LabelForKind(dep.Kind).ToUpperInvariant(),
+                        FontSize = 10,
+                        FontWeight = FontWeight.SemiBold,
+                        Foreground = Accents.TextSecondaryBrush,
+                        Opacity = 0.7,
+                        Margin = new Thickness(4, 10, 0, 4)
+                    });
+                    lastKind = dep.Kind;
+                }
+                listHost.Children.Add(BuildAddDependencyRow(dep, () =>
+                {
+                    picked = dep;
+                    dialog.Close(DialogResult.OK);
+                }));
+            }
+        }
+
+        search.KeyUp += (_, _) => Repopulate();
+        Repopulate();
+
+        var result = await dialog.ShowAsync(host);
+        if (result != DialogResult.OK || picked == null) return;
+
+        if (DOSIProjectManager.AddDependency(project, picked))
+        {
+            // Auto-expand both the root deps node and the bucket the new
+            // dep landed in so the user immediately sees their addition.
+            _expandedFolders.Add(DepsRootKey(project));
+            _expandedFolders.Add(DepsBucketKey(project, picked.Kind));
+            RefreshTree();
+        }
+    }
+
+    private Border BuildAddDependencyRow(DOSIProjectDependency dep, Action onPick)
+    {
+        var badge = new Border
+        {
+            Width = 8,
+            Height = 8,
+            CornerRadius = new CornerRadius(2),
+            Background = new SolidColorBrush(ColorForKind(dep.Kind)),
+            Margin = new Thickness(0, 0, 10, 0),
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        var name = new TextBlock
+        {
+            Text = dep.Name,
+            FontSize = 12,
+            Foreground = Accents.TextPrimaryBrush,
+            VerticalAlignment = VerticalAlignment.Center,
+            TextTrimming = TextTrimming.CharacterEllipsis
+        };
+        var version = new TextBlock
+        {
+            Text = string.IsNullOrEmpty(dep.Version) ? string.Empty : dep.Version,
+            FontSize = 10,
+            Foreground = Accents.TextSecondaryBrush,
+            Opacity = 0.65,
+            VerticalAlignment = VerticalAlignment.Center,
+            HorizontalAlignment = HorizontalAlignment.Right
+        };
+
+        var grid = new Grid
+        {
+            ColumnDefinitions = new ColumnDefinitions("Auto,*,Auto"),
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        grid.Children.Add(badge); Grid.SetColumn(badge, 0);
+        grid.Children.Add(name); Grid.SetColumn(name, 1);
+        grid.Children.Add(version); Grid.SetColumn(version, 2);
+
+        var row = new Border
+        {
+            Padding = new Thickness(8, 6),
+            CornerRadius = new CornerRadius(6),
+            Background = Brushes.Transparent,
+            Cursor = new Cursor(StandardCursorType.Hand),
+            Child = grid
+        };
+        row.PointerEntered += (_, _) =>
+            row.Background = new SolidColorBrush(Color.FromArgb(28, 255, 255, 255));
+        row.PointerExited += (_, _) => row.Background = Brushes.Transparent;
+        row.PointerReleased += (_, _) => onPick();
+        return row;
+    }
+
+    /// <summary>
+    /// Header row used by both the "Dependencies" parent and each per-kind
+    /// sub-bucket. Mirrors <see cref="BuildTreeRow"/>'s look (twirly + glyph
+    /// + label + indent) but sidesteps the file-system semantics of that
+    /// helper since dependencies aren't real folders.
+    /// </summary>
+    private Border BuildDepsHeaderRow(
+        string label,
+        int depth,
+        bool isExpanded,
+        string glyph,
+        bool isRoot,
+        Action<TextBlock> onToggle,
+        Action<Border>? onContextMenu)
+    {
+        var indent = depth * 14 + 6;
+
+        var twirly = new TextBlock
+        {
+            Text = isExpanded ? "\u25BE" : "\u25B8",
+            FontSize = 10,
+            Width = 12,
+            Foreground = Accents.TextSecondaryBrush,
+            VerticalAlignment = VerticalAlignment.Center,
+            TextAlignment = TextAlignment.Center
+        };
+
+        var glyphText = new TextBlock
+        {
+            Text = glyph,
+            FontSize = 11,
+            Foreground = new SolidColorBrush(isRoot ? Accents.AccentSecondary : Accents.AccentPrimary),
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(2, 0, 6, 0)
+        };
+
+        var name = new TextBlock
+        {
+            Text = label,
+            FontSize = 12,
+            FontWeight = isRoot ? FontWeight.SemiBold : FontWeight.Normal,
+            Foreground = Accents.TextPrimaryBrush,
+            VerticalAlignment = VerticalAlignment.Center,
+            TextTrimming = TextTrimming.CharacterEllipsis
+        };
+
+        var stack = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(indent, 0, 8, 0),
+            Children = { twirly, glyphText, name }
+        };
+
+        var row = new Border
+        {
+            Padding = new Thickness(0, 4),
+            Background = Brushes.Transparent,
+            Cursor = new Cursor(StandardCursorType.Hand),
+            Child = stack
+        };
+
+        row.PointerEntered += (_, _) =>
+            row.Background = new SolidColorBrush(Color.FromArgb(28, 255, 255, 255));
+        row.PointerExited += (_, _) => row.Background = Brushes.Transparent;
+
+        row.PointerPressed += (_, e) =>
+        {
+            var props = e.GetCurrentPoint(row).Properties;
+            if (props.IsRightButtonPressed) return;
+            e.Handled = true;
+            onToggle(twirly);
+        };
+
+        onContextMenu?.Invoke(row);
+
+        return row;
+    }
+
+    /// <summary>
+    /// Generic collapse toggle for a deps header. Tracks the synthetic key
+    /// in <see cref="_expandedFolders"/>, flips the sibling host's visibility,
+    /// and lazy-builds its contents on first expand via <paramref name="populate"/>.
+    /// </summary>
+    private void ToggleDepsBucket(string key, StackPanel _, TextBlock twirly, Action populate)
+    {
+        // The buckets host is stashed on the header.Tag and reachable via the
+        // header that owns this twirly; resolve it by walking up the parent
+        // StackPanel that wraps {header, host}.
+        if (twirly.Parent is not StackPanel headerStack ||
+            headerStack.Parent is not Border header ||
+            header.Parent is not StackPanel wrapper ||
+            wrapper.Children.Count < 2 ||
+            wrapper.Children[1] is not StackPanel host) return;
+
+        if (_expandedFolders.Contains(key))
+        {
+            _expandedFolders.Remove(key);
+            host.IsVisible = false;
+            twirly.Text = "\u25B8";
+        }
+        else
+        {
+            _expandedFolders.Add(key);
+            populate();
+            host.IsVisible = true;
+            twirly.Text = "\u25BE";
+        }
+    }
+
+    private static string LabelForKind(DOSIDependencyKind kind) => kind switch
+    {
+        DOSIDependencyKind.Framework => "Framework",
+        DOSIDependencyKind.Platform => "Platform",
+        DOSIDependencyKind.DOSI => "DOSI",
+        DOSIDependencyKind.Project => "Projects",
+        DOSIDependencyKind.Package => "Packages",
+        _ => kind.ToString()
+    };
+
+    private static Color ColorForKind(DOSIDependencyKind kind) => kind switch
+    {
+        DOSIDependencyKind.Framework => Color.FromRgb(0x6B, 0x9F, 0xFF),
+        DOSIDependencyKind.Platform => Color.FromRgb(0xC9, 0x82, 0xFF),
+        DOSIDependencyKind.DOSI => Color.FromRgb(0x4F, 0xD1, 0xC5),
+        DOSIDependencyKind.Project => Color.FromRgb(0xFF, 0xB7, 0x4D),
+        DOSIDependencyKind.Package => Color.FromRgb(0xFF, 0x80, 0xA8),
+        _ => Color.FromRgb(0x99, 0x99, 0x99)
+    };
 }
