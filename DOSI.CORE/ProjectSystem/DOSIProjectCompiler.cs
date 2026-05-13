@@ -13,13 +13,49 @@ using DOSI.CORE.Security;
 
 namespace DOSI.CORE.ProjectSystem;
 
+/// <summary>Severity bucket for a <see cref="DOSIDiagnostic"/>.</summary>
+public enum DOSIDiagnosticSeverity
+{
+    Info,
+    Warning,
+    Error
+}
+
+/// <summary>
+/// Structured compiler diagnostic surfaced by the IDE's Error List. Carries
+/// the original Roslyn fields plus a best-effort plain-English suggested fix
+/// keyed off the diagnostic <see cref="Code"/>.
+/// </summary>
+public sealed class DOSIDiagnostic
+{
+    public DOSIDiagnosticSeverity Severity { get; init; } = DOSIDiagnosticSeverity.Error;
+    /// <summary>Roslyn diagnostic id (e.g. <c>"CS0103"</c>) or empty for non-compiler messages.</summary>
+    public string Code { get; init; } = string.Empty;
+    public string Message { get; init; } = string.Empty;
+    /// <summary>Absolute path of the source file the diagnostic points at, or empty if unknown.</summary>
+    public string FilePath { get; init; } = string.Empty;
+    /// <summary>1-based start line. 0 when the diagnostic has no location.</summary>
+    public int Line { get; init; }
+    /// <summary>1-based start column. 0 when the diagnostic has no location.</summary>
+    public int Column { get; init; }
+    /// <summary>1-based end line, defaulting to <see cref="Line"/>.</summary>
+    public int EndLine { get; init; }
+    /// <summary>1-based end column, defaulting to <see cref="Column"/>.</summary>
+    public int EndColumn { get; init; }
+    /// <summary>Plain-English hint shown below the message in the Error List, or null.</summary>
+    public string? SuggestedFix { get; init; }
+}
+
 /// <summary>
 /// Outcome of a <see cref="DOSIProjectCompiler"/> run.
 /// </summary>
 public sealed class DOSIBuildResult
 {
     public bool Success { get; init; }
+    /// <summary>Pre-formatted diagnostic strings (kept for backwards-compat with the Output pane).</summary>
     public IReadOnlyList<string> Diagnostics { get; init; } = Array.Empty<string>();
+    /// <summary>Structured diagnostics for the IDE Error List. Empty for purely-informational builds.</summary>
+    public IReadOnlyList<DOSIDiagnostic> StructuredDiagnostics { get; init; } = Array.Empty<DOSIDiagnostic>();
     public Assembly? Assembly { get; init; }
     public string Output { get; init; } = string.Empty;
     public Control? ReturnedControl { get; init; }
@@ -97,14 +133,20 @@ public static class DOSIProjectCompiler
         using var ms = new MemoryStream();
         EmitResult emit = compilation.Emit(ms);
 
-        var diagnostics = emit.Diagnostics
+        var emitDiags = emit.Diagnostics
             .Where(d => d.Severity == DiagnosticSeverity.Error || d.Severity == DiagnosticSeverity.Warning)
-            .Select(FormatDiagnostic)
             .ToList();
+        var diagnostics = emitDiags.Select(FormatDiagnostic).ToList();
+        var structured = emitDiags.Select(ToStructured).ToList();
 
         if (!emit.Success)
         {
-            return new DOSIBuildResult { Success = false, Diagnostics = diagnostics };
+            return new DOSIBuildResult
+            {
+                Success = false,
+                Diagnostics = diagnostics,
+                StructuredDiagnostics = structured
+            };
         }
 
         ms.Seek(0, SeekOrigin.Begin);
@@ -118,7 +160,15 @@ public static class DOSIProjectCompiler
             return new DOSIBuildResult
             {
                 Success = false,
-                Diagnostics = diagnostics.Concat(new[] { "Assembly load failed: " + ex.Message }).ToList()
+                Diagnostics = diagnostics.Concat(new[] { "Assembly load failed: " + ex.Message }).ToList(),
+                StructuredDiagnostics = structured.Concat(new[]
+                {
+                    new DOSIDiagnostic
+                    {
+                        Severity = DOSIDiagnosticSeverity.Error,
+                        Message = "Assembly load failed: " + ex.Message
+                    }
+                }).ToList()
             };
         }
 
@@ -126,6 +176,7 @@ public static class DOSIProjectCompiler
         {
             Success = true,
             Diagnostics = diagnostics,
+            StructuredDiagnostics = structured,
             Assembly = assembly
         };
     }
@@ -237,6 +288,84 @@ public static class DOSIProjectCompiler
         var sev = d.Severity == DiagnosticSeverity.Error ? "error" : "warning";
         return $"{file}({line},{col}): {sev} {d.Id}: {d.GetMessage()}";
     }
+
+    /// <summary>
+    /// Projects a Roslyn <see cref="Diagnostic"/> into the IDE-facing
+    /// <see cref="DOSIDiagnostic"/> shape (1-based positions, severity bucket,
+    /// suggested-fix string). The Error List in DOSIIDE consumes this.
+    /// </summary>
+    private static DOSIDiagnostic ToStructured(Diagnostic d)
+    {
+        var loc = d.Location.GetLineSpan();
+        var hasPos = loc.IsValid;
+        return new DOSIDiagnostic
+        {
+            Severity = d.Severity switch
+            {
+                DiagnosticSeverity.Error => DOSIDiagnosticSeverity.Error,
+                DiagnosticSeverity.Warning => DOSIDiagnosticSeverity.Warning,
+                _ => DOSIDiagnosticSeverity.Info
+            },
+            Code = d.Id ?? string.Empty,
+            Message = d.GetMessage(),
+            FilePath = loc.Path ?? string.Empty,
+            Line = hasPos ? loc.StartLinePosition.Line + 1 : 0,
+            Column = hasPos ? loc.StartLinePosition.Character + 1 : 0,
+            EndLine = hasPos ? loc.EndLinePosition.Line + 1 : 0,
+            EndColumn = hasPos ? loc.EndLinePosition.Character + 1 : 0,
+            SuggestedFix = SuggestFix(d.Id)
+        };
+    }
+
+    /// <summary>
+    /// Best-effort plain-English remediation hint for the most common Roslyn
+    /// diagnostics our users hit. Returns null for codes we don't have a
+    /// specific tip for; the IDE simply omits the "Fix:" line in that case.
+    /// Keep entries terse - this surfaces under the message in the Error List.
+    /// </summary>
+    private static string? SuggestFix(string code) => code switch
+    {
+        // ----- Lookup / resolution -----
+        "CS0103" => "Check the spelling, or add a 'using' for the namespace that defines this name.",
+        "CS0246" => "Add the missing 'using' directive (e.g. 'using System;') or check the type name spelling.",
+        "CS0104" => "The name is ambiguous - qualify it with its namespace (e.g. 'System.Timer' vs 'System.Threading.Timer').",
+        "CS0117" => "The type doesn't define this member. Check spelling or look for a different overload / extension method.",
+        "CS1061" => "The type doesn't have this member. Verify the spelling, the type, or whether you need to add a 'using' for an extension method.",
+
+        // ----- Syntax -----
+        "CS1002" => "Add the missing semicolon ';' at the end of the statement.",
+        "CS1003" => "Syntax error - usually a missing or extra punctuation character (',', ';', '}', etc.).",
+        "CS1513" => "Add the missing closing brace '}'.",
+        "CS1514" => "Add the missing opening brace '{'.",
+        "CS1525" => "Unexpected token. The expression isn't valid here - check punctuation and operator placement.",
+
+        // ----- Types / conversions -----
+        "CS0029" => "Cannot implicitly convert. Add an explicit cast '(Type)value' or change the variable's type.",
+        "CS0266" => "Cannot implicitly convert (loss of precision risk). Add an explicit cast.",
+        "CS0019" => "The operator can't be applied to these operand types - check the types or convert one side.",
+        "CS0021" => "Cannot index the value with [] - the type isn't an array, list, dictionary, or indexable collection.",
+
+        // ----- Method calls -----
+        "CS1501" => "No overload of the method takes this many arguments. Check the parameter list.",
+        "CS1503" => "Argument type doesn't match the parameter type. Cast it or pass a different value.",
+        "CS7036" => "A required argument wasn't provided - supply all parameters that don't have default values.",
+
+        // ----- Control flow -----
+        "CS0161" => "Not all code paths return a value. Add a 'return' statement before the closing brace.",
+        "CS0165" => "Local variable used before being assigned. Initialize it first or assign it on every path.",
+
+        // ----- Nullability -----
+        "CS8600" => "Possible null assignment to a non-nullable type. Mark the target as nullable ('Type?') or guard with a null check.",
+        "CS8602" => "Possible dereference of a null value. Add a null check ('if (x is not null)'), use '?.', or assert with '!'.",
+        "CS8604" => "Possible null reference passed as argument. Guard the value before passing it.",
+
+        // ----- Misc common -----
+        "CS0234" => "The type or namespace doesn't exist in this assembly. Check the namespace path or add a project reference.",
+        "CS0535" => "Implement the missing interface member, or remove the interface from the class.",
+        "CS0407" => "Method group has the wrong return type for the delegate. Change the delegate or the method signature.",
+
+        _ => null
+    };
 
     /// <summary>
     /// If <paramref name="text"/> looks like a "script" file - it contains top-level

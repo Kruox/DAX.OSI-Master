@@ -73,6 +73,18 @@ public class DOSIIDE : DOSIWindow
     private Border? _runPreviewHost;
     private Grid? _runPreviewContent;
 
+    // Error List sub-tab (lives inside the output pane). Hidden until a build
+    // populates it; clicking a row jumps to the file/line and selects the
+    // diagnostic span so the user can see exactly what's wrong.
+    private enum OutputTab { Output, ErrorList }
+    private OutputTab _outputActiveTab = OutputTab.Output;
+    private TextBlock? _errorListTabHeader;
+    private Border? _errorListBadge;
+    private TextBlock? _errorListBadgeText;
+    private DOSIScrollViewer? _errorListScroller;
+    private StackPanel? _errorListItems;
+    private TextBlock? _errorListEmptyState;
+
     // Standalone DOSIWindow that hosts the most recent run (so the user's
     // returned Control behaves like a real OS window: drag, resize, focus).
     private DOSIWindow? _runWindow;
@@ -388,6 +400,11 @@ public class DOSIIDE : DOSIWindow
         _statusBar = statusBar;
 
         // ---------- Output / Run preview pane ----------
+        // Two-tab pill in the header: OUTPUT (build log + run preview) and
+        // ERROR LIST (clickable, structured Roslyn diagnostics with one-line
+        // suggested fixes). Active tab is tracked by _outputActiveTab so
+        // every other code path that flips between them goes through the
+        // same SetOutputTab helper.
         _outputHeader = new TextBlock
         {
             Text = "OUTPUT",
@@ -397,6 +414,75 @@ public class DOSIIDE : DOSIWindow
             LetterSpacing = 1.2,
             VerticalAlignment = VerticalAlignment.Center
         };
+        _errorListTabHeader = new TextBlock
+        {
+            Text = "ERROR LIST",
+            FontSize = 10,
+            FontWeight = FontWeight.SemiBold,
+            Foreground = Accents.TextSecondaryBrush,
+            LetterSpacing = 1.2,
+            VerticalAlignment = VerticalAlignment.Center,
+            Opacity = 0.6
+        };
+        _errorListBadge = new Border
+        {
+            CornerRadius = new CornerRadius(8),
+            Background = new SolidColorBrush(Color.FromRgb(0xE5, 0x4B, 0x4B)),
+            Padding = new Thickness(6, 1),
+            Margin = new Thickness(6, 0, 0, 0),
+            VerticalAlignment = VerticalAlignment.Center,
+            IsVisible = false,
+            Child = _errorListBadgeText = new TextBlock
+            {
+                Text = "0",
+                FontSize = 10,
+                FontWeight = FontWeight.Bold,
+                Foreground = Brushes.White,
+                VerticalAlignment = VerticalAlignment.Center,
+                HorizontalAlignment = HorizontalAlignment.Center
+            }
+        };
+        var errorListHeaderRow = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            VerticalAlignment = VerticalAlignment.Center,
+            Children = { _errorListTabHeader, _errorListBadge }
+        };
+
+        var outputHeaderHost = new Border
+        {
+            Padding = new Thickness(0, 4),
+            Background = Brushes.Transparent,
+            Cursor = new Cursor(StandardCursorType.Hand),
+            Child = _outputHeader
+        };
+        outputHeaderHost.PointerPressed += (_, e) =>
+        {
+            e.Handled = true;
+            SetOutputTab(OutputTab.Output);
+        };
+
+        var errorListHeaderHost = new Border
+        {
+            Padding = new Thickness(0, 4),
+            Margin = new Thickness(20, 0, 0, 0),
+            Background = Brushes.Transparent,
+            Cursor = new Cursor(StandardCursorType.Hand),
+            Child = errorListHeaderRow
+        };
+        errorListHeaderHost.PointerPressed += (_, e) =>
+        {
+            e.Handled = true;
+            SetOutputTab(OutputTab.ErrorList);
+        };
+
+        var outputTabRow = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            VerticalAlignment = VerticalAlignment.Center,
+            Children = { outputHeaderHost, errorListHeaderHost }
+        };
+
         var hideOutputBtn = new TextBlock
         {
             Text = "\u2715",
@@ -416,7 +502,7 @@ public class DOSIIDE : DOSIWindow
             ColumnDefinitions = new ColumnDefinitions("*,Auto"),
             Margin = new Thickness(12, 8)
         };
-        outputHeaderGrid.Children.Add(_outputHeader); Grid.SetColumn(_outputHeader, 0);
+        outputHeaderGrid.Children.Add(outputTabRow); Grid.SetColumn(outputTabRow, 0);
         outputHeaderGrid.Children.Add(hideOutputBtn); Grid.SetColumn(hideOutputBtn, 1);
 
         _outputLog = new DOSICodeEditor
@@ -424,6 +510,32 @@ public class DOSIIDE : DOSIWindow
             FontSize = 12,
             IsReadOnly = true,
             Text = string.Empty
+        };
+
+        // Error List body: a vertically-stacked, clickable list of
+        // diagnostics. Built lazily by RenderErrorList() each time a build
+        // finishes. Hidden by default - swapped in via SetOutputTab.
+        _errorListItems = new StackPanel
+        {
+            Orientation = Orientation.Vertical,
+            Margin = new Thickness(0, 4)
+        };
+        _errorListEmptyState = new TextBlock
+        {
+            Text = "No issues. Build a project to see diagnostics here.",
+            FontSize = 12,
+            Foreground = Accents.TextSecondaryBrush,
+            Opacity = 0.7,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Margin = new Thickness(0, 24, 0, 0)
+        };
+        _errorListItems.Children.Add(_errorListEmptyState);
+        _errorListScroller = new DOSIScrollViewer
+        {
+            Content = _errorListItems,
+            HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled,
+            VerticalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto,
+            IsVisible = false
         };
 
         _runPreviewContent = new Grid
@@ -445,7 +557,10 @@ public class DOSIIDE : DOSIWindow
         {
             RowDefinitions = new RowDefinitions("*,Auto")
         };
+        // Layered: only one of _outputLog / _errorListScroller is visible at
+        // a time (driven by SetOutputTab). Run preview pinned at the bottom.
         outputBody.Children.Add(_outputLog); Grid.SetRow(_outputLog, 0);
+        outputBody.Children.Add(_errorListScroller); Grid.SetRow(_errorListScroller, 0);
         outputBody.Children.Add(_runPreviewHost); Grid.SetRow(_runPreviewHost, 1);
 
         var outputContent = new Grid
@@ -2061,6 +2176,22 @@ public class DOSIIDE : DOSIWindow
         foreach (var d in result.Diagnostics)
             AppendOutput(d);
 
+        // Refresh the Error List with the structured diagnostics from this
+        // build. On failure, surface the list automatically so the user
+        // doesn't have to hunt through the OUTPUT log to find what broke.
+        RenderErrorList(result.StructuredDiagnostics);
+        if (!result.Success && result.StructuredDiagnostics.Count > 0)
+        {
+            SetOutputTab(OutputTab.ErrorList);
+        }
+        else if (result.Success)
+        {
+            // Clean build: keep the user on whichever tab they were on, but
+            // make sure the OUTPUT log is the default if they hadn't picked.
+            if (_outputActiveTab == OutputTab.ErrorList && result.StructuredDiagnostics.Count == 0)
+                SetOutputTab(OutputTab.Output);
+        }
+
         if (!result.Success)
         {
             AppendOutput($"[Build] {_activeProject.Name}: FAILED.");
@@ -2207,6 +2338,242 @@ public class DOSIIDE : DOSIWindow
         // Keep the freshest line in view so long build/run logs don't appear
         // cut off behind the status bar in either windowed or fullscreen mode.
         _outputLog.ScrollToEnd();
+    }
+
+    // =====================================================================
+    // Output pane tab switching + Error List rendering
+    // =====================================================================
+
+    /// <summary>
+    /// Swaps the output pane between the OUTPUT log and the ERROR LIST view.
+    /// Updates the header weights / opacity so the active tab reads as
+    /// selected, and toggles which body control occupies the pane. Safe to
+    /// call before the pane has been initialised (no-op in that case).
+    /// </summary>
+    private void SetOutputTab(OutputTab tab)
+    {
+        _outputActiveTab = tab;
+        if (_outputLog != null) _outputLog.IsVisible = tab == OutputTab.Output;
+        if (_errorListScroller != null) _errorListScroller.IsVisible = tab == OutputTab.ErrorList;
+
+        if (_outputHeader != null)
+        {
+            _outputHeader.Opacity = tab == OutputTab.Output ? 1 : 0.6;
+            _outputHeader.Foreground = tab == OutputTab.Output
+                ? Accents.TextPrimaryBrush
+                : Accents.TextSecondaryBrush;
+        }
+        if (_errorListTabHeader != null)
+        {
+            _errorListTabHeader.Opacity = tab == OutputTab.ErrorList ? 1 : 0.6;
+            _errorListTabHeader.Foreground = tab == OutputTab.ErrorList
+                ? Accents.TextPrimaryBrush
+                : Accents.TextSecondaryBrush;
+        }
+    }
+
+    /// <summary>
+    /// Repopulates the Error List with one row per <see cref="DOSIDiagnostic"/>.
+    /// Updates the badge count, sorts errors before warnings, and falls back
+    /// to the empty-state hint when there are no diagnostics. Does NOT change
+    /// which tab is currently visible - call <see cref="SetOutputTab"/>
+    /// separately if you want to bring the list to the foreground.
+    /// </summary>
+    private void RenderErrorList(IReadOnlyList<DOSIDiagnostic> diagnostics)
+    {
+        if (_errorListItems == null) return;
+        _errorListItems.Children.Clear();
+
+        // Errors first (most painful), then warnings, then info.
+        var ordered = diagnostics
+            .OrderBy(d => d.Severity switch
+            {
+                DOSIDiagnosticSeverity.Error => 0,
+                DOSIDiagnosticSeverity.Warning => 1,
+                _ => 2
+            })
+            .ThenBy(d => d.FilePath, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(d => d.Line)
+            .ThenBy(d => d.Column)
+            .ToList();
+
+        var errorCount = ordered.Count(d => d.Severity == DOSIDiagnosticSeverity.Error);
+        var warningCount = ordered.Count(d => d.Severity == DOSIDiagnosticSeverity.Warning);
+
+        if (_errorListBadge != null && _errorListBadgeText != null)
+        {
+            var totalBlocking = errorCount + warningCount;
+            _errorListBadge.IsVisible = totalBlocking > 0;
+            _errorListBadgeText.Text = totalBlocking.ToString();
+            // Red badge for errors, amber when only warnings remain.
+            _errorListBadge.Background = errorCount > 0
+                ? new SolidColorBrush(Color.FromRgb(0xE5, 0x4B, 0x4B))
+                : new SolidColorBrush(Color.FromRgb(0xE8, 0xA1, 0x4A));
+        }
+
+        if (ordered.Count == 0)
+        {
+            if (_errorListEmptyState != null)
+            {
+                _errorListEmptyState.Text = "No issues. Last build is clean.";
+                _errorListItems.Children.Add(_errorListEmptyState);
+            }
+            return;
+        }
+
+        foreach (var diag in ordered)
+        {
+            _errorListItems.Children.Add(BuildErrorRow(diag));
+        }
+    }
+
+    private Border BuildErrorRow(DOSIDiagnostic diag)
+    {
+        // Severity icon (filled circle in the severity color).
+        var iconColor = diag.Severity switch
+        {
+            DOSIDiagnosticSeverity.Error => Color.FromRgb(0xE5, 0x4B, 0x4B),
+            DOSIDiagnosticSeverity.Warning => Color.FromRgb(0xE8, 0xA1, 0x4A),
+            _ => Color.FromRgb(0x6B, 0x9F, 0xFF)
+        };
+        var icon = new Border
+        {
+            Width = 10,
+            Height = 10,
+            CornerRadius = new CornerRadius(5),
+            Background = new SolidColorBrush(iconColor),
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 10, 0)
+        };
+
+        var codeText = new TextBlock
+        {
+            Text = string.IsNullOrEmpty(diag.Code) ? string.Empty : diag.Code,
+            FontFamily = DOSI.CORE.DOSIFonts.Mono,
+            FontSize = 11,
+            FontWeight = FontWeight.SemiBold,
+            Foreground = new SolidColorBrush(iconColor),
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 10, 0)
+        };
+
+        var locationText = new TextBlock
+        {
+            Text = FormatLocation(diag),
+            FontSize = 11,
+            Foreground = Accents.TextSecondaryBrush,
+            Opacity = 0.85,
+            VerticalAlignment = VerticalAlignment.Center,
+            TextTrimming = TextTrimming.CharacterEllipsis
+        };
+
+        var headerRow = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            VerticalAlignment = VerticalAlignment.Center,
+            Children = { icon, codeText, locationText }
+        };
+
+        var messageText = new TextBlock
+        {
+            Text = diag.Message,
+            FontSize = 12,
+            Foreground = Accents.TextPrimaryBrush,
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(20, 4, 0, 0)
+        };
+
+        var stack = new StackPanel { Orientation = Orientation.Vertical };
+        stack.Children.Add(headerRow);
+        stack.Children.Add(messageText);
+
+        if (!string.IsNullOrEmpty(diag.SuggestedFix))
+        {
+            var fixText = new TextBlock
+            {
+                Text = "Fix: " + diag.SuggestedFix,
+                FontSize = 11,
+                FontStyle = FontStyle.Italic,
+                Foreground = Accents.AccentPrimaryBrush,
+                TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(20, 4, 0, 0)
+            };
+            stack.Children.Add(fixText);
+        }
+
+        var row = new Border
+        {
+            Padding = new Thickness(12, 8),
+            Margin = new Thickness(8, 2),
+            CornerRadius = new CornerRadius(6),
+            Background = Brushes.Transparent,
+            BorderBrush = new SolidColorBrush(Color.FromArgb(40, 255, 255, 255)),
+            BorderThickness = new Thickness(0, 0, 0, 1),
+            Cursor = string.IsNullOrEmpty(diag.FilePath)
+                ? null
+                : new Cursor(StandardCursorType.Hand),
+            Child = stack
+        };
+
+        if (!string.IsNullOrEmpty(diag.FilePath))
+        {
+            row.PointerEntered += (_, _) =>
+                row.Background = new SolidColorBrush(Color.FromArgb(28, 255, 255, 255));
+            row.PointerExited += (_, _) =>
+                row.Background = Brushes.Transparent;
+            row.PointerReleased += (_, _) => GoToDiagnostic(diag);
+        }
+
+        return row;
+    }
+
+    private static string FormatLocation(DOSIDiagnostic diag)
+    {
+        if (string.IsNullOrEmpty(diag.FilePath)) return "(no location)";
+        var name = IOPath.GetFileName(diag.FilePath);
+        return diag.Line > 0
+            ? $"{name} (Ln {diag.Line}, Col {diag.Column})"
+            : name;
+    }
+
+    /// <summary>
+    /// Opens the file referenced by <paramref name="diag"/>, jumps the caret
+    /// to its location, and selects the diagnostic span so the offending code
+    /// is visibly highlighted. Falls back gracefully for diagnostics with no
+    /// file path (e.g. assembly load failures).
+    /// </summary>
+    private void GoToDiagnostic(DOSIDiagnostic diag)
+    {
+        if (string.IsNullOrEmpty(diag.FilePath) || !File.Exists(diag.FilePath))
+        {
+            ShowOutput();
+            AppendOutput($"[Error List] Cannot navigate: source file not available for {diag.Code}.");
+            return;
+        }
+
+        OpenFile(diag.FilePath);
+
+        // OpenFile activates the tab synchronously; reach the editor and
+        // navigate. Selection (start..end) gives us the highlighted span.
+        var ed = _activeTab?.Editor;
+        if (ed == null) return;
+
+        if (diag.Line <= 0)
+        {
+            return;
+        }
+
+        // SetSelection takes 0-based line/col; clamp end to a sane range so
+        // single-character diagnostics still highlight at least one glyph.
+        var startLine0 = Math.Max(0, diag.Line - 1);
+        var startCol0 = Math.Max(0, diag.Column - 1);
+        var endLine0 = Math.Max(startLine0, diag.EndLine - 1);
+        var endCol0 = diag.EndLine == diag.Line && diag.EndColumn <= diag.Column
+            ? startCol0 + 1
+            : Math.Max(0, diag.EndColumn - 1);
+
+        ed.GoToLine(diag.Line, diag.Column);
+        ed.SetSelection(startLine0, startCol0, endLine0, endCol0);
     }
 
     private static Border BuildToolDivider() => new()
