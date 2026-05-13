@@ -24,6 +24,7 @@ namespace DAX.OSI.DefaultApplications;
 public class DOSIWebBrowser : DOSIWindow
 {
     private readonly DOSITextBox _addressBar;
+    private Avalonia.Controls.Shapes.Path? _addressBarSiteIcon;
     private readonly Border _backButton;
     private readonly Border _forwardButton;
     private readonly Border _refreshButton;
@@ -43,6 +44,9 @@ public class DOSIWebBrowser : DOSIWindow
     private readonly Border _toolbarBorder;
     private readonly Border _statusBar;
     private readonly TextBlock _statusText;
+    private Border? _loadProgress;
+    private Avalonia.Threading.DispatcherTimer? _loadProgressTimer;
+    private double _loadProgressPhase;
     private readonly List<string> _history = [];
     private int _historyIndex = -1;
     private string _currentUrl = "dosi://home";
@@ -133,18 +137,53 @@ public class DOSIWebBrowser : DOSIWindow
         navButtonPanel.Children.Add(_refreshButton);
         navButtonPanel.Children.Add(_homeButton);
 
-        // Address bar - using custom DOSITextBox with rounded pill-shaped ends
+        // Address bar - using custom DOSITextBox with rounded pill-shaped ends.
+        // Left padding is bumped to make room for the site-state icon (lock /
+        // globe / sparkle) overlaid on the inside of the pill below.
         _addressBar = new DOSITextBox
         {
             PlaceholderText = "Enter URL or search...",
             FontSize = 13,
             VerticalAlignment = VerticalAlignment.Center,
             UseRoundedEnds = true,  // Pill-shaped rounded corners
-            Padding = new Thickness(14, 6),
+            Padding = new Thickness(36, 6, 14, 6),
             Height = 32
         };
         _addressBar.KeyDown += OnAddressBarKeyDown;
         _addressBar.GotFocus += (s, e) => _addressBar.SelectAll();
+        // Keep the leading site-state icon in lockstep with whatever the
+        // address bar shows (covers NavigateTo, GoBack/Forward, in-page
+        // navigations from the WebView, etc. - any code that touches Text).
+        _addressBar.PropertyChanged += (_, e) =>
+        {
+            if (e.Property == TextBox.TextProperty)
+                ApplyAddressBarSiteIcon((e.NewValue as string) ?? string.Empty);
+        };
+
+        // Leading site-state icon overlaid inside the pill, kept visually
+        // associated with the address text. Path-based so it scales crisply
+        // and follows the accent. RefreshAddressBarSiteIcon() swaps the
+        // geometry whenever the URL changes (lock for HTTPS, globe for HTTP,
+        // sparkle for dosi:// internal pages).
+        _addressBarSiteIcon = new Avalonia.Controls.Shapes.Path
+        {
+            Width = 14,
+            Height = 14,
+            Stretch = Stretch.Uniform,
+            Fill = Accents.TextSecondaryBrush,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        var siteIconHost = new Border
+        {
+            Width = 22,
+            Height = 22,
+            HorizontalAlignment = HorizontalAlignment.Left,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(10, 0, 0, 0),
+            Child = _addressBarSiteIcon,
+            IsHitTestVisible = false
+        };
+        ApplyAddressBarSiteIcon("dosi://home");
 
         // Go button - shares the exact Path geometry used by Forward so the
         // entire toolbar reads as one consistent arrow family. Pixel-identical
@@ -164,7 +203,10 @@ public class DOSIWebBrowser : DOSIWindow
         Grid.SetColumn(navButtonPanel, 0);
 
         var addressContainer = new Border { Margin = new Thickness(8, 0) };
-        addressContainer.Child = _addressBar;
+        var addressOverlay = new Grid();
+        addressOverlay.Children.Add(_addressBar);
+        addressOverlay.Children.Add(siteIconHost);
+        addressContainer.Child = addressOverlay;
         toolbar.Children.Add(addressContainer);
         Grid.SetColumn(addressContainer, 1);
 
@@ -191,13 +233,32 @@ public class DOSIWebBrowser : DOSIWindow
             VerticalAlignment = VerticalAlignment.Center
         };
 
+        // Thin accent-coloured strip drawn along the TOP edge of the status
+        // bar that pulses while a page is loading. Indeterminate (the wrapped
+        // WebView doesn't surface a load percentage) but the gentle
+        // breathing motion gives users continuous "yes, work is happening"
+        // feedback during slow navigations. Hidden by default.
+        _loadProgress = new Border
+        {
+            Height = 2,
+            Background = Accents.AccentPrimaryBrush,
+            VerticalAlignment = VerticalAlignment.Top,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            IsVisible = false,
+            Opacity = 0
+        };
+
+        var statusContent = new Grid();
+        statusContent.Children.Add(_statusText);
+        statusContent.Children.Add(_loadProgress);
+
         _statusBar = new Border
         {
             Background = Accents.ControlBackgroundBrush,
             BorderBrush = new SolidColorBrush(Accents.ControlBorder),
             BorderThickness = new Thickness(0, 1, 0, 0),
             Height = 28,
-            Child = _statusText
+            Child = statusContent
         };
 
         // Main layout
@@ -332,6 +393,10 @@ public class DOSIWebBrowser : DOSIWindow
         // tabs don't leak their native HWND past the window's lifetime.
         DisposeAllTabWebViews();
         _webView = null;
+
+        // Tear down the load-progress pulse timer so its dispatcher reference
+        // doesn't keep the closed window's UI thread root alive.
+        EndLoadProgress();
     }
 
     /// <summary>
@@ -950,6 +1015,7 @@ public class DOSIWebBrowser : DOSIWindow
         {
             _statusText.Text = $"Loading {navUrl}...";
             _addressBar.Text = navUrl;
+            BeginLoadProgress();
         };
 
         _webView.NavigationCompleted += (s, navUrl) =>
@@ -959,6 +1025,7 @@ public class DOSIWebBrowser : DOSIWindow
             _currentUrl = navUrl;
             UpdateNavigationButtons();
             SyncActiveTabState();
+            EndLoadProgress();
         };
 
         _webView.TitleChanged += (s, title) =>
@@ -1127,47 +1194,90 @@ public class DOSIWebBrowser : DOSIWindow
         var content = new StackPanel
         {
             HorizontalAlignment = HorizontalAlignment.Center,
-            VerticalAlignment = VerticalAlignment.Center,
-            Spacing = 20,
-            Margin = new Thickness(40, 60)
+            VerticalAlignment = VerticalAlignment.Top,
+            Spacing = 18,
+            Margin = new Thickness(40, 80, 40, 60),
+            MaxWidth = 760
         };
 
-        // Logo
-        var logo = new TextBlock
+        // ---- Hero greeting -------------------------------------------------
+        // Time-of-day aware so the home page feels alive across the day
+        // instead of staring back with the same headline every time.
+        var hour = DateTime.Now.Hour;
+        var greeting = hour switch
         {
-            Text = "DOSI",
-            FontSize = 64,
+            >= 5 and < 12 => "Good morning",
+            >= 12 and < 18 => "Good afternoon",
+            >= 18 and < 22 => "Good evening",
+            _ => "Hello"
+        };
+
+        var hero = new TextBlock
+        {
+            Text = greeting,
+            FontSize = 44,
             FontWeight = FontWeight.Bold,
             Foreground = Accents.AccentPrimaryBrush,
             HorizontalAlignment = HorizontalAlignment.Center
         };
-        content.Children.Add(logo);
+        content.Children.Add(hero);
 
-        var tagline = new TextBlock
+        var subhero = new TextBlock
         {
-            Text = "Your gateway to the digital world",
+            Text = "Where would you like to go?",
             FontSize = 16,
             Foreground = Accents.TextSecondaryBrush,
             HorizontalAlignment = HorizontalAlignment.Center,
-            Margin = new Thickness(0, -10, 0, 20)
+            Margin = new Thickness(0, -6, 0, 14)
         };
-        content.Children.Add(tagline);
+        content.Children.Add(subhero);
 
-        // Quick links section
-        var quickLinksTitle = new TextBlock
+        // ---- Centered search bar ------------------------------------------
+        // Functional - submitting routes through NavigateTo (which dispatches
+        // to the user's chosen search engine, same as the address bar).
+        var searchBox = new DOSITextBox
         {
-            Text = "Quick Links",
+            PlaceholderText = $"Search {BrowserPreferences.GetEngineLabel(BrowserPreferences.Current.SearchEngine)} or type a URL",
             FontSize = 14,
+            UseRoundedEnds = true,
+            Padding = new Thickness(20, 10),
+            Height = 44,
+            Width = 540,
+            HorizontalAlignment = HorizontalAlignment.Center
+        };
+        searchBox.KeyDown += (_, e) =>
+        {
+            if (e.Key == Key.Enter)
+            {
+                NavigateTo(searchBox.Text ?? string.Empty);
+                e.Handled = true;
+            }
+        };
+        var searchHost = new Border
+        {
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Padding = new Thickness(0, 6, 0, 6),
+            Child = searchBox
+        };
+        content.Children.Add(searchHost);
+
+        // ---- Quick links section (kind-grouped cards) ---------------------
+        content.Children.Add(new TextBlock
+        {
+            Text = "QUICK LINKS",
+            FontSize = 11,
             FontWeight = FontWeight.SemiBold,
             Foreground = Accents.TextSecondaryBrush,
-            Margin = new Thickness(0, 20, 0, 10)
-        };
-        content.Children.Add(quickLinksTitle);
+            Opacity = 0.7,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Margin = new Thickness(0, 26, 0, 4)
+        });
 
         var linksPanel = new WrapPanel
         {
             HorizontalAlignment = HorizontalAlignment.Center,
-            Orientation = Orientation.Horizontal
+            Orientation = Orientation.Horizontal,
+            ItemWidth = 170
         };
 
         linksPanel.Children.Add(CreateQuickLink("Google",   "https://www.google.com",  Color.FromRgb(66, 133, 244)));
@@ -1178,6 +1288,18 @@ public class DOSIWebBrowser : DOSIWindow
         linksPanel.Children.Add(CreateQuickLink("About",    "dosi://about",            Accents.AccentSecondary));
 
         content.Children.Add(linksPanel);
+
+        // ---- Footer line --------------------------------------------------
+        var footer = new TextBlock
+        {
+            Text = $"DOSI Browser · default search: {BrowserPreferences.GetEngineLabel(BrowserPreferences.Current.SearchEngine)}",
+            FontSize = 11,
+            Foreground = Accents.TextSecondaryBrush,
+            Opacity = 0.6,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Margin = new Thickness(0, 28, 0, 0)
+        };
+        content.Children.Add(footer);
 
         container.Content = content;
 
@@ -2256,6 +2378,98 @@ public class DOSIWebBrowser : DOSIWindow
         return path;
     }
 
+    /// <summary>
+    /// Starts the indeterminate "breathing" pulse on the status-bar load
+    /// strip. Idempotent: re-calling while already pulsing is a no-op.
+    /// </summary>
+    private void BeginLoadProgress()
+    {
+        if (_loadProgress == null) return;
+        _loadProgress.IsVisible = true;
+        if (_loadProgressTimer != null) return;
+
+        _loadProgressPhase = 0;
+        _loadProgressTimer = new Avalonia.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(40)
+        };
+        _loadProgressTimer.Tick += (_, _) =>
+        {
+            if (_loadProgress == null) return;
+            _loadProgressPhase += 0.08;
+            // Cosine-eased breathing between 0.35 and 1.0 so the strip never
+            // disappears (still reads as "loading") but visibly pulses.
+            var eased = 0.675 + 0.325 * Math.Cos(_loadProgressPhase);
+            _loadProgress.Opacity = eased;
+        };
+        _loadProgressTimer.Start();
+    }
+
+    /// <summary>
+    /// Snaps the load strip back to invisible and tears down the pulse timer.
+    /// Safe to call when no pulse is in flight.
+    /// </summary>
+    private void EndLoadProgress()
+    {
+        _loadProgressTimer?.Stop();
+        _loadProgressTimer = null;
+        if (_loadProgress != null)
+        {
+            _loadProgress.Opacity = 0;
+            _loadProgress.IsVisible = false;
+        }
+    }
+
+    /// <summary>
+    /// Updates the leading site-state icon inside the address bar pill based
+    /// on <paramref name="url"/>'s scheme. HTTPS gets a closed-padlock; plain
+    /// HTTP gets an unlocked padlock tinted by the warning accent so the user
+    /// notices an insecure page; <c>dosi://</c> internal pages get a four-
+    /// pointed sparkle in the accent color so the home page / settings page
+    /// feel native rather than borrowed.
+    /// </summary>
+    private void ApplyAddressBarSiteIcon(string url)
+    {
+        if (_addressBarSiteIcon == null) return;
+
+        // Filled-shape geometries (Stretch.Uniform sizes them into the 14x14
+        // host) - kept simple so they read instantly at icon size.
+        const string lockGeometry =
+            "M 5,8 L 5,5 A 3,3 0 0 1 11,5 L 11,8 L 4,8 L 4,15 L 12,15 L 12,8 Z " +
+            "M 6.5,5 A 1.5,1.5 0 0 1 9.5,5 L 9.5,8 L 6.5,8 Z";
+        const string sparkleGeometry =
+            "M 8,1 L 9.6,6.4 L 15,8 L 9.6,9.6 L 8,15 L 6.4,9.6 L 1,8 L 6.4,6.4 Z";
+        const string globeGeometry =
+            "M 8,1 A 7,7 0 1 1 7.999,1 Z " +
+            "M 1,8 L 15,8 M 8,1 C 4,4 4,12 8,15 M 8,1 C 12,4 12,12 8,15";
+
+        IBrush fill;
+        string data;
+        if (url.StartsWith("dosi://", StringComparison.OrdinalIgnoreCase))
+        {
+            data = sparkleGeometry;
+            fill = Accents.AccentPrimaryBrush;
+        }
+        else if (url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+        {
+            data = lockGeometry;
+            fill = new SolidColorBrush(Color.FromRgb(0x4F, 0xC3, 0x6E)); // calm green
+        }
+        else if (url.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+        {
+            data = globeGeometry;
+            fill = new SolidColorBrush(Color.FromRgb(0xE8, 0xA1, 0x4A)); // warning amber
+        }
+        else
+        {
+            data = globeGeometry;
+            fill = Accents.TextSecondaryBrush;
+        }
+
+        _addressBarSiteIcon.Data = Geometry.Parse(data);
+        _addressBarSiteIcon.Fill = fill;
+    }
+
     private static Border CreateNavButton(Control glyph, string tooltip)
     {
         // Soft drop shadow on every glyph so the icons gently lift off the
@@ -2687,6 +2901,25 @@ public class DOSIWebBrowser : DOSIWindow
         tab.Header.Background = isActive
             ? Accents.ControlBackgroundBrush
             : Brushes.Transparent;
+
+        // Bold the active tab title slightly so the foreground tab also reads
+        // by weight, not just by background fill - helps users with low
+        // contrast settings track which tab is current.
+        tab.HeaderText.FontWeight = isActive ? FontWeight.SemiBold : FontWeight.Normal;
+
+        // Lift the active tab off the strip with a soft drop shadow so it
+        // visually "comes forward" the way Edge / Chrome / VS Code do, then
+        // strip it from inactive tabs to keep the row flat.
+        tab.Header.BoxShadow = isActive
+            ? new BoxShadows(new BoxShadow
+            {
+                OffsetX = 0,
+                OffsetY = 1,
+                Blur = 6,
+                Spread = 0,
+                Color = Color.FromArgb(55, 0, 0, 0)
+            })
+            : default;
 
         // Active indicator strip: visible only on the foreground tab.
         if (tab.HeaderActiveIndicator != null)
