@@ -25,6 +25,10 @@
   </ItemGroup>
 
   <ItemGroup>
+    <ProjectReference Include="..\DAX.OSI.PluginSdk\DAX.OSI.PluginSdk.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
     <AvaloniaResource Include="Resources\Wallpapers\**" />
   </ItemGroup>
 

@@ -4,6 +4,7 @@ using DOSI.CORE.AccentManagement;
 using DOSI.CORE.UIComponents;
 using DOSI.CORE.UIComponents.WindowManagement;
 using DOSI.CORE.UserManagement;
+using DOSI.CORE.WallpaperManagement;
 
 namespace DOSI.CORE.DOSITerminalManagement;
 
@@ -329,6 +330,24 @@ public class DOSITerminalManager
             return;
         }
 
+        // SystemSignOut.Begin is async void and silently no-ops in two cases:
+        //   (a) no SignOutHandler installed (host hasn't wired up the visual
+        //       sequence yet - shouldn't happen at this point but worth
+        //       surfacing if it does)
+        //   (b) a sign-out is already in flight (IsSigningOut == true)
+        // Without surfacing those, the terminal printed "Signing out X..."
+        // and then appeared to hang. Tell the user what's going on instead.
+        if (SystemSignOut.SignOutHandler == null)
+        {
+            _terminal.WriteLine("Sign-out isn't available right now (no handler).");
+            return;
+        }
+        if (SystemSignOut.IsSigningOut)
+        {
+            _terminal.WriteLine("A sign-out is already in progress.");
+            return;
+        }
+
         _terminal.WriteLine($"Signing out {user.DisplayName}...");
         SystemSignOut.Begin();
     }
@@ -449,8 +468,14 @@ public class DOSITerminalManager
         public string DisplayName = string.Empty;
         public string Password = string.Empty;
         public DOSIAccent? Accent;
+        // Wallpaper key chosen during the wizard. null = accent-only
+        // backdrop (the documented default for fresh accounts so the
+        // user's chosen accent reads as the dominant brand colour
+        // on first sign-in rather than being washed out by an image).
+        public string? WallpaperKey;
         public bool IsAdministrator;
         public DOSIAccent[] AvailableAccents = Array.Empty<DOSIAccent>();
+        public DOSIWallpaper[] AvailableWallpapers = Array.Empty<DOSIWallpaper>();
     }
 
     /// <summary>
@@ -605,6 +630,48 @@ public class DOSITerminalManager
             }
 
             state.Accent = idx == 0 ? null : state.AvailableAccents[idx - 1];
+            AskWallpaper(state);
+        });
+    }
+
+    // ---- Step 5b: Wallpaper picker ----
+    //
+    // Lists every wallpaper the WallpaperManager knows about plus a
+    // leading "[0] Accent only (default)" entry. The accent-only sentinel
+    // is the documented default for fresh accounts - it makes the user's
+    // chosen accent the dominant brand colour on first sign-in instead of
+    // being washed out by an image. Pressing Enter with no input also
+    // accepts the default so the wizard stays fast for users who just
+    // want defaults.
+    private void AskWallpaper(UserAddState state)
+    {
+        state.AvailableWallpapers = WallpaperManager.Instance.AvailableWallpapers.ToArray();
+
+        _terminal.WriteLine();
+        _terminal.WriteLine("Available wallpapers:");
+        _terminal.WriteLine("  [ 0] Accent only (default)");
+        for (int i = 0; i < state.AvailableWallpapers.Length; i++)
+        {
+            var w = state.AvailableWallpapers[i];
+            _terminal.WriteLine($"  [{i + 1,2}] {w.DisplayName}");
+        }
+
+        AskNext("Wallpaper number [0]:", input =>
+        {
+            if (HandleCancel(input)) return;
+
+            var raw = (input ?? string.Empty).Trim();
+            // Empty input == accept the default (accent only).
+            if (string.IsNullOrEmpty(raw)) { state.WallpaperKey = null; AskAdministrator(state); return; }
+
+            if (!int.TryParse(raw, out var idx) || idx < 0 || idx > state.AvailableWallpapers.Length)
+            {
+                _terminal.WriteLine($"  Please enter a number from 0 to {state.AvailableWallpapers.Length}.");
+                AskWallpaper(state);
+                return;
+            }
+
+            state.WallpaperKey = idx == 0 ? null : state.AvailableWallpapers[idx - 1].Key;
             AskAdministrator(state);
         });
     }
@@ -629,11 +696,22 @@ public class DOSITerminalManager
             ? AccentManager.GetAccentDisplayName(state.Accent.Value)
             : "system default";
 
+        // Wallpaper display name from the picker's saved key. Null /
+        // unknown key reads as the documented default (accent only) so
+        // the review block always tells the user what's about to happen.
+        string wallpaperName = "Accent only";
+        if (!string.IsNullOrEmpty(state.WallpaperKey) &&
+            WallpaperManager.Instance.TryGetWallpaper(state.WallpaperKey!, out var wp))
+        {
+            wallpaperName = wp.DisplayName;
+        }
+
         _terminal.WriteLine();
         _terminal.WriteLine("Review:");
         _terminal.WriteLine($"  Username:      {state.Username}");
         _terminal.WriteLine($"  Display name:  {state.DisplayName}");
         _terminal.WriteLine($"  Accent:        {accentName}");
+        _terminal.WriteLine($"  Wallpaper:     {wallpaperName}");
         _terminal.WriteLine($"  Administrator: {(state.IsAdministrator ? "yes" : "no")}");
 
         AskNext("Create this account? (Y/n):", input =>
@@ -677,6 +755,13 @@ public class DOSITerminalManager
 
         if (state.Accent.HasValue)
             UserManager.SetUserAccent(user, state.Accent.Value);
+
+        // Persist the wallpaper preference. The login screen's SelectUser
+        // reads this through UserManager.GetUserWallpaper so the choice
+        // takes effect on the very first sign-in. Passing null saves the
+        // accent-only default; non-null keys are validated by the picker
+        // step above so we never store a bogus key.
+        UserManager.SetUserWallpaper(user, state.WallpaperKey);
 
         _terminal.WriteLine();
         _terminal.WriteLine($"  Account created at: {UserManager.GetUserFilePath(user.Username)}");

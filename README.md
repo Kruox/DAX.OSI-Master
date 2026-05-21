@@ -18,7 +18,7 @@
 - [Project Layout](#project-layout)
 - [Getting Started](#getting-started)
 - [Tutorial](#tutorial)
-- [Building Apps in DOSIIDE](#building-apps-in-dosiide)
+- [Plug-in Apps](#plug-in-apps)
 - [Roadmap](#roadmap)
 - [License](#license)
 
@@ -36,8 +36,11 @@ DAX.OSI is the **shell**: the boot screen, login flow, desktop environment, and 
 | `DOSIFileExplorer` | Browse and manage virtual files |
 | `DOSIWebBrowser` | Embedded WebView-powered browser |
 | `DOSIImageViewer` | View images |
-| `DOSIIDE` | Lightweight code editor / IDE for building DOSI projects |
 | `DOSISettingsScreen` | System settings (accent color, fullscreen, etc.) |
+
+Additional applications (such as a code editor / IDE) are delivered as
+**plug-ins** discovered at startup from the `Plugins/` folder next to the
+executable. See [Plug-in Apps](#plug-in-apps) below.
 
 Every visible pixel is rendered with Avalonia and powered by the components exposed by **DOSI.CORE**.
 
@@ -132,7 +135,8 @@ Think of DOSI.CORE as the *kernel + standard library* of the virtual OS:
 |                          DAX.OSI                             |
 |  (Avalonia App: BootScreen -> LoginScreen -> DesktopScreen)  |
 |                                                              |
-|   Default Apps:  Terminal | FileExplorer | Browser | IDE     |
+|   Default Apps:  Terminal | FileExplorer | Browser | Viewer  |
+|   Plug-in Apps:  loaded from <executable>/Plugins/*.dll      |
 +----------------------------+---------------------------------+
                              |  references
                              v
@@ -142,6 +146,14 @@ Think of DOSI.CORE as the *kernel + standard library* of the virtual OS:
 |   SystemCore   |  WindowManager  |  UserManager              |
 |   AccentMgr    |  ScreenManager  |  WallpaperManager         |
 |   UIComponents |  Animations     |  ProjectSystem · Designer |
+|   PluginLoader |  LoadedAppRegistry                          |
++----------------------------+---------------------------------+
+                             |  references
+                             v
++--------------------------------------------------------------+
+|                     DAX.OSI.PluginSdk                        |
+|                                                              |
+|   IDOSIApp · IDOSIAppPlugin (public plug-in contracts)       |
 +--------------------------------------------------------------+
                              |
                              v
@@ -164,11 +176,12 @@ DAX.OSI-Master/
 ├── DAX.OSI/                    # The shell application (entry point)
 │   ├── Program.cs · App.cs · MainWindow.cs
 │   ├── UI/                     # BootScreen, LoginScreen, DesktopScreen
-│   ├── DefaultApplications/    # Terminal, FileExplorer, Browser, IDE
+│   ├── DefaultApplications/    # Terminal, FileExplorer, Browser, Viewer, ...
 │   └── Controls/               # WebViewWrapper, etc.
 │
 ├── DOSI.CORE/                  # The reusable engine / SDK
-│   ├── SystemCore.cs · SystemShutdown.cs · SystemSignOut.cs
+│   ├── System/                 # SystemCore, SystemShutdown, SystemSignOut
+│   ├── Fonts/                  # DOSIFonts
 │   ├── UIComponents/           # All DOSI* controls
 │   │   └── WindowManagement/   # WindowManager, WindowSnapManager
 │   ├── Animations/             # Tween, Easings, loading/success anims
@@ -177,7 +190,10 @@ DAX.OSI-Master/
 │   ├── UserManagement/         # UserManager
 │   ├── WallpaperManagement/    # WallpaperManager
 │   ├── AccentManagement/       # AccentManager + DOSIAccent enum
-│   └── DOSITerminalManagement/ # DOSITerminalManager
+│   ├── DOSITerminalManagement/ # DOSITerminalManager
+│   └── Plugins/                # PluginLoader + LoadedAppRegistry
+│
+├── DAX.OSI.PluginSdk/          # Public plug-in contracts (IDOSIApp, IDOSIAppPlugin)
 │
 ├── img/                        # Screenshots used in the Gallery section
 └── tutorial.html               # Quick-start interactive tutorial
@@ -215,13 +231,67 @@ A friendly, interactive walkthrough is included in **[`tutorial.html`](./tutoria
 
 ---
 
-## Building Apps in DOSIIDE
+## Plug-in Apps
 
-DAX.OSI ships with **DOSIIDE** — a Visual-Studio-style environment that lives *inside* the OS. It is sandboxed to the signed-in user's home folder, backed by an in-memory **Roslyn** compiler and a custom visual designer.
+DAX.OSI loads additional applications at startup from a **`Plugins/`**
+folder next to the executable. Each plug-in is a standalone .NET 9
+assembly that:
+
+1. References `DAX.OSI.PluginSdk` (and optionally `DOSI.CORE`)
+2. Exposes a public class implementing `IDOSIAppPlugin`
+3. Returns one or more `IDOSIApp` instances from `GetApps()`
+
+Discovered apps appear in the **Applications** menu next to the built-in
+tiles and participate in file-association routing from the **File
+Explorer** via `IDOSIApp.CanOpenFile(extension)`.
+
+```csharp
+using DAX.OSI.PluginSdk;
+using Avalonia.Controls;
+
+public sealed class MyAppPlugin : IDOSIAppPlugin
+{
+    public IEnumerable<IDOSIApp> GetApps() { yield return new MyApp(); }
+}
+
+internal sealed class MyApp : IDOSIApp
+{
+    public string Id          => "contoso.myapp";
+    public string Title       => "My App";
+    public string Description => "Does cool things";
+    public Control BuildGlyph() => new Border { /* 26x26 tile glyph */ };
+    public Control Activate()   => new MyAppWindow();   // a DOSIWindow
+    public bool CanOpenFile(string ext) => false;
+    public void OpenPath(Control instance, string path) { }
+}
+```
+
+Drop the compiled DLL into `<executable>/Plugins/`, restart, and the app
+shows up. Removing the DLL removes the app — the host runs unchanged.
+
+### How loading works
+
+`DOSI.CORE.Plugins.PluginLoader` scans `Plugins/*.dll` once at boot. Each
+plug-in is loaded into its own `AssemblyLoadContext` whose resolver
+redirects shared assemblies (`DOSI.CORE`, `DAX.OSI.PluginSdk`, Avalonia,
+BCL) back to the host's already-loaded copies, so type identity is
+preserved across the plug-in boundary.
+
+See `DAX.OSI.PluginSdk/PluginContracts.cs` for the full interface
+documentation.
+
+### Reference plug-in
+
+An example, **proprietary** plug-in (a Visual-Studio-style code editor +
+project system + visual form designer) is shipped as a separate, private
+repository. It is **not** part of this open-source codebase.
+
+---
 
 ### The `.dosiproj` Project Format
 
-A DOSI project is a folder containing a single `*.dosiproj` JSON manifest under `~/Projects/<name>/`:
+DOSI.CORE's project system stores apps as folders under `~/Projects/<name>/`
+with a single `*.dosiproj` JSON manifest:
 
 ```jsonc
 {
@@ -239,7 +309,7 @@ The IDE's **New Project** button scaffolds this for you and adds a starter `Prog
 
 When you press **Run**, `DOSIProjectCompiler.BuildAndRun` reflectively invokes the manifest's `EntryType.EntryMethod` as a `static` method:
 
-| `Run()` returns             | What DOSIIDE does                                                  |
+| `Run()` returns             | What `DOSIProjectCompiler.BuildAndRun` does                        |
 |-----------------------------|--------------------------------------------------------------------|
 | `void`                      | Executes the code; captures `Console.Out` into the Output pane.    |
 | `Avalonia.Controls.Control` | Hosts the returned control inside a real `DOSIWindow`.             |
@@ -262,7 +332,9 @@ public static class Program
 
 ### Script-Style Files
 
-For quick experiments, DOSIIDE allows top-level statements without a class or namespace — the compiler auto-wraps them into a `Program.Run` shape:
+For quick experiments, `DOSIProjectCompiler` accepts top-level statements
+without a class or namespace — the compiler auto-wraps them into a
+`Program.Run` shape:
 
 ```csharp
 using DOSI.CORE.UIComponents;
@@ -284,18 +356,26 @@ MyCoolApp/
 └── MainForm.dosiform     # designer file (optional)
 ```
 
-### Building, Running & The Output Pane
+### Building & Running
 
-- **Build (⚒)** — compile only; warnings and errors stream to the Output pane.
-- **Run (▶)** — build, invoke the entry point, capture stdout, and host any returned `Control` in a live preview window.
-- **Save / Save All** — flush dirty tabs.
-- **Status bar** — shows caret position, encoding, file path, and the active project (auto-detected from the focused tab).
+Programmatic entry points exposed by `DOSI.CORE.ProjectSystem`:
+
+| API | What it does |
+|---|---|
+| `DOSIProjectCompiler.Build(project)` | Compiles the project in-memory with Roslyn; returns diagnostics + the assembly. |
+| `DOSIProjectCompiler.BuildAndRun(project)` | Builds, invokes the entry point, captures stdout, and returns any `Control` the entry returned. |
+| `DOSIProject.EnumerateSourceFiles()` | Every `.cs` under the project folder (excluding `bin/` / `obj/`). |
+| `DOSIPublishedAppRegistry.Register(...)` | Adds the compiled app to the desktop's apps menu for the current user. |
+
+A host UI (such as the proprietary IDE plug-in) typically wraps these
+APIs behind toolbar buttons; the APIs themselves are part of the
+open-source DOSI.CORE surface.
 
 ### The Visual Form Designer (`.dosiform`)
 
-Files with the `.dosiform` extension open in **DOSIDesigner** instead of the code editor. Each form is a JSON document describing a `DOSIWindow` and its controls.
-
-Designer features:
+`DOSI.CORE.Designer.DOSIDesigner` is a re-usable visual designer control
+for `.dosiform` files. Each form is a JSON document describing a
+`DOSIWindow` and its controls. Designer features:
 
 - Toolbox of every DOSI control (drag onto the canvas)
 - Click-to-select, arrow-key nudging, drag-to-move, corner resizing
@@ -331,7 +411,9 @@ Every designed control has a `Dock` property powering responsive re-flow:
 
 ### Publishing Apps
 
-Once a project builds and runs cleanly, hit **Publish (↑)** in the toolbar. DOSIIDE registers it with `DOSIPublishedAppRegistry`, making it launchable from the desktop just like any built-in app.
+Once a project builds and runs cleanly, calling
+`DOSIPublishedAppRegistry.Register(user, project)` makes it launchable
+from the desktop apps menu just like any built-in app.
 
 ---
 

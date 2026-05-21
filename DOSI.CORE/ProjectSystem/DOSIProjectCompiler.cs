@@ -453,7 +453,7 @@ public static class DOSIProjectCompiler
     /// <summary>
     /// Projects a Roslyn <see cref="Diagnostic"/> into the IDE-facing
     /// <see cref="DOSIDiagnostic"/> shape (1-based positions, severity bucket,
-    /// suggested-fix string). The Error List in DOSIIDE consumes this.
+    /// suggested-fix string). Consumed by IDE-style hosts that surface an Error List.
     /// </summary>
     private static DOSIDiagnostic ToStructured(Diagnostic d)
     {
@@ -474,7 +474,7 @@ public static class DOSIProjectCompiler
             Column = hasPos ? loc.StartLinePosition.Character + 1 : 0,
             EndLine = hasPos ? loc.EndLinePosition.Line + 1 : 0,
             EndColumn = hasPos ? loc.EndLinePosition.Character + 1 : 0,
-            SuggestedFix = SuggestFix(d.Id)
+            SuggestedFix = SuggestFix(d.Id ?? string.Empty)
         };
     }
 

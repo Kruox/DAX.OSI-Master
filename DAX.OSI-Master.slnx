@@ -1,4 +1,5 @@
-<Solution>
+﻿<Solution>
   <Project Path="DAX.OSI/DAX.OSI.csproj" />
+  <Project Path="DAX.OSI.PluginSdk/DAX.OSI.PluginSdk.csproj" />
   <Project Path="DOSI.CORE/DOSI.CORE.csproj" />
 </Solution>

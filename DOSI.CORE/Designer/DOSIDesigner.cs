@@ -23,9 +23,9 @@ namespace DOSI.CORE.Designer;
 // =============================================================================
 // DOSI Visual Designer (MVP)
 //
-// Persistence model: sidecar .dosiform JSON file. The IDE recognises this
-// extension and opens it inside DOSIDesigner instead of DOSICodeEditor; the
-// Run path (DOSIIDE.RunBuildOrRun) feeds the file through DOSIFormLoader to
+// Persistence model: sidecar .dosiform JSON file. Hosts (typically a code
+// editor) recognise this extension and open it inside DOSIDesigner instead
+// of DOSICodeEditor; the Run path feeds the file through DOSIFormLoader to
 // build a real DOSIWindow at runtime.
 //
 // Out of scope for MVP (intentional - additive next steps):

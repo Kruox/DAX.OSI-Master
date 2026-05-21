@@ -21,7 +21,7 @@ namespace DAX.OSI.UI;
 /// idle timeout. Distinct from <see cref="LoginScreen"/>: there is no user
 /// picker - only the currently signed-in user can unlock.
 /// </summary>
-public sealed class LockScreen : Border
+public sealed class LockScreen : Border, IDOSILockScreen
 {
     private static AccentManager Accents => AccentManager.Instance;
 
@@ -279,6 +279,6 @@ public sealed class LockScreen : Border
     private async Task FadeOutStatusLater()
     {
         await Task.Delay(3500);
-        if (_statusText.Text.Length > 0) _statusText.Opacity = 0.55;
+        if (!string.IsNullOrEmpty(_statusText.Text)) _statusText.Opacity = 0.55;
     }
 }

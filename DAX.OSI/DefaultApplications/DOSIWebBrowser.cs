@@ -5,6 +5,7 @@ using Avalonia.Input;
 using Avalonia.Layout;
 using Avalonia.Media;
 using Avalonia.Media.Imaging;
+using Avalonia.Threading;
 using DAX.OSI.Controls;
 using DOSI.CORE;
 using DOSI.CORE.AccentManagement;
@@ -1144,8 +1145,12 @@ public class DOSIWebBrowser : DOSIWindow
             var openInNew = new MenuItem { Header = "Open Link in New Window" };
             openInNew.Click += (_, _) =>
             {
-                var wm = WindowManager.Instance;
-                if (wm != null) wm.OpenWindow(new DOSIWebBrowser(e.LinkUrl));
+                var url = e.LinkUrl!;
+                RunAfterMenuClosed(menu, () =>
+                {
+                    var wm = WindowManager.Instance;
+                    if (wm != null) wm.OpenWindow(new DOSIWebBrowser(url));
+                });
             };
             menu.Items.Add(openInNew);
 
@@ -1161,10 +1166,39 @@ public class DOSIWebBrowser : DOSIWindow
             var openImage = new MenuItem { Header = "Open Image in New Window" };
             openImage.Click += (_, _) =>
             {
-                var wm = WindowManager.Instance;
-                if (wm != null) wm.OpenWindow(new DOSIWebBrowser(e.ImageUrl));
+                var url = e.ImageUrl!;
+                RunAfterMenuClosed(menu, () =>
+                {
+                    var wm = WindowManager.Instance;
+                    if (wm != null) wm.OpenWindow(new DOSIWebBrowser(url));
+                });
             };
             menu.Items.Add(openImage);
+
+            // Save image to the user's Pictures folder, then open
+            // DOSIFileExplorer pre-navigated there so the user can rename
+            // / move / drag-to-wallpaper from a familiar surface. Async
+            // download is fire-and-forget; the explorer opens immediately
+            // and the file appears via the existing FileSystemWatcher
+            // pipeline once the download completes.
+            //
+            // CRITICAL: DispatcherPriority.Background is NOT late enough
+            // here - even after the click bubbles, the popup's composition
+            // sort (Visual.SynchronizeCompositionChildVisuals) keeps
+            // running for another render commit or two as the popup
+            // animates closed. Opening a new DOSIWindow on the next
+            // background pump races straight into a 'Failed to compare
+            // two elements in the array' crash inside the comparer.
+            // RunAfterMenuClosed below explicitly closes the menu, then
+            // schedules the action via a one-shot 60 ms DispatcherTimer
+            // - long enough for the popup to fully detach + render
+            // pipeline to settle on any reasonable machine, short
+            // enough that the user reads it as 'immediate'.
+            var saveImage = new MenuItem { Header = "Save Image As..." };
+            var imgUrl = e.ImageUrl!;
+            saveImage.Click += (_, _) =>
+                RunAfterMenuClosed(menu, () => _ = SaveImageToPicturesAsync(imgUrl));
+            menu.Items.Add(saveImage);
 
             menu.Items.Add(new Separator());
         }
@@ -1200,6 +1234,171 @@ public class DOSIWebBrowser : DOSIWindow
         menu.Open(_webView);
     }
 
+    /// <summary>
+    /// Forces the in-page context menu closed and then defers
+    /// <paramref name="action"/> by ~60 ms so the popup's visual tree
+    /// fully detaches before we mutate the parent tree. This is the
+    /// belt-and-braces version of "post at Background priority" - that
+    /// priority isn't actually late enough on builds with a WebView2
+    /// airspace HWND, because the compositor's child-visual sort runs
+    /// for another render commit or two after the click bubbles. The
+    /// timer-based yield is the only way to reliably wait past the
+    /// popup tear-down without engaging in arms-race priority hacks.
+    /// <para>
+    /// Crash signature this avoids:
+    /// <c>System.InvalidOperationException: Failed to compare two
+    /// elements in the array. at Avalonia.Visual.SynchronizeComposition
+    /// ChildVisuals()</c> - thrown when our handler opens a new
+    /// DOSIWindow (DOSIFileExplorer / DOSIWebBrowser) while the still-
+    /// closing popup's children are being re-sorted on the compositor.
+    /// </para>
+    /// </summary>
+    private static void RunAfterMenuClosed(ContextMenu menu, Action action)
+    {
+        try { menu.Close(); } catch { /* best-effort */ }
+
+        DispatcherTimer? timer = null;
+        timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(60) };
+        timer.Tick += (_, _) =>
+        {
+            timer!.Stop();
+            try { action(); } catch { /* don't crash the UI thread */ }
+        };
+        timer.Start();
+    }
+
+    /// <summary>
+    /// Downloads <paramref name="imageUrl"/> into the signed-in user's
+    /// Pictures folder, then opens a DOSIFileExplorer pre-navigated to
+    /// that folder so the user can rename / move / set-as-wallpaper from
+    /// a familiar surface. The explorer is opened IMMEDIATELY (before the
+    /// download completes) so there's instant feedback; the file itself
+    /// materialises in the explorer's grid via the watcher pipeline once
+    /// the bytes hit disk.
+    /// <para>
+    /// Handles data: URLs (inline base64), http(s) URLs (network fetch),
+    /// and falls back to the URL's last path segment for the filename.
+    /// Collisions get the standard " (2)", " (3)" suffix so a second
+    /// save of the same image doesn't clobber the first.
+    /// </para>
+    /// </summary>
+    private async System.Threading.Tasks.Task SaveImageToPicturesAsync(string imageUrl)
+    {
+        var user = DOSI.CORE.UserManagement.UserManager.CurrentUser;
+        if (user == null)
+        {
+            try { DOSIPopNotification.Show("Sign in to save images."); } catch { }
+            return;
+        }
+
+        string picturesDir;
+        try
+        {
+            DOSI.CORE.UserManagement.UserManager.EnsureUserSubfolders(user);
+            picturesDir = DOSI.CORE.UserManagement.UserManager.GetUserSubfolder(user, "Pictures");
+            System.IO.Directory.CreateDirectory(picturesDir);
+        }
+        catch (Exception ex)
+        {
+            try { DOSIPopNotification.Show($"Can't open Pictures folder: {ex.Message}"); } catch { }
+            return;
+        }
+
+        // Open the explorer right away so the user gets feedback even on
+        // a slow network. The file lands via the watcher when the
+        // download completes.
+        var wm = DOSI.CORE.UIComponents.WindowManagement.WindowManager.Instance;
+        if (wm != null)
+        {
+            var explorer = new DOSIFileExplorer();
+            explorer.RequestNavigate(picturesDir);
+            wm.OpenWindow(explorer);
+        }
+
+        // Resolve a sensible filename. Strip query strings + fragments so
+        // a URL like /banner.png?v=42 becomes "banner.png" instead of
+        // "banner.png?v=42" (which is an illegal filename on Windows).
+        string filename;
+        string? ext = null;
+        try
+        {
+            if (imageUrl.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+            {
+                // data:image/png;base64,xxxx - extract the subtype as ext.
+                var semi = imageUrl.IndexOf(';');
+                if (semi > 5)
+                {
+                    var mime = imageUrl.Substring(5, semi - 5); // "image/png"
+                    var slash = mime.IndexOf('/');
+                    if (slash >= 0) ext = "." + mime.Substring(slash + 1).ToLowerInvariant();
+                }
+                filename = $"image-{DateTime.Now:yyyyMMdd-HHmmss}{ext ?? ".png"}";
+            }
+            else
+            {
+                var uri = new Uri(imageUrl, UriKind.Absolute);
+                var seg = System.IO.Path.GetFileName(uri.LocalPath);
+                if (string.IsNullOrEmpty(seg)) seg = $"image-{DateTime.Now:yyyyMMdd-HHmmss}";
+                // Sanitize any leftover illegal chars.
+                foreach (var c in System.IO.Path.GetInvalidFileNameChars())
+                    seg = seg.Replace(c, '_');
+                filename = seg;
+                ext = System.IO.Path.GetExtension(filename);
+                if (string.IsNullOrEmpty(ext)) filename += ".img";
+            }
+        }
+        catch
+        {
+            filename = $"image-{DateTime.Now:yyyyMMdd-HHmmss}.img";
+        }
+
+        var dst = System.IO.Path.Combine(picturesDir, filename);
+        // Collision: " (2)", " (3)", ... before the extension.
+        if (System.IO.File.Exists(dst))
+        {
+            var stem = System.IO.Path.GetFileNameWithoutExtension(filename);
+            var e2 = System.IO.Path.GetExtension(filename);
+            for (int i = 2; i < 1000; i++)
+            {
+                var candidate = System.IO.Path.Combine(picturesDir, $"{stem} ({i}){e2}");
+                if (!System.IO.File.Exists(candidate)) { dst = candidate; break; }
+            }
+        }
+
+        // IMPORTANT: do NOT use ConfigureAwait(false) on these awaits.
+        // The continuation calls DOSIPopNotification.Show(...) which mutates
+        // the desktop visual tree (Canvas.Children.Add / Canvas.SetLeft).
+        // Coming back on a threadpool thread corrupts Avalonia's children
+        // collection, and the very next compositor sort throws
+        // "Failed to compare two elements in the array." from inside
+        // Visual.SynchronizeCompositionChildVisuals - which is exactly what
+        // users see when right-clicking an image and choosing Save Image As
+        // on a bare image page. Staying on the UI sync context keeps the
+        // toast (and any future UI work in the catch block) on the right
+        // thread.
+        try
+        {
+            byte[] bytes;
+            if (imageUrl.StartsWith("data:", StringComparison.OrdinalIgnoreCase))
+            {
+                // Inline base64 - decode directly, no network round-trip.
+                var comma = imageUrl.IndexOf(',');
+                if (comma < 0) throw new InvalidOperationException("Malformed data URL.");
+                bytes = Convert.FromBase64String(imageUrl.Substring(comma + 1));
+            }
+            else
+            {
+                bytes = await _faviconHttp.GetByteArrayAsync(imageUrl);
+            }
+            await System.IO.File.WriteAllBytesAsync(dst, bytes);
+            try { DOSIPopNotification.Show($"Saved \u201C{System.IO.Path.GetFileName(dst)}\u201D"); } catch { }
+        }
+        catch (Exception ex)
+        {
+            try { DOSIPopNotification.Show($"Download failed: {ex.Message}"); } catch { }
+        }
+    }
+
     private Control CreateHomePage()
     {
         var container = new DOSIScrollViewer
@@ -1212,55 +1411,97 @@ public class DOSIWebBrowser : DOSIWindow
         {
             HorizontalAlignment = HorizontalAlignment.Center,
             VerticalAlignment = VerticalAlignment.Top,
-            Spacing = 18,
-            Margin = new Thickness(40, 80, 40, 60),
+            Spacing = 0,
+            Margin = new Thickness(40, 64, 40, 56),
             MaxWidth = 760
         };
 
-        // ---- Hero greeting -------------------------------------------------
-        // Time-of-day aware so the home page feels alive across the day
-        // instead of staring back with the same headline every time.
+        // ---- Brand wordmark -----------------------------------------------
+        // Monospace "DOSI //" wordmark with the slashes tinted in the accent
+        // colour. Reads as a system identity, not a generic "new tab" page,
+        // which is the entire point of this redesign - the user shouldn't
+        // mistake this for Chrome's start page on a glance.
+        var wordmarkRow = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Spacing = 0
+        };
+        wordmarkRow.Children.Add(new TextBlock
+        {
+            Text = "DOSI",
+            FontFamily = DOSI.CORE.DOSIFonts.Mono,
+            FontSize = 56,
+            FontWeight = FontWeight.Bold,
+            Foreground = Accents.TextPrimaryBrush,
+            VerticalAlignment = VerticalAlignment.Center
+        });
+        wordmarkRow.Children.Add(new TextBlock
+        {
+            Text = " //",
+            FontFamily = DOSI.CORE.DOSIFonts.Mono,
+            FontSize = 56,
+            FontWeight = FontWeight.Bold,
+            Foreground = Accents.AccentPrimaryBrush,
+            VerticalAlignment = VerticalAlignment.Center
+        });
+        content.Children.Add(wordmarkRow);
+
+        // Time-of-day greeting sits BELOW the brand mark and reads as a
+        // "system status" line rather than the dominant headline. Subtle,
+        // intentionally typed in mono caps with letter-spacing so it reads
+        // as a CLI prompt instead of a marketing tagline.
         var hour = DateTime.Now.Hour;
         var greeting = hour switch
         {
-            >= 5 and < 12 => "Good morning",
-            >= 12 and < 18 => "Good afternoon",
-            >= 18 and < 22 => "Good evening",
-            _ => "Hello"
+            >= 5 and < 12 => "GOOD MORNING",
+            >= 12 and < 18 => "GOOD AFTERNOON",
+            >= 18 and < 22 => "GOOD EVENING",
+            _ => "WELCOME BACK"
         };
-
-        var hero = new TextBlock
+        content.Children.Add(new TextBlock
         {
-            Text = greeting,
-            FontSize = 44,
+            Text = greeting + "  ·  " + DateTime.Now.ToString("ddd MMM d  HH:mm"),
+            FontFamily = DOSI.CORE.DOSIFonts.Mono,
+            FontSize = 11,
+            LetterSpacing = 1.4,
+            Foreground = Accents.TextSecondaryBrush,
+            Opacity = 0.8,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Margin = new Thickness(0, 6, 0, 36)
+        });
+
+        // ---- Command-prompt search ----------------------------------------
+        // A textbox masquerading as a CLI prompt: chevron prefix glyph + mono
+        // input field, all wrapped in a pill with an accent-coloured outline.
+        // Functionally identical to the old search box (Enter routes through
+        // NavigateTo and respects the user's chosen search engine) but the
+        // visual language is unmistakably "DOSI" instead of "Google".
+        var promptGlyph = new TextBlock
+        {
+            Text = "\u203A",   // single right-pointing angle quote ›
+            FontFamily = DOSI.CORE.DOSIFonts.Mono,
+            FontSize = 22,
             FontWeight = FontWeight.Bold,
             Foreground = Accents.AccentPrimaryBrush,
-            HorizontalAlignment = HorizontalAlignment.Center
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(20, 0, 8, 0)
         };
-        content.Children.Add(hero);
-
-        var subhero = new TextBlock
-        {
-            Text = "Where would you like to go?",
-            FontSize = 16,
-            Foreground = Accents.TextSecondaryBrush,
-            HorizontalAlignment = HorizontalAlignment.Center,
-            Margin = new Thickness(0, -6, 0, 14)
-        };
-        content.Children.Add(subhero);
-
-        // ---- Centered search bar ------------------------------------------
-        // Functional - submitting routes through NavigateTo (which dispatches
-        // to the user's chosen search engine, same as the address bar).
         var searchBox = new DOSITextBox
         {
-            PlaceholderText = $"Search {BrowserPreferences.GetEngineLabel(BrowserPreferences.Current.SearchEngine)} or type a URL",
+            PlaceholderText = $"search {BrowserPreferences.GetEngineLabel(BrowserPreferences.Current.SearchEngine).ToLowerInvariant()}, or paste a URL",
             FontSize = 14,
-            UseRoundedEnds = true,
-            Padding = new Thickness(20, 10),
+            Padding = new Thickness(0, 10, 16, 10),
             Height = 44,
-            Width = 540,
-            HorizontalAlignment = HorizontalAlignment.Center
+            VerticalAlignment = VerticalAlignment.Center,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            // Strip the textbox's own chrome so the rounded host pill below
+            // is the ONLY visual surface - otherwise the textbox paints its
+            // own ControlBackground + ControlBorder rectangle inside the pill
+            // and you can clearly see the two layers fighting each other.
+            Background = Brushes.Transparent,
+            BorderBrush = Brushes.Transparent,
+            BorderThickness = 0
         };
         searchBox.KeyDown += (_, e) =>
         {
@@ -1270,53 +1511,128 @@ public class DOSIWebBrowser : DOSIWindow
                 e.Handled = true;
             }
         };
+        var promptGrid = new Grid
+        {
+            ColumnDefinitions = new ColumnDefinitions("Auto,*"),
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        promptGrid.Children.Add(promptGlyph); Grid.SetColumn(promptGlyph, 0);
+        promptGrid.Children.Add(searchBox); Grid.SetColumn(searchBox, 1);
+
         var searchHost = new Border
         {
+            Width = 560,
+            Height = 56,
+            CornerRadius = new CornerRadius(28),
+            Background = Accents.ControlBackgroundBrush,
+            BorderBrush = Accents.AccentPrimaryBrush,
+            BorderThickness = new Thickness(1.5),
             HorizontalAlignment = HorizontalAlignment.Center,
-            Padding = new Thickness(0, 6, 0, 6),
-            Child = searchBox
+            Child = promptGrid,
+            // Soft accent halo around the prompt so it reads as the focal
+            // point of the page without needing to be physically larger.
+            BoxShadow = new BoxShadows(new BoxShadow
+            {
+                OffsetX = 0,
+                OffsetY = 6,
+                Blur = 24,
+                Spread = -8,
+                Color = Color.FromArgb(70,
+                    Accents.AccentPrimary.R,
+                    Accents.AccentPrimary.G,
+                    Accents.AccentPrimary.B)
+            })
         };
         content.Children.Add(searchHost);
 
-        // ---- Quick links section (kind-grouped cards) ---------------------
+        // ---- Quick links: brand tile grid ---------------------------------
+        // Replaces the "rounded button row" (universal new-tab look) with a
+        // square tile grid where each tile has a brand-coloured top band and
+        // a label band beneath. Visually closer to a launcher / app drawer
+        // than to a bookmark bar.
         content.Children.Add(new TextBlock
         {
-            Text = "QUICK LINKS",
-            FontSize = 11,
+            Text = "PINNED",
+            FontFamily = DOSI.CORE.DOSIFonts.Mono,
+            FontSize = 10,
+            LetterSpacing = 2.0,
             FontWeight = FontWeight.SemiBold,
             Foreground = Accents.TextSecondaryBrush,
-            Opacity = 0.7,
-            HorizontalAlignment = HorizontalAlignment.Center,
-            Margin = new Thickness(0, 26, 0, 4)
+            Opacity = 0.6,
+            HorizontalAlignment = HorizontalAlignment.Left,
+            Margin = new Thickness(2, 40, 0, 12)
         });
 
-        var linksPanel = new WrapPanel
+        var tileGrid = new WrapPanel
         {
             HorizontalAlignment = HorizontalAlignment.Center,
-            Orientation = Orientation.Horizontal,
-            ItemWidth = 170
+            Orientation = Orientation.Horizontal
         };
+        tileGrid.Children.Add(CreateQuickLink("Google",    "https://www.google.com",  Color.FromRgb(66, 133, 244)));
+        tileGrid.Children.Add(CreateQuickLink("YouTube",   "https://www.youtube.com", Color.FromRgb(255, 0, 0)));
+        tileGrid.Children.Add(CreateQuickLink("GitHub",    "https://github.com",      Color.FromRgb(36, 41, 47)));
+        tileGrid.Children.Add(CreateQuickLink("Reddit",    "https://www.reddit.com",  Color.FromRgb(255, 69, 0)));
+        tileGrid.Children.Add(CreateQuickLink("Settings",  "dosi://settings",         Accents.AccentPrimary));
+        tileGrid.Children.Add(CreateQuickLink("About",     "dosi://about",            Accents.AccentSecondary));
+        content.Children.Add(tileGrid);
 
-        linksPanel.Children.Add(CreateQuickLink("Google",   "https://www.google.com",  Color.FromRgb(66, 133, 244)));
-        linksPanel.Children.Add(CreateQuickLink("YouTube",  "https://www.youtube.com", Color.FromRgb(255, 0, 0)));
-        linksPanel.Children.Add(CreateQuickLink("GitHub",   "https://github.com",      Color.FromRgb(36, 41, 47)));
-        linksPanel.Children.Add(CreateQuickLink("Reddit",   "https://www.reddit.com",  Color.FromRgb(255, 69, 0)));
-        linksPanel.Children.Add(CreateQuickLink("Settings", "dosi://settings",         Accents.AccentPrimary));
-        linksPanel.Children.Add(CreateQuickLink("About",    "dosi://about",            Accents.AccentSecondary));
-
-        content.Children.Add(linksPanel);
-
-        // ---- Footer line --------------------------------------------------
-        var footer = new TextBlock
+        // ---- System footer (multi-column status row) ----------------------
+        // Replaces the single-line "DOSI Browser · default search: ..." with
+        // a four-column status strip. Reads as a system info bar (think the
+        // bottom of a tiling-WM screen) rather than a marketing footer.
+        var prefs = BrowserPreferences.Current;
+        var sysFooter = new Grid
         {
-            Text = $"DOSI Browser · default search: {BrowserPreferences.GetEngineLabel(BrowserPreferences.Current.SearchEngine)}",
-            FontSize = 11,
-            Foreground = Accents.TextSecondaryBrush,
-            Opacity = 0.6,
-            HorizontalAlignment = HorizontalAlignment.Center,
-            Margin = new Thickness(0, 28, 0, 0)
+            ColumnDefinitions = new ColumnDefinitions("*,*,*,*"),
+            Margin = new Thickness(0, 56, 0, 0),
+            HorizontalAlignment = HorizontalAlignment.Stretch
         };
-        content.Children.Add(footer);
+        Border BuildFooterCell(string caption, string value)
+        {
+            return new Border
+            {
+                Padding = new Thickness(12, 8),
+                BorderBrush = new SolidColorBrush(Color.FromArgb(60,
+                    Accents.AccentPrimary.R, Accents.AccentPrimary.G, Accents.AccentPrimary.B)),
+                BorderThickness = new Thickness(0, 1, 0, 0),
+                Child = new StackPanel
+                {
+                    Orientation = Orientation.Vertical,
+                    Spacing = 2,
+                    Children =
+                    {
+                        new TextBlock
+                        {
+                            Text = caption,
+                            FontFamily = DOSI.CORE.DOSIFonts.Mono,
+                            FontSize = 9,
+                            LetterSpacing = 1.5,
+                            Foreground = Accents.TextSecondaryBrush,
+                            Opacity = 0.7
+                        },
+                        new TextBlock
+                        {
+                            Text = value,
+                            FontFamily = DOSI.CORE.DOSIFonts.Mono,
+                            FontSize = 12,
+                            FontWeight = FontWeight.SemiBold,
+                            Foreground = Accents.TextPrimaryBrush,
+                            TextTrimming = TextTrimming.CharacterEllipsis
+                        }
+                    }
+                }
+            };
+        }
+
+        var c1 = BuildFooterCell("ENGINE", BrowserPreferences.GetEngineLabel(prefs.SearchEngine));
+        var c2 = BuildFooterCell("ZOOM",   prefs.ZoomPercent + "%");
+        var c3 = BuildFooterCell("PRIVACY", prefs.SendDoNotTrack ? "DNT ON" : "DNT OFF");
+        var c4 = BuildFooterCell("ACCENT", AccentManager.GetAccentDisplayName(AccentManager.Instance.CurrentAccent).ToUpperInvariant());
+        sysFooter.Children.Add(c1); Grid.SetColumn(c1, 0);
+        sysFooter.Children.Add(c2); Grid.SetColumn(c2, 1);
+        sysFooter.Children.Add(c3); Grid.SetColumn(c3, 2);
+        sysFooter.Children.Add(c4); Grid.SetColumn(c4, 3);
+        content.Children.Add(sysFooter);
 
         container.Content = content;
 
@@ -1332,22 +1648,22 @@ public class DOSIWebBrowser : DOSIWindow
 
     private Control CreateQuickLink(string text, string url, Color brand)
     {
-        // Brand badge: solid circle in the site's brand color with the
-        // first letter of its name. Avoids relying on emoji glyphs that
-        // can mojibake on file re-save (the previous "??" boxes).
-        var badge = new Border
+        // Square tile: a brand-coloured top band carrying the first letter,
+        // a label band beneath. Distinct from the universal "rounded button
+        // row" you see in every other browser's new-tab page; reads as an
+        // app-launcher icon instead of a bookmark.
+        var brandBand = new Border
         {
-            Width = 24,
-            Height = 24,
-            CornerRadius = new CornerRadius(12),
+            Height = 56,
             Background = new SolidColorBrush(brand),
-            VerticalAlignment = VerticalAlignment.Center,
+            CornerRadius = new CornerRadius(10, 10, 0, 0),
             Child = new TextBlock
             {
                 Text = string.IsNullOrEmpty(text)
-                    ? "\u003F"
+                    ? "?"
                     : char.ToUpperInvariant(text[0]).ToString(),
-                FontSize = 12,
+                FontFamily = DOSI.CORE.DOSIFonts.Mono,
+                FontSize = 24,
                 FontWeight = FontWeight.Bold,
                 Foreground = Brushes.White,
                 HorizontalAlignment = HorizontalAlignment.Center,
@@ -1355,56 +1671,74 @@ public class DOSIWebBrowser : DOSIWindow
             }
         };
 
-        var buttonContent = new StackPanel
+        var labelBand = new Border
         {
-            Orientation = Orientation.Horizontal,
-            Spacing = 8,
-            HorizontalAlignment = HorizontalAlignment.Center,
-            VerticalAlignment = VerticalAlignment.Center,
-            Children =
+            Height = 32,
+            Background = Accents.ControlBackgroundBrush,
+            CornerRadius = new CornerRadius(0, 0, 10, 10),
+            Padding = new Thickness(8, 0),
+            Child = new TextBlock
             {
-                badge,
-                new TextBlock
-                {
-                    Text = text,
-                    FontSize = 14,
-                    VerticalAlignment = VerticalAlignment.Center,
-                    Foreground = Accents.TextPrimaryBrush
-                }
+                Text = text,
+                FontSize = 12,
+                FontWeight = FontWeight.SemiBold,
+                Foreground = Accents.TextPrimaryBrush,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center,
+                TextTrimming = TextTrimming.CharacterEllipsis
             }
         };
 
-        var button = new Border
+        var stack = new Grid
         {
-            Background = Accents.ButtonBackgroundBrush,
+            RowDefinitions = new RowDefinitions("Auto,Auto")
+        };
+        stack.Children.Add(brandBand); Grid.SetRow(brandBand, 0);
+        stack.Children.Add(labelBand); Grid.SetRow(labelBand, 1);
+
+        var tile = new Border
+        {
+            Width = 96,
+            Margin = new Thickness(8),
+            CornerRadius = new CornerRadius(10),
             BorderBrush = new SolidColorBrush(Accents.ControlBorder),
             BorderThickness = new Thickness(1),
-            CornerRadius = new CornerRadius(8),
-            Padding = new Thickness(14, 8, 18, 8),
-            Margin = new Thickness(5),
+            ClipToBounds = true,
             Cursor = new Cursor(StandardCursorType.Hand),
-            Child = buttonContent
+            Child = stack
         };
 
-        // Hover effects using accent colors
-        button.PointerEntered += (s, e) => button.Background = Accents.ButtonBackgroundHoverBrush;
-        button.PointerExited += (s, e) => button.Background = Accents.ButtonBackgroundBrush;
-        button.PointerPressed += (s, e) => button.Background = Accents.ButtonBackgroundPressedBrush;
-        button.PointerReleased += (s, e) =>
+        // Hover: subtle brand-tinted glow so the user gets clear feedback
+        // about which tile they're targeting without flipping the whole tile
+        // background (which would fight the brand colour).
+        tile.PointerEntered += (_, _) =>
         {
-            button.Background = Accents.ButtonBackgroundHoverBrush;
+            tile.BoxShadow = new BoxShadows(new BoxShadow
+            {
+                OffsetX = 0,
+                OffsetY = 4,
+                Blur = 16,
+                Spread = -2,
+                Color = Color.FromArgb(120, brand.R, brand.G, brand.B)
+            });
+        };
+        tile.PointerExited += (_, _) => tile.BoxShadow = default;
+        tile.PointerPressed += (_, _) => tile.Opacity = 0.85;
+        tile.PointerReleased += (_, _) =>
+        {
+            tile.Opacity = 1;
             NavigateTo(url);
         };
 
-        return button;
+        return tile;
     }
 
     private Control CreateSearchPage(string url)
     {
         var query = "";
-        if (url.Contains("?q="))
+        if (url.Contains("?q=", StringComparison.Ordinal))
         {
-            var queryStart = url.IndexOf("?q=") + 3;
+            var queryStart = url.IndexOf("?q=", StringComparison.Ordinal) + 3;
             query = Uri.UnescapeDataString(url[queryStart..]);
         }
 
@@ -2821,22 +3155,6 @@ public class DOSIWebBrowser : DOSIWindow
             CloseTab(tab);
         };
 
-        // Thin accent strip drawn along the top edge of the active tab. Hidden
-        // for inactive tabs; UpdateTabHeaderVisuals flips its opacity. Gives
-        // the active tab a clear visual anchor (Edge / Chrome convention)
-        // beyond the subtle background swap.
-        var activeIndicator = new Border
-        {
-            Height = 2,
-            Background = Accents.AccentPrimaryBrush,
-            VerticalAlignment = VerticalAlignment.Top,
-            HorizontalAlignment = HorizontalAlignment.Stretch,
-            Margin = new Thickness(6, 0, 6, 0),
-            CornerRadius = new CornerRadius(0, 0, 1, 1),
-            Opacity = 0,
-            IsHitTestVisible = false
-        };
-
         var content = new StackPanel
         {
             Orientation = Orientation.Horizontal,
@@ -2844,11 +3162,13 @@ public class DOSIWebBrowser : DOSIWindow
             Children = { iconImage, titleText, closeBtn }
         };
 
-        // Stack the indicator over the row contents using a Grid - the indicator
-        // sits at the top edge regardless of how the row's contents shift.
+        // The active tab is already clearly marked by its solid background
+        // fill + drop shadow + bold title weight (see UpdateTabHeaderVisuals).
+        // The previous accent-coloured strip on top of the active tab read
+        // as an unwanted dark-blue line, so it's gone - HeaderActiveIndicator
+        // is left null and UpdateTabHeaderVisuals null-guards it.
         var headerRoot = new Grid();
         headerRoot.Children.Add(content);
-        headerRoot.Children.Add(activeIndicator);
 
         var header = new Border
         {
@@ -2897,7 +3217,7 @@ public class DOSIWebBrowser : DOSIWindow
         tab.HeaderText = titleText;
         tab.HeaderIcon = iconImage;
         tab.HeaderCloseButton = closeBtn;
-        tab.HeaderActiveIndicator = activeIndicator;
+        tab.HeaderActiveIndicator = null;
     }
 
     /// <summary>

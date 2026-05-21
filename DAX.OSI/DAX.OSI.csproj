@@ -25,5 +25,6 @@
 
   <ItemGroup>
     <ProjectReference Include="..\DOSI.CORE\DOSI.CORE.csproj" />
+    <ProjectReference Include="..\DAX.OSI.PluginSdk\DAX.OSI.PluginSdk.csproj" />
   </ItemGroup>
 </Project>

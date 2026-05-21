@@ -7,8 +7,16 @@ namespace DAX.OSI;
 internal class Program
 {
     [STAThread]
-    public static void Main(string[] args) => BuildAvaloniaApp()
-        .StartWithClassicDesktopLifetime(args);
+    public static void Main(string[] args)
+    {
+        // Install the global crash handler before Avalonia starts so any
+        // throw during boot (XAML resource lookup, font load, etc.) lands
+        // in crash.log next to the executable instead of vanishing into
+        // the OS event log.
+        CrashReporter.Install();
+
+        BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
+    }
 
     public static AppBuilder BuildAvaloniaApp()
         => AppBuilder.Configure<App>()
@@ -20,7 +28,7 @@ internal class Program
             // uniformly across every host platform without each DOSI
             // control having to opt in. Controls that need a monospace
             // face (currently DOSITerminalIO) reach for DOSIFonts.Mono
-            // explicitly.
+            // explicitly. Dont FUCKING load System.Fonts for the love of god; determining windows based fonts here only
             .With(new FontManagerOptions
             {
                 DefaultFamilyName = DOSIFonts.UIFamilyUri

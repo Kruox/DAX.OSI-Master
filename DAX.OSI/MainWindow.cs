@@ -317,7 +317,15 @@ public class MainWindow : Window, IDosiHost
         {
             try
             {
-                var mw = new MonitorWindow(screen);
+                // Index secondaries starting at 2 (primary is implicitly 1)
+                // so the per-monitor desktop folder name is stable across
+                // sessions: "Desktop-Monitor2" for the first secondary,
+                // "Desktop-Monitor3" for the next, etc. Order matches
+                // Avalonia's Screens.All enumeration; if the OS reorders
+                // displays the folders stay the same shape but their
+                // contents follow the screen at that ordinal position.
+                var monitorIndex = _monitorWindows.Count + 2;
+                var mw = new MonitorWindow(screen, monitorIndex);
                 _monitorWindows.Add(mw);
                 mw.Show();
             }
@@ -371,6 +379,11 @@ public class MainWindow : Window, IDosiHost
         // Fired when a monitor is connected / disconnected / configuration
         // changes. Always marshal back to the UI thread - some backends
         // raise this from a platform watcher thread.
+        //
+        // Windowed-launch mode never spawns secondary monitor windows in the
+        // first place (see OnLoaded), so a hot-plug event has nothing to
+        // rebuild - bail before touching anything.
+        if (!SystemCore.Settings.Fullscreen) return;
         Dispatcher.UIThread.Post(RebuildMonitorWindows);
     }
 
@@ -543,6 +556,14 @@ public class MainWindow : Window, IDosiHost
         var desktop = _screenManager.GetScreen<DesktopScreen>("desktop");
         if (desktop != null) await desktop.AnimateTaskbarOutAsync();
 
+        // Signal secondaries to retract their visual taskbars in lockstep
+        // with the primary's slide-out so all monitors lose their chrome
+        // together. Posted AFTER the primary's await so the primary's
+        // upward slide is the visually dominant motion - the secondaries'
+        // ~320 ms cubic-in matches the primary's pacing closely enough
+        // that the eye reads it as one synchronised retraction.
+        DAX.OSI.UI.DesktopScreen.NotifyPrimaryDesktopGone();
+
         // Multi-monitor: fade every secondary to BLACK in lockstep with
         // the primary's overlay fade. We INTENTIONALLY do NOT close the
         // monitor windows here - that would expose the host OS desktop
@@ -631,9 +652,30 @@ public class MainWindow : Window, IDosiHost
         // come back when the user (or a different one) signs in again.
         UserManager.SignOut();
 
+        // Reset the global window-translucency multiplier to fully opaque
+        // BEFORE the login screen renders. AccentManager.WindowOpacity is a
+        // process-wide alpha multiplier applied to every container-style
+        // brush (window background, chrome, content, controls, buttons,
+        // listbox). DesktopScreen.OnNavigatedTo set it from the user's
+        // saved preference on sign-in (e.g. 0.75), and nothing in
+        // UserManager.SignOut clears it - so the freshly-built LoginScreen
+        // would inherit the leaving user's translucency value and paint
+        // every chrome surface at reduced alpha over the host window's
+        // black background. The visible result reads as "duller", most
+        // pronounced under the Light accent where the surfaces are
+        // luminous near-whites and the black-bleed delta is largest.
+        // Snapping back to 1.0 here keeps the login screen visually
+        // consistent regardless of which user just left.
+        DOSIWindow.WindowOpacity = UserManager.DefaultWindowOpacity;
+
         // Tear down the desktop screen. This unhooks its taskbar / apps menu
         // chrome from _popupOverlay, but the overlay itself stays alive so
         // the next DesktopScreen can attach fresh chrome.
+        // Signal secondaries FIRST so their visual taskbars retract /
+        // icon layers hide in the same frame the primary's chrome goes
+        // away. Without this they'd linger past the primary's slide-out
+        // until the next sign-in re-armed the gate.
+        DAX.OSI.UI.DesktopScreen.NotifyPrimaryDesktopGone();
         _screenManager.RemoveScreen("desktop");
 
         // Build a fresh LoginScreen instance and register it.
@@ -743,7 +785,16 @@ public class MainWindow : Window, IDosiHost
         // never briefly flash the host OS desktop during startup. Each
         // secondary shows a wallpaper-only ExtensionScreen and stays up
         // through the entire boot -> login -> desktop -> signout lifecycle.
-        RebuildMonitorWindows();
+        //
+        // Skipped entirely when the system is configured to launch windowed
+        // (SystemSettings.Fullscreen == false): in that mode DAX.OSI is just
+        // a regular floating window on the user's host OS, so taking over
+        // their secondary monitors with full-screen ExtensionScreens would
+        // be wildly out of place. Single primary window only.
+        if (SystemCore.Settings.Fullscreen)
+        {
+            RebuildMonitorWindows();
+        }
 
         // Show the boot screen for 4 seconds.
         await Task.Delay(TimeSpan.FromSeconds(4));

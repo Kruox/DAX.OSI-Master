@@ -402,6 +402,7 @@ public static class UserManager
     /// </summary>
     public static IReadOnlyList<string> StandardUserSubfolders { get; } = new[]
     {
+        "Applications",
         "Desktop",
         "Documents",
         "Downloads",

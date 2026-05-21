@@ -14,9 +14,8 @@ public class WindowManager
 
     private readonly Canvas _desktop;
     private readonly List<DOSIWindow> _windows = [];
-    private readonly Stack<DOSIWindow> _zOrderStack = new();
     private DOSIWindow? _focusedWindow;
-    private int _baseZIndex = 100;
+    private const int BaseZIndex = 100;
 
     /// <summary>
     /// Gets all managed windows.
@@ -62,7 +61,17 @@ public class WindowManager
         _desktop = desktop ?? throw new ArgumentNullException(nameof(desktop));
         if (makeActive)
             _instance = this;
+
+        // Wire snap-to-edges. WindowSnapManager attaches itself to every
+        // open + future window's drag pipeline and renders its own
+        // preview Border into the desktop canvas; it lives as long as
+        // this WindowManager does. No DesktopScreen / ExtensionScreen
+        // wiring required - every monitor that builds a WindowManager
+        // gets snap for free, which is what we want.
+        _snapManager = new WindowSnapManager(desktop, this);
     }
+
+    private readonly WindowSnapManager _snapManager;
 
     /// <summary>
     /// Promotes this WindowManager instance to be the current <see cref="Instance"/>.
@@ -87,16 +96,40 @@ public class WindowManager
         _windows.Add(window);
         window.OwnerManager = this;
 
+        // Restore last-known geometry per window Title when the caller
+        // didn't pin a position. An explicit x/y from the caller always
+        // wins (file-explorer-double-click drops a viewer at a specific
+        // spot, drag-and-drop, etc.), but a vanilla LaunchApplication call
+        // gets the saved layout - the single biggest QOL win for window
+        // management. Skipped on the very first run for a window title -
+        // CalculateCascadeX/Y still produces a sane default.
+        var saved = (!x.HasValue && !y.HasValue)
+            ? WindowGeometryRegistry.Get(window.Title)
+            : null;
+
         // Position window
         if (x.HasValue)
             window.WindowX = x.Value;
+        else if (saved != null)
+            window.WindowX = saved.X;
         else
             window.WindowX = CalculateCascadeX();
 
         if (y.HasValue)
             window.WindowY = Math.Max(TopWorkAreaInset, y.Value);
+        else if (saved != null)
+            window.WindowY = Math.Max(TopWorkAreaInset, saved.Y);
         else
             window.WindowY = CalculateCascadeY();
+
+        // Restore size too if we have it. Bound it to a minimum so we
+        // don't restore a tiny window the user accidentally shrank to
+        // 1x1 in a previous session.
+        if (saved != null)
+        {
+            if (saved.Width  > 80) window.WindowWidth  = saved.Width;
+            if (saved.Height > 60) window.WindowHeight = saved.Height;
+        }
 
         // Add to desktop
         _desktop.Children.Add(window);
@@ -128,6 +161,19 @@ public class WindowManager
         // visible after the Avalonia chrome is gone.
         window.NotifyClosingForRemoval();
 
+        // Capture the last-known geometry so re-opening this kind of
+        // window lands in the same place. Done before we strip the
+        // window from _windows / _desktop so the X/Y/Size readings are
+        // still meaningful (a removed window's coordinates can be reset
+        // by some teardown paths).
+        try
+        {
+            WindowGeometryRegistry.Save(window.Title,
+                window.WindowX, window.WindowY,
+                window.WindowWidth, window.WindowHeight);
+        }
+        catch { /* persistence is best-effort; never break window close */ }
+
         _windows.Remove(window);
         _desktop.Children.Remove(window);
         window.OwnerManager = null;
@@ -155,6 +201,78 @@ public class WindowManager
         {
             CloseWindow(window);
         }
+    }
+
+    /// <summary>
+    /// Removes <paramref name="window"/> from this manager WITHOUT firing
+    /// <see cref="WindowClosed"/> or running close animations / native
+    /// teardown. Used by the multi-monitor cross-display drag handoff to
+    /// hand a window over to a different monitor's manager via
+    /// <see cref="AdoptWindow"/>. Pair every <c>RelinquishWindow</c> with
+    /// a matching <c>AdoptWindow</c> on the receiving manager - otherwise
+    /// the window is orphaned (no canvas parent, no manager) and will
+    /// silently disappear.
+    /// </summary>
+    public void RelinquishWindow(DOSIWindow window)
+    {
+        ArgumentNullException.ThrowIfNull(window);
+        if (!_windows.Contains(window)) return;
+
+        _windows.Remove(window);
+        _desktop.Children.Remove(window);
+        window.OwnerManager = null;
+
+        if (_focusedWindow == window)
+        {
+            _focusedWindow = null;
+            FocusTopWindow();
+        }
+
+        RecalculateZOrder();
+
+        // Intentionally NOT firing WindowClosed - the window is alive,
+        // just temporarily unparented. WindowsChanged fires so any
+        // observers (taskbar item lists, etc.) refresh.
+        WindowsChanged?.Invoke(this, new DOSIWindowEventArgs(window));
+    }
+
+    /// <summary>
+    /// Quietly adopts a window that was previously <see cref="RelinquishWindow"/>ed
+    /// from another <see cref="WindowManager"/>. Skips the cascade-position
+    /// logic and the open animation that <see cref="OpenWindow"/> runs, so a
+    /// drag-handoff feels like a continuous motion instead of a teleport
+    /// followed by a pop. The caller is responsible for placing the window
+    /// at sensible <paramref name="x"/>/<paramref name="y"/> coords (typically
+    /// chosen so the cursor stays inside the title bar).
+    /// </summary>
+    public void AdoptWindow(DOSIWindow window, double x, double y)
+    {
+        ArgumentNullException.ThrowIfNull(window);
+        if (_windows.Contains(window)) return;
+
+        _windows.Add(window);
+        window.OwnerManager = this;
+
+        // Re-parent BEFORE writing position. WindowX/WindowY setters use
+        // Canvas.SetLeft/SetTop attached properties, and Width/Height on
+        // Layoutable triggers InvalidateMeasure / InvalidateArrange routed
+        // through the control's current LayoutManager. If we set position
+        // while the control is unparented (RelinquishWindow removed it
+        // from the source canvas just before this call), the layout
+        // invalidation can be queued against a stale LayoutManager
+        // reference - which throws "Attempt to call InvalidateArrange on
+        // wrong LayoutManager" the moment the dispatcher tries to flush
+        // the layout. Adding to the new canvas FIRST attaches the control
+        // to the target TopLevel's LayoutManager so subsequent property
+        // changes route correctly.
+        _desktop.Children.Add(window);
+        window.WindowX = x;
+        window.WindowY = Math.Max(TopWorkAreaInset, y);
+
+        BringToFront(window);
+
+        WindowOpened?.Invoke(this, new DOSIWindowEventArgs(window));
+        WindowsChanged?.Invoke(this, new DOSIWindowEventArgs(window));
     }
 
     /// <summary>
@@ -463,7 +581,7 @@ public class WindowManager
     {
         for (int i = 0; i < _windows.Count; i++)
         {
-            _windows[i].ZIndex = _baseZIndex + i;
+            _windows[i].ZIndex = BaseZIndex + i;
         }
     }
 

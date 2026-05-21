@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.Shapes;
@@ -47,7 +48,7 @@ public sealed class DOSISuccessAnim : UserControl, IDisposable
     private readonly Canvas _confettiHost;
 
     private readonly DispatcherTimer _timer;
-    private readonly DateTime _startUtc = DateTime.UtcNow;
+    private readonly Stopwatch _clock = Stopwatch.StartNew();
     private readonly Confetti[] _confetti;
 
     private bool _isDisposed;
@@ -146,7 +147,7 @@ public sealed class DOSISuccessAnim : UserControl, IDisposable
     {
         if (_isDisposed) return;
 
-        var elapsed = (DateTime.UtcNow - _startUtc).TotalMilliseconds;
+        var elapsed = _clock.Elapsed.TotalMilliseconds;
         var totalDuration = CirclePopDuration + CheckDrawDuration + HoldDuration + FadeOutDuration;
 
         // -------- Ring pulse: expands and fades across the early phase --------
@@ -184,7 +185,7 @@ public sealed class DOSISuccessAnim : UserControl, IDisposable
 
     private static Confetti[] BuildConfetti(Canvas host, Color accent, Color accentSecondary)
     {
-        var rng = new Random();
+        var rng = Random.Shared;
         var palette = new[]
         {
             accent,
@@ -245,14 +246,6 @@ public sealed class DOSISuccessAnim : UserControl, IDisposable
             var opacity = t < 0.15 ? t / 0.15 : 1 - Math.Pow(t, 2);
             c.Dot.Opacity = Math.Clamp(opacity, 0, 1);
         }
-    }
-
-    private static double EaseOutBack(double t)
-    {
-        const double c1 = 1.70158;
-        const double c3 = c1 + 1;
-        var x = t - 1;
-        return 1 + c3 * x * x * x + c1 * x * x;
     }
 
     public void Dispose()

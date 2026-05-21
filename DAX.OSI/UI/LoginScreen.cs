@@ -37,11 +37,24 @@ public class LoginScreen : DOSIScreen
     private readonly TextBlock _clockText;
     private readonly TextBlock _dateText;
     private readonly TextBlock _versionText;
+    // Bottom-corner chrome stacks - kept as fields so OnSignInClicked can
+    // fade them out cleanly before raising SignInCompleted. Without that,
+    // the corner shutdown button + version label POP out of existence at
+    // the screen-manager handoff because DesktopScreen doesn't render
+    // anything in the corners that would cover them.
+    private readonly StackPanel _clockStack;
+    private readonly StackPanel _bottomRightStack;
 
     // ----- Picker mode -----
     private readonly StackPanel _pickerPanel;
     private readonly WrapPanel _userTilesWrap;
     private Border? _pickerDivider;
+    // Picker title is dynamic so we can swap "Choose your account" for a
+    // time-of-day greeting ("Good morning, Tyler") when there's exactly
+    // one user - small warmth touch, no cost when there's >1 user since
+    // the original string falls through.
+    private TextBlock? _pickerTitle;
+    private TextBlock? _pickerSubtitle;
 
     // ----- Sign-in mode -----
     private readonly StackPanel _signInPanel;
@@ -57,6 +70,21 @@ public class LoginScreen : DOSIScreen
     private readonly DOSIButton _signInButton;
     private readonly DOSIButton _switchUserButton;
     private readonly TextBlock _statusText;
+    // Tiny "CAPS LOCK" warning chip rendered just below the password row.
+    // Kept hidden by default; flipped visible whenever a key arriving at
+    // the password box reports KeyModifiers.None for Shift but produces a
+    // Caps lock state. Same affordance every native login screen ships.
+    private readonly Border _capsLockChip;
+    // Eye glyph button overlaid on the password box that toggles the
+    // DOSITextBox's UsePasswordChar mask. Pure QoL - users juggling long
+    // generated passwords appreciate being able to verify what they
+    // pasted/typed without typing it again into a plain-text field.
+    private readonly TextBlock _passwordRevealGlyph;
+    // The eye button itself - kept as a field so the success path can
+    // hide it in lockstep with the password box. Without this, the eye
+    // glyph stays painted over the "Welcome back" message during the
+    // crossfade to the desktop.
+    private readonly Border _passwordRevealButton;
 
     // ----- State -----
     private readonly DispatcherTimer _clockTimer;
@@ -89,7 +117,7 @@ public class LoginScreen : DOSIScreen
             Opacity = 0.85
         };
 
-        var clockStack = new StackPanel
+        _clockStack = new StackPanel
         {
             Orientation = Orientation.Vertical,
             Margin = new Thickness(36, 0, 0, 28),
@@ -111,6 +139,7 @@ public class LoginScreen : DOSIScreen
             Foreground = Brushes.White,
             HorizontalAlignment = HorizontalAlignment.Center
         };
+        _pickerTitle = pickerTitle;
 
         var pickerSubtitle = new TextBlock
         {
@@ -121,6 +150,7 @@ public class LoginScreen : DOSIScreen
             Opacity = 0.85,
             Margin = new Thickness(0, 4, 0, 22)
         };
+        _pickerSubtitle = pickerSubtitle;
 
         _userTilesWrap = new WrapPanel
         {
@@ -237,7 +267,7 @@ public class LoginScreen : DOSIScreen
         {
             PlaceholderText = "Password",
             FontSize = 14,
-            Padding = new Thickness(14, 10),
+            Padding = new Thickness(14, 10, 38, 10), // extra right padding for the eye toggle
             CornerRadius = new CornerRadius(8),
             Height = 40,
             Width = 300,
@@ -246,6 +276,112 @@ public class LoginScreen : DOSIScreen
         _passwordBox.KeyDown += (_, e) =>
         {
             if (e.Key == Key.Enter) OnSignInClicked(this, new Avalonia.Interactivity.RoutedEventArgs());
+            else if (e.Key == Key.CapsLock)
+            {
+                // Toggle now - KeyDown reports the PRE-toggle state. Defer
+                // the visual update to the next tick so the modifier read
+                // happens after the OS has actually flipped CapsLock.
+                _capsLockTracked = !_capsLockTracked;
+                Dispatcher.UIThread.Post(UpdateCapsLockChip, DispatcherPriority.Background);
+            }
+            else
+            {
+                // Any other keypress refreshes the chip - covers the case
+                // where the user pressed CapsLock while focus was elsewhere.
+                UpdateCapsLockChip();
+            }
+        };
+        _passwordBox.GotFocus += (_, _) => UpdateCapsLockChip();
+
+        // Reveal-password eye glyph, overlaid on the right edge of the
+        // password box. Toggles UsePasswordChar between true/false; glyph
+        // swap (eye <-> crossed-eye) telegraphs the current state. Stays
+        // visible only while focus is in the password row to keep the
+        // sign-in card visually quiet at rest.
+        //
+        // FONT NOTE: previously used U+1F441 (eye emoji) + U+1F576
+        // (sunglasses emoji). Both are emoji-presentation code points,
+        // which means the renderer falls through to whatever system
+        // emoji font is available - so the same glyph could render as
+        // a flat blue silhouette on one machine and a full-colour pixel
+        // emoji on another, and the two STATES rendered with visibly
+        // different weights/sizes because the eye and sunglasses come
+        // from different emoji fonts. Switched to a pair of plain
+        // monochrome BMP code points (U+25CF filled circle for "masked"
+        // and U+25CB hollow circle for "revealed") and pinned the
+        // glyph's FontFamily to the bundled DOSIFonts.UIFamily so both
+        // states are guaranteed to be rendered by the same face at the
+        // same metrics - no more "the eye looks different at certain
+        // times".
+        _passwordRevealGlyph = new TextBlock
+        {
+            Text = "\u25CF", // ● filled - masked
+            FontFamily = DOSIFonts.UI,
+            FontSize = 14,
+            FontWeight = FontWeight.SemiBold,
+            Foreground = new SolidColorBrush(Color.FromArgb(200, 255, 255, 255)),
+            VerticalAlignment = VerticalAlignment.Center,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            IsHitTestVisible = false
+        };
+        _passwordRevealButton = new Border
+        {
+            Width = 32,
+            Height = 32,
+            CornerRadius = new CornerRadius(16),
+            Background = Brushes.Transparent,
+            Cursor = new Cursor(StandardCursorType.Hand),
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(0, 0, 4, 0),
+            Child = _passwordRevealGlyph
+        };
+        ToolTip.SetTip(_passwordRevealButton, "Show password");
+        _passwordRevealButton.PointerEntered += (_, _) =>
+            _passwordRevealButton.Background = new SolidColorBrush(Color.FromArgb(40, 255, 255, 255));
+        _passwordRevealButton.PointerExited += (_, _) =>
+            _passwordRevealButton.Background = Brushes.Transparent;
+        _passwordRevealButton.PointerPressed += (_, e) =>
+        {
+            e.Handled = true;
+            _passwordBox.UsePasswordChar = !_passwordBox.UsePasswordChar;
+            _passwordRevealGlyph.Text = _passwordBox.UsePasswordChar
+                ? "\u25CF"   // ● filled circle (masked)
+                : "\u25CB";  // ○ hollow circle (revealed) - same font, same metrics
+            ToolTip.SetTip(_passwordRevealButton, _passwordBox.UsePasswordChar ? "Show password" : "Hide password");
+            // Keep focus on the password field so typing continues.
+            _passwordBox.Focus();
+        };
+
+        var passwordRow = new Grid { Width = 300, Height = 40 };
+        passwordRow.Children.Add(_passwordBox);
+        passwordRow.Children.Add(_passwordRevealButton);
+
+        // Caps-lock warning chip - sits in the layout permanently (so the
+        // card doesn't reflow when it appears) but is invisible by default.
+        // ShowDelta = Opacity tween instead of IsVisible flip so the chip
+        // doesn't jitter the layout when CapsLock toggles repeatedly.
+        var capsGlyph = new TextBlock
+        {
+            Text = "\u21EA  CAPS LOCK", // ⇪
+            FontSize = 10,
+            FontWeight = FontWeight.SemiBold,
+            Foreground = Brushes.White,
+            LetterSpacing = 1,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        _capsLockChip = new Border
+        {
+            Background = new SolidColorBrush(Color.FromArgb(170, 200, 90, 30)),
+            CornerRadius = new CornerRadius(10),
+            Padding = new Thickness(10, 3),
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Margin = new Thickness(0, 2, 0, 0),
+            Height = 20,
+            Opacity = 0,
+            IsHitTestVisible = false,
+            Child = capsGlyph
         };
 
         _signInButton = new DOSIButton
@@ -302,7 +438,8 @@ public class LoginScreen : DOSIScreen
                 _selectedDisplayName,
                 _selectedUsername,
                 _signInDivider,
-                _passwordBox,
+                passwordRow,
+                _capsLockChip,
                 _signInButton,
                 _statusText,
                 _switchUserButton
@@ -338,16 +475,34 @@ public class LoginScreen : DOSIScreen
             FontSize = 11,
             Foreground = Accents.TextSecondaryBrush,
             Opacity = 0.6,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            Margin = new Thickness(0, 6, 0, 0)
+        };
+
+        // ===== Bottom-right: Shutdown button + version stack =====
+        // Mirrors the apps-menu Shutdown entry (DesktopScreen.
+        // BuildShutdownGlyph) but presented as a standalone circular
+        // power button so the user can power off without signing in.
+        // Stacked vertically with the version label underneath - keeps
+        // them as a single visual unit pinned to the bottom-right corner,
+        // out of the way of the bottom-left clock / date and the centred
+        // sign-in card.
+        var shutdownButton = BuildShutdownButton();
+        _bottomRightStack = new StackPanel
+        {
+            Orientation = Orientation.Vertical,
             HorizontalAlignment = HorizontalAlignment.Right,
             VerticalAlignment = VerticalAlignment.Bottom,
-            Margin = new Thickness(0, 0, 24, 16)
+            Margin = new Thickness(0, 0, 24, 16),
+            Spacing = 0,
+            Children = { shutdownButton, _versionText }
         };
 
         _layoutRoot = new Grid
         {
             HorizontalAlignment = HorizontalAlignment.Stretch,
             VerticalAlignment = VerticalAlignment.Stretch,
-            Children = { clockStack, _card, _versionText }
+            Children = { _clockStack, _card, _bottomRightStack }
         };
 
         Desktop.Children.Add(_layoutRoot);
@@ -452,7 +607,23 @@ public class LoginScreen : DOSIScreen
 
         RebuildUserTiles();
         ShowPickerMode();
-        PlayEntranceAnimation();
+        // Suppress the card-only fade-in when the SCREEN itself is being
+        // crossfaded in by ScreenManager.NavigateToWithCrossfadeAsync
+        // (Opacity is set to 0 before OnNavigatedTo fires and tweened back
+        // to 1 over the next several hundred ms). Without this guard, BOTH
+        // animations run simultaneously - the screen fades 0->1 AND the
+        // card fades 0->1 - so their opacities multiply (0.3 * 0.3 ~= 9%)
+        // and the card stays nearly invisible for the entire crossfade,
+        // then snaps to full opacity mid-transition. Most visible on the
+        // InitialStartup -> LoginScreen handoff because the setup wizard's
+        // success animation runs immediately before, drawing the user's
+        // eye to exactly where the card is supposed to appear.
+        // The screen-level crossfade is already a perfectly good entrance;
+        // an extra nested fade serves no purpose during it.
+        if (Opacity >= 0.999)
+            PlayEntranceAnimation();
+        else
+            _card.Opacity = 1;
 
         // If we just arrived from a flow that previewed a different accent (e.g. the
         // setup wizard), animate back to the real system default so picker mode
@@ -479,6 +650,7 @@ public class LoginScreen : DOSIScreen
         _userTilesWrap.Children.Clear();
 
         var users = UserManager.GetAllUsers();
+        UpdatePickerGreeting(users);
         if (users.Count == 0)
         {
             _userTilesWrap.Children.Add(new TextBlock
@@ -497,6 +669,79 @@ public class LoginScreen : DOSIScreen
         foreach (var user in users)
             _userTilesWrap.Children.Add(BuildUserTile(user));
     }
+
+    /// <summary>
+    /// Swaps the picker title for a time-of-day greeting when there's
+    /// exactly one user (cheap warmth - the system feels like it knows
+    /// them). With multiple users we keep the neutral "Choose your
+    /// account" so we don't have to pick a favourite. The subtitle is
+    /// updated in lockstep so the visual weight balances.
+    /// </summary>
+    private void UpdatePickerGreeting(IReadOnlyList<DOSIUser> users)
+    {
+        if (_pickerTitle == null || _pickerSubtitle == null) return;
+        if (users.Count == 1)
+        {
+            var u = users[0];
+            var name = !string.IsNullOrWhiteSpace(u.DisplayName)
+                ? u.DisplayName
+                : u.Username;
+            var hour = DateTime.Now.Hour;
+            string greeting =
+                hour < 5 ? "Up late" :
+                hour < 12 ? "Good morning" :
+                hour < 17 ? "Good afternoon" :
+                hour < 22 ? "Good evening" : "Welcome back";
+            _pickerTitle.Text = $"{greeting}, {name}";
+            _pickerSubtitle.Text = "Click your profile to sign in";
+        }
+        else
+        {
+            _pickerTitle.Text = "Choose your account";
+            _pickerSubtitle.Text = "Select a profile to sign in";
+        }
+    }
+
+    /// <summary>
+    /// Reads the live Caps Lock toggle state and animates the warning chip
+    /// in/out. Called whenever a key arrives at the password field or the
+    /// field gains focus. Uses Opacity (not IsVisible) so the chip's
+    /// footprint stays reserved in the layout - the card never reflows
+    /// when CapsLock toggles, which is the difference between "subtle
+    /// warning" and "jarring flicker".
+    /// </summary>
+    private void UpdateCapsLockChip()
+    {
+        if (_capsLockChip == null) return;
+        bool capsOn = IsCapsLockOn();
+        _capsLockChip.Opacity = capsOn ? 1 : 0;
+    }
+
+    /// <summary>
+    /// Best-effort CapsLock detector. On Windows we ask user32 directly
+    /// (instant, accurate even when CapsLock was toggled outside the
+    /// app); on any other host we fall back to the locally-tracked
+    /// _capsLockTracked flag which is flipped each time we observe a
+    /// Key.CapsLock keypress in the password field. The fallback can
+    /// miss state changes that happen while the field doesn't have
+    /// focus, which is the standard tradeoff every cross-platform login
+    /// chip makes - good enough as a warning, never trusted as a lock.
+    /// </summary>
+    private bool _capsLockTracked;
+    private bool IsCapsLockOn()
+    {
+        try
+        {
+            if (System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+                    System.Runtime.InteropServices.OSPlatform.Windows))
+                return (NativeGetKeyState(0x14) & 1) != 0;
+        }
+        catch { /* fall through */ }
+        return _capsLockTracked;
+    }
+
+    [System.Runtime.InteropServices.DllImport("user32.dll", EntryPoint = "GetKeyState")]
+    private static extern short NativeGetKeyState(int nVirtKey);
 
     private Control BuildUserTile(DOSIUser user)
     {
@@ -647,6 +892,7 @@ public class LoginScreen : DOSIScreen
         _signInPanel.IsHitTestVisible = false;
         // Restore controls in case they were hidden by a prior sign-in attempt.
         _passwordBox.IsVisible = true;
+        _passwordRevealButton.IsVisible = true;
         _signInButton.IsVisible = true;
         _switchUserButton.IsVisible = true;
         _statusText.Text = string.Empty;
@@ -728,6 +974,7 @@ public class LoginScreen : DOSIScreen
         // cross-fade below handles the visual swap.
         _selectedUser = null;
         _passwordBox.IsVisible = true;
+        _passwordRevealButton.IsVisible = true;
         _signInButton.IsVisible = true;
         _switchUserButton.IsVisible = true;
         _statusText.Text = string.Empty;
@@ -810,15 +1057,37 @@ public class LoginScreen : DOSIScreen
         // Hide the interactive controls so the celebration takes the spotlight
         // and the user can't double-submit while the animation is playing.
         _passwordBox.IsVisible = false;
+        _passwordRevealButton.IsVisible = false;
         _signInButton.IsVisible = false;
         _switchUserButton.IsVisible = false;
 
         _statusText.Text = "Signing in...";
         _statusText.Foreground = Brushes.White;
 
-        // Celebrate the successful sign-in, then hand control off to the host
-        // (typically MainWindow) so it can crossfade into the desktop screen.
+        // Celebrate the successful sign-in, then fade out the corner chrome
+        // (clock + shutdown button + version label) BEFORE handing control
+        // off to the host. The screen manager's crossfade only fades the
+        // INCOMING screen in over the still-opaque outgoing one (so most
+        // covered regions transition smoothly), but the corners aren't
+        // covered by DesktopScreen, so without this pre-fade the user sees
+        // the shutdown button vanish at the swap. The central success card
+        // is left at full opacity intentionally - it's what the desktop
+        // fades in over.
         DOSISuccessAnim.PlayOver(_layoutRoot, DOSISuccessAnim.SuccessSize.Large,
+            onCompleted: () => FadeCornerChromeAndSignIn(authed));
+    }
+
+    private void FadeCornerChromeAndSignIn(DOSIUser authed)
+    {
+        const int FadeMs = 220;
+
+        // Both corner stacks fade in lock-step. We complete the sign-in
+        // handoff from the clock-stack tween's onCompleted because both
+        // tweens have identical durations - using either is equivalent.
+        Tween.Run(FadeMs, Easings.EaseOutCubic,
+            apply: t => _bottomRightStack.Opacity = 1 - t);
+        Tween.Run(FadeMs, Easings.EaseOutCubic,
+            apply: t => _clockStack.Opacity = 1 - t,
             onCompleted: () => SignInCompleted?.Invoke(this, authed));
     }
 
@@ -949,6 +1218,91 @@ public class LoginScreen : DOSIScreen
                 _card.Opacity = 1;
                 _entranceTween = null;
             });
+    }
+
+    /// <summary>
+    /// Builds the standalone shutdown power button shown in the bottom-left
+    /// corner of the login screen. Visually echoes the apps-menu Shutdown
+    /// glyph (DesktopScreen.BuildShutdownGlyph) - same red-tinted circular
+    /// chip with a power symbol - but enlarged and elevated to a primary
+    /// affordance so the user can power off without signing in. Pointer
+    /// hover gently brightens both the fill and the glyph; click invokes
+    /// the same SystemShutdown.Begin pipeline the apps menu uses.
+    /// </summary>
+    private static Control BuildShutdownButton()
+    {
+        var glyph = new TextBlock
+        {
+            Text = "\u23FB", // power symbol
+            FontSize = 22,
+            FontWeight = FontWeight.Bold,
+            Foreground = new SolidColorBrush(Color.FromRgb(255, 150, 150)),
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+
+        // Idle / hover brushes captured here so the pointer handlers below
+        // can swap between them without having to re-create brushes every
+        // event - cheaper, and keeps the colour palette declarative.
+        var idleFill = new SolidColorBrush(Color.FromRgb(60, 18, 18));
+        var hoverFill = new SolidColorBrush(Color.FromRgb(95, 24, 24));
+        var idleBorder = new SolidColorBrush(Color.FromArgb(180, 240, 90, 90));
+        var hoverBorder = new SolidColorBrush(Color.FromArgb(255, 255, 120, 120));
+        var idleGlyph = new SolidColorBrush(Color.FromRgb(255, 150, 150));
+        var hoverGlyph = new SolidColorBrush(Color.FromRgb(255, 200, 200));
+
+        var button = new Border
+        {
+            Width = 44,
+            Height = 44,
+            CornerRadius = new CornerRadius(22),
+            Background = idleFill,
+            BorderBrush = idleBorder,
+            BorderThickness = new Thickness(1.5),
+            // Layout owned by the parent StackPanel - centre the chip
+            // horizontally inside the stack so the smaller version label
+            // underneath sits visually centred under it.
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Top,
+            Cursor = new Cursor(StandardCursorType.Hand),
+            Child = glyph,
+            // Soft red glow under the chip - same vibe as the apps-menu
+            // Shutdown row's hover state, but always-on since this is the
+            // single power affordance on the login screen and we want it
+            // to read as "primary destructive action available".
+            Effect = new Avalonia.Media.DropShadowEffect
+            {
+                BlurRadius = 14,
+                Color = Color.FromRgb(255, 60, 60),
+                Opacity = 0.35,
+                OffsetX = 0,
+                OffsetY = 0
+            }
+        };
+
+        button.PointerEntered += (_, _) =>
+        {
+            button.Background = hoverFill;
+            button.BorderBrush = hoverBorder;
+            glyph.Foreground = hoverGlyph;
+        };
+        button.PointerExited += (_, _) =>
+        {
+            button.Background = idleFill;
+            button.BorderBrush = idleBorder;
+            glyph.Foreground = idleGlyph;
+        };
+        button.PointerPressed += (_, e) =>
+        {
+            // Left-click only; ignore middle / right so a stray right-click
+            // doesn't accidentally power off the system.
+            if (e.GetCurrentPoint(button).Properties.IsLeftButtonPressed)
+            {
+                try { SystemShutdown.Begin(0); } catch { /* best-effort */ }
+            }
+        };
+
+        return button;
     }
 }
 

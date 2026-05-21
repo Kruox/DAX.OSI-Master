@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <AnalysisMode>Recommended</AnalysisMode>
+    <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+
+    <!--
+      Public, redistributable surface that third-party (and PRIVATE) DAX.OSI
+      plug-ins compile against. Intentionally tiny: contracts only, no
+      implementation.
+
+      Plug-ins reference this DLL plus DOSI.CORE; the host loads the plug-in
+      DLL out of the signed-in user's Applications/ folder via AppLoader.
+      Keeping the surface small means the open-source DAX.OSI / DOSI.CORE
+      projects can evolve freely while plug-in binaries (proprietary or
+      not) keep working as long as these interfaces stay stable.
+
+      RENAMED from "AppSdk" -> "PluginSdk" so the interface and assembly
+      names match the proprietary plug-in repo's expectations exactly. The
+      plug-in references DAX.OSI.PluginSdk.dll and implements
+      IDOSIAppPlugin; if those names diverge the host's reflection-based
+      discovery silently finds zero providers and the plug-in never lights
+      up in the apps menu - the actual symptom that drove this rename.
+    -->
+    <Description>Public plug-in contracts for DAX.OSI.</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      The SDK depends on Avalonia.Controls types (Control, Window) so plug-ins
+      can return real UI from IDOSIApp.Activate(). Plug-in DLLs MUST mark
+      this reference as <Private>false</Private> so they don't ship a duplicate
+      Avalonia next to the host.
+    -->
+    <PackageReference Include="Avalonia" Version="12.0.1" />
+  </ItemGroup>
+
+</Project>

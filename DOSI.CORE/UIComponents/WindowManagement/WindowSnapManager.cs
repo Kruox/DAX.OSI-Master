@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Threading.Tasks;
 using Avalonia;
 using Avalonia.Animation.Easings;
@@ -7,6 +8,7 @@ using Avalonia.Controls;
 using Avalonia.Input;
 using Avalonia.Media;
 using Avalonia.Threading;
+using Avalonia.VisualTree;
 using DOSI.CORE.AccentManagement;
 
 namespace DOSI.CORE.UIComponents.WindowManagement;
@@ -99,7 +101,7 @@ public sealed class WindowSnapManager : IDisposable
     private Rect _animToRect;
     private double _animFromOpacity;
     private double _animToOpacity;
-    private DateTime _animStart;
+    private readonly Stopwatch _animClock = new();
     private static readonly TimeSpan PreviewAnimDuration = TimeSpan.FromMilliseconds(180);
     private static readonly TimeSpan SnapAnimDuration = TimeSpan.FromMilliseconds(220);
     private static readonly IEasing PreviewEasing = new CubicEaseOut();
@@ -216,6 +218,27 @@ public sealed class WindowSnapManager : IDisposable
         var h = _desktop.Bounds.Height;
         if (w <= 0 || h <= 0) return SnapZone.None;
         var topInset = _manager.TopWorkAreaInset;
+
+        // Multi-monitor: when the user drags a window toward a neighbouring
+        // monitor, pointer capture keeps PointerMoved events flowing to this
+        // source window even after the cursor has physically left this
+        // monitor's bounds. In that case `p` lands at or past [0, w] x
+        // [0, h] - e.g. p.X = 1925 on a 1920-wide canvas means the cursor
+        // is now on monitor 2. Bail the moment the cursor reaches OR
+        // crosses any edge so the cross-monitor handoff in DOSIWindow.
+        // OnChromeDragEnded wins cleanly. Any slack here (e.g. allowing
+        // p.X up to w + EdgeThreshold) creates an overlap window where
+        // BOTH a "near right" snap commit AND a cross-monitor handoff
+        // fire on the same release, snapping the window to monitor 1's
+        // right half while it also transfers to monitor 2 - the exact
+        // "auto-snapping when dragging across to a new monitor" symptom
+        // we want to eliminate. Within-canvas edge snapping still works
+        // because (p.X >= w - EdgeThreshold && p.X < w) is still a valid
+        // zone for nearRight below.
+        if (p.X < 0 || p.X >= w || p.Y < 0 || p.Y >= h)
+        {
+            return SnapZone.None;
+        }
 
         bool nearTop = p.Y <= topInset + EdgeThreshold;
         bool nearBottom = p.Y >= h - BottomEdgeThreshold;
@@ -359,7 +382,7 @@ public sealed class WindowSnapManager : IDisposable
         _animToRect = to;
         _animFromOpacity = fromOp;
         _animToOpacity = toOp;
-        _animStart = DateTime.UtcNow;
+        _animClock.Restart();
         if (_animTimer == null)
         {
             _animTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(8) };
@@ -370,7 +393,7 @@ public sealed class WindowSnapManager : IDisposable
 
     private void OnPreviewAnimTick(object? sender, EventArgs e)
     {
-        var elapsed = DateTime.UtcNow - _animStart;
+        var elapsed = _animClock.Elapsed;
         var t = Math.Min(1.0, elapsed.TotalMilliseconds / PreviewAnimDuration.TotalMilliseconds);
         var eased = PreviewEasing.Ease(t);
         Canvas.SetLeft(_preview, Lerp(_animFromRect.X, _animToRect.X, eased));
@@ -393,6 +416,24 @@ public sealed class WindowSnapManager : IDisposable
         HidePreview();
 
         if (zone == SnapZone.None) return;
+
+        // Top zone is the maximize gesture. Hand off to the window's own
+        // Maximized state so it picks up:
+        //   * the proper WindowState for taskbar/Alt+Tab semantics,
+        //   * the existing maximize entry / restore animation,
+        //   * the existing drag-from-Maximized unsnap path in OnChromeDragMoved
+        //     (which already restores to pre-maximize bounds and re-anchors
+        //      the cursor in the title bar).
+        // Skipping our own animation here avoids fighting the maximize
+        // animation, and skipping MarkSnapped lets the standard maximize
+        // restore handle drag-to-unsnap instead of our half/quarter path.
+        if (zone == SnapZone.Top)
+        {
+            if (window.WindowState != DOSIWindowState.Maximized)
+                window.WindowState = DOSIWindowState.Maximized;
+            return;
+        }
+
         var rect = ZoneRect(zone);
         if (rect.Width <= 0 || rect.Height <= 0) return;
 
@@ -405,6 +446,14 @@ public sealed class WindowSnapManager : IDisposable
                 window.WindowWidth, window.WindowHeight);
         }
 
+        // Tell the window what to restore to if the user drags it. DOSIWindow
+        // checks this in OnChromeDragMoved and pops back to the pre-snap size
+        // (cursor re-anchored under the title bar) on the next drag - matches
+        // Windows' "drag a snapped window to unsnap" gesture. Refreshed every
+        // CommitSnap so re-snapping a window updates the restore target.
+        var pre = _preSnapBounds[window];
+        window.MarkSnapped(pre.Width, pre.Height);
+
         // Make sure we're starting from a Normal state. If the window happens
         // to be Maximized, the maximize-clamp would fight our animation.
         if (window.WindowState == DOSIWindowState.Maximized)
@@ -415,14 +464,25 @@ public sealed class WindowSnapManager : IDisposable
 
     private static async Task AnimateWindowAsync(DOSIWindow window, Rect target)
     {
+        // Snapshot the parent at animation start. If a cross-monitor
+        // drag handoff reparents the window mid-tween (RelinquishWindow +
+        // AdoptWindow swap to a different TopLevel's LayoutManager), the
+        // next WindowX/Y/Width/Height write would queue an InvalidateArrange
+        // against the OLD LayoutManager and throw "Attempt to call
+        // InvalidateArrange on wrong LayoutManager". Bailing on parent
+        // change leaves the window at whatever bounds it had reached so far.
+        var startParent = window.Parent;
+
         var startX = window.WindowX;
         var startY = window.WindowY;
         var startW = window.WindowWidth;
         var startH = window.WindowHeight;
-        var t0 = DateTime.UtcNow;
+        var clock = Stopwatch.StartNew();
         while (true)
         {
-            var t = Math.Min(1.0, (DateTime.UtcNow - t0).TotalMilliseconds / SnapAnimDuration.TotalMilliseconds);
+            if (window.Parent != startParent) return;
+
+            var t = Math.Min(1.0, clock.Elapsed.TotalMilliseconds / SnapAnimDuration.TotalMilliseconds);
             var e = SnapEasing.Ease(t);
             window.WindowX = Lerp(startX, target.X, e);
             window.WindowY = Lerp(startY, target.Y, e);
@@ -431,10 +491,13 @@ public sealed class WindowSnapManager : IDisposable
             if (t >= 1.0) break;
             await Task.Delay(8);
         }
-        window.WindowX = target.X;
-        window.WindowY = target.Y;
-        window.WindowWidth = target.Width;
-        window.WindowHeight = target.Height;
+        if (window.Parent == startParent)
+        {
+            window.WindowX = target.X;
+            window.WindowY = target.Y;
+            window.WindowWidth = target.Width;
+            window.WindowHeight = target.Height;
+        }
     }
 
     private static double Lerp(double a, double b, double t) => a + (b - a) * t;
@@ -445,8 +508,12 @@ public sealed class WindowSnapManager : IDisposable
         _manager.WindowClosed -= OnWindowClosed;
         Accents.AccentChanged -= OnAccentChanged;
         foreach (var w in _manager.Windows) Detach(w);
-        _animTimer?.Stop();
-        _animTimer = null;
+        if (_animTimer != null)
+        {
+            _animTimer.Stop();
+            _animTimer.Tick -= OnPreviewAnimTick;
+            _animTimer = null;
+        }
         if (_preview.Parent is Canvas c) c.Children.Remove(_preview);
     }
 }

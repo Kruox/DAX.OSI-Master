@@ -183,7 +183,23 @@ public class DOSIWindow : UserControl
     public double WindowY
     {
         get => Canvas.GetTop(this) + ShadowMargin;
-        set => Canvas.SetTop(this, value - ShadowMargin);
+        // Floor against the owning manager's reserved top inset (taskbar
+        // height on desktops, 0 elsewhere) so EVERY path that writes Y -
+        // OpenWindow's saved-geometry restore, maximize, restore-from-
+        // minimize tween, snap-to-edges, AdoptWindow on cross-monitor
+        // handoff - is incapable of placing the title bar under the
+        // taskbar. The drag handler is excluded from this floor because
+        // cross-monitor drag intentionally sends Y negative so the cursor
+        // can travel to a monitor above the source (see the multi-monitor
+        // relaxation in OnChromeDragMove); only clamp values that are
+        // between 0 and the inset, i.e. the dead zone behind the taskbar
+        // on the CURRENT monitor.
+        set
+        {
+            var inset = OwnerManager?.TopWorkAreaInset ?? 0;
+            var clamped = (value >= 0 && value < inset) ? inset : value;
+            Canvas.SetTop(this, clamped - ShadowMargin);
+        }
     }
 
     /// <summary>

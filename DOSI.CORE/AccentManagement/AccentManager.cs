@@ -75,9 +75,18 @@ public sealed class AccentManager
             var clamped = Math.Clamp(value, 0.5, 1.0);
             if (Math.Abs(_windowOpacity - clamped) < double.Epsilon) return;
             _windowOpacity = clamped;
+            // Mutate the cached brushes in place so every Border/TextBlock
+            // already bound to WindowChromeBrush / WindowContentBrush /
+            // etc. repaints automatically. We DO NOT fire AccentChanged
+            // here - that signal means "the accent palette identity
+            // changed", and consumers like DOSITabControl interpret it as
+            // a cue to rebuild their cached tab bodies. Rebuilding mid-
+            // drag (e.g. the transparency slider on the Settings User
+            // tab) destroys the slider that's currently capturing the
+            // pointer, so the drag scrolls the parent ScrollViewer back
+            // to the top instead of moving the thumb. The brush mutation
+            // alone is sufficient for live transparency preview.
             RefreshCachedBrushes();
-            if (!_suppressAccentChanged)
-                AccentChanged?.Invoke(this, EventArgs.Empty);
         }
     }
     private double _windowOpacity = 1.0;

@@ -34,16 +34,13 @@ public class DOSIContextMenu : ContextMenu
 
     public DOSIContextMenu()
     {
-        Background = BuildMenuBackground();
-        BorderBrush = new SolidColorBrush(Accents.AccentSecondary);
+        ApplyAccentSurfaces();
+
+        Template = BuildTemplate();
         BorderThickness = new Thickness(1);
         CornerRadius = new CornerRadius(10);
         Padding = new Thickness(4);
         MinWidth = 170;
-
-        Template = BuildTemplate();
-        Styles.Add(BuildItemStyle());
-        Styles.Add(BuildSeparatorStyle());
 
         // Live-update the accent border. The template binds the chrome's
         // BorderBrush to ours, so reassigning BorderBrush is enough - no
@@ -57,22 +54,34 @@ public class DOSIContextMenu : ContextMenu
         // again so re-opens stopped tracking accent changes.
         AttachedToVisualTree += (_, _) => Accents.AccentChanged += OnAccentChanged;
         DetachedFromVisualTree += (_, _) => Accents.AccentChanged -= OnAccentChanged;
+
+        // Belt-and-braces: a ContextMenu only lives in the visual tree
+        // while its popup is open, so an accent change that lands while
+        // the menu is closed never reaches OnAccentChanged. Refresh the
+        // brushes + styles every time the menu opens so re-opens after a
+        // closed-state accent flip always render the current accent.
+        Opening += (_, _) => ApplyAccentSurfaces();
     }
 
-    private void OnAccentChanged(object? sender, EventArgs e)
+    /// <summary>
+    /// (Re-)applies every accent-derived surface on the menu: background
+    /// gradient, accent border, item text colour, separator colour. Safe
+    /// to call any number of times - idempotent.
+    /// </summary>
+    private void ApplyAccentSurfaces()
     {
-        BorderBrush = new SolidColorBrush(Accents.AccentSecondary);
-        // Refresh the background too so live accent switches between Light
-        // and a dark accent flip the menu surface accordingly.
         Background = BuildMenuBackground();
+        BorderBrush = new SolidColorBrush(Accents.AccentSecondary);
 
-        // Item / separator styles capture brushes at construction time, so
-        // rebuild them so a live accent flip (especially Light <-> dark)
-        // recolors menu-item text + dividers correctly.
+        // Item / separator styles capture brushes at construction time,
+        // so rebuild them so a live accent flip (especially Light <-> dark)
+        // recolours menu-item text + dividers correctly.
         Styles.Clear();
         Styles.Add(BuildItemStyle());
         Styles.Add(BuildSeparatorStyle());
     }
+
+    private void OnAccentChanged(object? sender, EventArgs e) => ApplyAccentSurfaces();
 
     /// <summary>
     /// Custom template: outer transparent gutter (so the popup window has real
@@ -86,20 +95,29 @@ public class DOSIContextMenu : ContextMenu
             var presenter = new ItemsPresenter { Name = "PART_ItemsPresenter" };
             ns.Register("PART_ItemsPresenter", presenter);
 
-            // Light surfaces get a softer, slightly cool shadow so we don't
-            // paint a heavy black halo around a near-white menu. Dark accents
-            // keep the original deep shadow for proper depth on dark wallpapers.
+            // Two shadow recipes:
+            // - Dark accents: a deep near-black halo (matches the apps menu
+            //   / notification popover, which always open against the dark
+            //   wallpaper).
+            // - Light accent: a softer, cooler, lower-alpha shadow. A
+            //   straight #96000000 with a 36px blur paints a muddy grey
+            //   halo around the near-white menu surface that reads as
+            //   "smudged" rather than "elevated". The lower alpha + slate
+            //   tint gives proper depth without dirtying the chrome.
+            // The apps menu / notification popover keep using their own
+            // shadow because they open against the wallpaper, not over
+            // window content - the visual budget is different there.
             var isLight = Accents.CurrentAccent == DOSIAccent.Light;
             var chrome = new Border
             {
                 BoxShadow = new BoxShadows(new BoxShadow
                 {
                     OffsetX = 0,
-                    OffsetY = isLight ? 8 : 14,
-                    Blur = isLight ? 24 : 36,
+                    OffsetY = isLight ? 6 : 14,
+                    Blur = isLight ? 20 : 36,
                     Spread = 0,
                     Color = isLight
-                        ? Color.FromArgb(55, 30, 45, 75)
+                        ? Color.FromArgb(48, 28, 38, 60)
                         : Color.FromArgb(150, 0, 0, 0)
                 }),
                 Child = presenter
@@ -115,14 +133,24 @@ public class DOSIContextMenu : ContextMenu
 
             // Gutter sizes match the BoxShadow's spread on each side so the
             // halo fades out naturally instead of being clipped at the popup
-            // window's edges. Top/left are smaller than bottom/right because
-            // the shadow has a downward OffsetY=14, so most of the bleed is
-            // below + to the right. The chrome still opens close to the
-            // cursor (the popup origin) - just nudged in by ~14px.
+            // window's edges. ALL FOUR sides must be wide enough to fit the
+            // blur radius (~36 px for dark, ~20 px for light) or the halo
+            // gets sliced flush against the popup edge on that side. The
+            // previous asymmetric gutter (16, 12, 32, 36) was sized for
+            // bottom-right only - the LEFT side had just 16 px while the
+            // dark-accent shadow's 36 px blur needed 32+, which is why the
+            // left edge of every right-click menu rendered with a hard,
+            // un-feathered shadow boundary while the other three sides
+            // looked properly soft. Adding the downward OffsetY of 14 px
+            // to the bottom gutter keeps the offset shadow bleed accounted
+            // for without growing the top inset (the shadow has no upward
+            // bleed beyond the blur).
+            var blur = isLight ? 20 : 36;
+            var offsetY = isLight ? 6 : 14;
             return new Border
             {
                 Background = Brushes.Transparent,
-                Padding = new Thickness(16, 12, 32, 36),
+                Padding = new Thickness(blur, blur, blur, blur + offsetY),
                 Child = chrome
             };
         });
@@ -175,11 +203,11 @@ public class DOSIContextMenu : ContextMenu
     /// popup feels visually consistent. Switches to a light surface under the
     /// Light accent so the (dark) menu item text stays readable.
     ///
-    /// All stops are fully opaque (alpha = 255). Earlier revisions used
-    /// alphas in the 230s for a faint frost effect, but that let busy page
-    /// content (video frames, accent-coloured banners) bleed through the
-    /// menu and made dividers / text look ghostly. A real desktop right-click
-    /// menu always sits on a solid surface, so we do the same.
+    /// Alpha is intentionally well below opaque (~210) so the menu reads as
+    /// a soft glass panel rather than a heavy slab. Stops are also pulled
+    /// closer together in luminance so the gradient is gentler - the older
+    /// stronger gradient drew the eye to the menu chrome instead of the
+    /// menu items themselves.
     /// </summary>
     private static IBrush BuildMenuBackground()
     {
@@ -191,8 +219,8 @@ public class DOSIContextMenu : ContextMenu
                 EndPoint = new RelativePoint(0, 1, RelativeUnit.Relative),
                 GradientStops =
                 {
-                    new GradientStop(Color.FromRgb(250, 251, 254), 0),
-                    new GradientStop(Color.FromRgb(232, 236, 244), 1)
+                    new GradientStop(Color.FromArgb(210, 250, 251, 254), 0),
+                    new GradientStop(Color.FromArgb(210, 240, 243, 249), 1)
                 }
             };
         }
@@ -203,8 +231,8 @@ public class DOSIContextMenu : ContextMenu
             EndPoint = new RelativePoint(0, 1, RelativeUnit.Relative),
             GradientStops =
             {
-                new GradientStop(Color.FromRgb(28, 30, 38), 0),
-                new GradientStop(Color.FromRgb(16, 18, 26), 1)
+                new GradientStop(Color.FromArgb(210, 30, 32, 40), 0),
+                new GradientStop(Color.FromArgb(210, 22, 24, 32), 1)
             }
         };
     }

@@ -27,7 +27,7 @@ public sealed class UserAccessDeniedException : UnauthorizedAccessException
 /// through <see cref="AssertReadAccess"/> or <see cref="AssertWriteAccess"/>
 /// so we have a single, auditable place that enforces "user A cannot read
 /// user B's files" — even when the call comes from a third-party DOSI
-/// app compiled inside DOSIIDE.
+/// app compiled by <see cref="DOSI.CORE.ProjectSystem.DOSIProjectCompiler"/>.
 /// </para>
 /// <para>
 /// Administrators (<see cref="DOSIUser.IsAdministrator"/>) bypass the check.

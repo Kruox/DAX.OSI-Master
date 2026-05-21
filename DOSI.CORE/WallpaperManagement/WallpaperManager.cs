@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using Avalonia;
@@ -77,19 +78,14 @@ public sealed class WallpaperManager
         }
     };
 
-    private readonly Dictionary<string, Bitmap> _blurredBitmapCache = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, Bitmap> _sharpBitmapCache = new(StringComparer.OrdinalIgnoreCase);
-
-    /// <summary>
-    /// Serializes <see cref="LoadBitmap"/> calls so the background prewarm
-    /// thread (kicked off in the constructor) and the UI thread can both
-    /// safely populate / read the bitmap caches. Without this a UI-thread
-    /// call that arrives while prewarm is mid-bake could double-bake the
-    /// same wallpaper and leak a <see cref="Bitmap"/>. The lock is held for
-    /// the duration of one bake at most; once prewarm has finished every
-    /// subsequent UI call is a sub-microsecond cache hit.
-    /// </summary>
-    private readonly object _loadLock = new();
+    // Concurrent so the background prewarm thread (kicked off in the
+    // constructor) and the UI thread can safely populate / read the bitmap
+    // caches without a separate lock - reads are wait-free, writes are
+    // serialized internally, and GetOrAdd guarantees no double-bake leak.
+    private readonly ConcurrentDictionary<string, Bitmap> _blurredBitmapCache =
+        new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, Bitmap> _sharpBitmapCache =
+        new(StringComparer.OrdinalIgnoreCase);
 
     private WallpaperManager()
     {
@@ -323,20 +319,17 @@ public sealed class WallpaperManager
 
         var cache = blurred ? _blurredBitmapCache : _sharpBitmapCache;
 
-        // Fast path: lock-free read of the cache. Dictionary reads of an
-        // already-published entry are safe enough here (we never remove
-        // entries) and this keeps the steady-state hit cost effectively zero.
+        // Fast path: lock-free read.
         if (cache.TryGetValue(wallpaper.Key, out var cached)) return cached;
 
-        // Slow path: serialize the decode + bake so the prewarm thread and
-        // the UI thread don't race and produce two copies of the bitmap.
-        lock (_loadLock)
+        // Slow path: bake the bitmap and publish atomically. GetOrAdd may
+        // run our factory and still discard its result if a concurrent
+        // caller publishes first; in that case we dispose the loser bitmap
+        // so we don't leak a duplicate decode.
+        Bitmap? produced = null;
+        try
         {
-            // Re-check inside the lock - a concurrent caller may have
-            // populated the entry while we were waiting.
-            if (cache.TryGetValue(wallpaper.Key, out cached)) return cached;
-
-            try
+            var winner = cache.GetOrAdd(wallpaper.Key, _ =>
             {
                 // file:// URIs come from RegisterCustomWallpaper; avares://
                 // ones from the shipped catalog. Source dispatched off the
@@ -380,13 +373,19 @@ public sealed class WallpaperManager
                     }
                 }
 
-                cache[wallpaper.Key] = bmp;
+                produced = bmp;
                 return bmp;
-            }
-            catch
-            {
-                return null;
-            }
+            });
+
+            // If GetOrAdd accepted a different (concurrent) winner, dispose ours.
+            if (produced != null && !ReferenceEquals(produced, winner))
+                produced.Dispose();
+            return winner;
+        }
+        catch
+        {
+            produced?.Dispose();
+            return null;
         }
     }
 
@@ -502,7 +501,16 @@ public sealed class WallpaperManager
     {
         if (user == null)
         {
-            SetWallpaper(DefaultWallpaperKey);
+            // No signed-in user (boot, initial-startup, signout, login):
+            // intentionally show NO wallpaper, just the accent backdrop.
+            // Falling back to DefaultWallpaperKey here is a leak: any
+            // accent-only signed-in user would see the default shipped
+            // wallpaper appear on every screen the moment they sign out
+            // (most visibly on secondary monitors, whose wallpaper layer
+            // isn't faded by the signout transition - see MainWindow.
+            // RunSignOutSequenceAsync). AccentOnlyKey keeps the visual
+            // continuous: signed-in accent-only -> signed-out accent-only.
+            SetWallpaper(AccentOnlyKey);
             SetFitMode(WallpaperFitMode.Fill);
             return;
         }

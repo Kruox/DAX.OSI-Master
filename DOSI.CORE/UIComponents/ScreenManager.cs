@@ -1,6 +1,6 @@
 using Avalonia;
 using Avalonia.Controls;
-using Avalonia.Threading;
+using DOSI.CORE.Animations;
 
 namespace DOSI.CORE.UIComponents;
 
@@ -14,6 +14,18 @@ public class ScreenManager
     private readonly Dictionary<string, DOSIScreen> _screenCache = new();
 
     private DOSIScreen? _currentScreen;
+
+    // ----- Transition cancellation -----
+    // Tracks the in-flight crossfade (if any) so a second navigation request
+    // arriving mid-transition can finalize the first one cleanly instead of
+    // racing with it. The Tween is snapped to its end state, the overlay is
+    // torn down on the spot, and the new navigation starts from a stable
+    // _currentScreen / _container.Content. Without this, rapid double-clicks
+    // on a login tile, or a sign-out fired before a startup crossfade
+    // completed, could leave two screens parented under the overlay grid
+    // with mismatched opacities.
+    private Tween? _activeCrossfade;
+    private Action? _activeCrossfadeFinalize;
 
     public DOSIScreen? CurrentScreen => _currentScreen;
     public string? CurrentScreenId => _currentScreen?.ScreenId;
@@ -110,8 +122,33 @@ public class ScreenManager
     /// Navigates to the specified screen using a crossfade transition between the
     /// previously displayed screen and the new one.
     /// </summary>
-    public async Task<bool> NavigateToWithCrossfadeAsync(string screenId, TimeSpan duration, object? parameter = null)
+    /// <param name="screenId">The target screen's id.</param>
+    /// <param name="duration">Total crossfade duration.</param>
+    /// <param name="parameter">Optional navigation parameter forwarded via <see cref="ScreenChanged"/>.</param>
+    /// <param name="ease">
+    /// Easing curve applied to the wedge's progress. Defaults to <see cref="Easings.Linear"/>
+    /// which preserves the "constant coverage" math the wedge relies on; pass
+    /// <see cref="Easings.EaseInOutCubic"/> for a weightier feel on user-driven
+    /// transitions (desktop arrival), or <see cref="Easings.EaseOutCubic"/> for
+    /// settle-to-rest endings (login → desktop).
+    /// </param>
+    public async Task<bool> NavigateToWithCrossfadeAsync(string screenId, TimeSpan duration,
+        object? parameter = null, Func<double, double>? ease = null)
     {
+        // If another crossfade is still in flight, finalize it on the spot
+        // so we don't end up with two overlapping overlays + two screens
+        // both believing they own _container.Content. The finalize closure
+        // (set up below) handles overlay teardown + reparenting the
+        // then-current incoming screen to Content with full opacity.
+        if (_activeCrossfade != null)
+        {
+            var snap = _activeCrossfadeFinalize;
+            _activeCrossfade.Stop(snapToEnd: true);
+            _activeCrossfade = null;
+            _activeCrossfadeFinalize = null;
+            try { snap?.Invoke(); } catch { /* best-effort */ }
+        }
+
         var newScreen = GetOrCreateScreen(screenId);
         if (newScreen == null) return false;
 
@@ -135,17 +172,29 @@ public class ScreenManager
 
         var overlay = new Grid();
         newScreen.Opacity = 0;
-        // While the two screens are stacked, hide the incoming screen's
-        // accent vignette + wallpaper layers. Both screens own their own
-        // backdrop, so without this we composite two accents and two
-        // wallpapers on top of each other for the duration of the fade,
-        // producing a visible "ghost" (most obvious going from LoginScreen
-        // to DesktopScreen, where both render the user's accent + wallpaper).
-        // The outgoing screen's backdrop continues to render at full opacity
-        // and the new screen's UI fades in on top of it; the cutover at the
-        // end of the fade is invisible because both screens reference the
-        // same WallpaperManager bitmap and AccentManager brush.
-        newScreen.SetBackdropVisible(false);
+        // Reveal the incoming screen's backdrop (vignette + wallpaper)
+        // BEFORE the crossfade starts, snapped to whatever the outgoing
+        // screen is currently displaying. This is essential for the
+        // two-phase wedge crossfade in RunCrossfadeAsync to work without
+        // exposing the host window background: during phase B (outgoing
+        // fading from 1 -> 0 over a fully-opaque incoming) the incoming
+        // screen has to actually paint pixels everywhere outgoing used
+        // to, otherwise the regions the incoming screen's UI doesn't
+        // cover (most of the surface - the login is mostly a small card
+        // over wallpaper) drop to the window background and produce a
+        // black flash. The earlier "hide incoming backdrop for the whole
+        // fade, snap it on at the end" trick assumed outgoing stays at
+        // full opacity throughout, which the wedge no longer does.
+        //
+        // The earlier "ghost from compositing two accents/wallpapers"
+        // worry doesn't materialise here: during phase A the outgoing
+        // fully covers the incoming so the incoming backdrop is
+        // invisible, and during phase B the incoming covers fully and
+        // the outgoing fades cleanly on top. Pre-snapping the incoming
+        // wallpaper source to the outgoing's avoids any visible variant
+        // change at the start.
+        newScreen.SetWallpaperFrontSourceImmediate(previousScreen.GetWallpaperFrontSource());
+        newScreen.SetBackdropVisible(true);
         overlay.Children.Add(previousScreen);
         overlay.Children.Add(newScreen);
         _container.Content = overlay;
@@ -153,27 +202,32 @@ public class ScreenManager
         _currentScreen = newScreen;
         newScreen.OnNavigatedTo();
 
-        await RunCrossfadeAsync(previousScreen, newScreen, duration);
+        // Capture a finalize closure that the cancellation path (above)
+        // can invoke to bring the overlay down cleanly mid-fade. Same
+        // body as the post-await cleanup below, but callable from the
+        // tween's snap-to-end branch.
+        void FinalizeHandoff()
+        {
+            _container.Content = null;
+            overlay.Children.Clear();
+            _container.Content = newScreen;
+            newScreen.Opacity = 1;
+            previousScreen.Opacity = 1;
+            newScreen.OnTransitionComplete();
+        }
+        _activeCrossfadeFinalize = FinalizeHandoff;
 
-        // Restore the new screen's backdrop before reparenting it so that
-        // when it's promoted back to top-level Content there is no frame
-        // where the desktop has no wallpaper / accent behind it.
-        //
-        // Snap the new screen's wallpaper layer to whatever the outgoing
-        // screen had on display first. The two screens may want different
-        // variants of the same wallpaper (e.g. DesktopScreen with blur
-        // disabled coming in over LoginScreen which always shows the soft
-        // variant, or DesktopScreen handing off to SignoutScreen / Shutdown
-        // which always show the soft variant). Without the snap, revealing
-        // the new screen's backdrop produces a visible "cut" from the
-        // outgoing variant straight to the incoming variant - which the
-        // hidden-backdrop cross-fade trick would otherwise hide a smooth
-        // transition behind. With the snap, the reveal is seamless and
-        // OnTransitionComplete (called below) animates any variant
-        // difference visibly on top of the freshly-revealed backdrop.
-        newScreen.SetWallpaperFrontSourceImmediate(previousScreen.GetWallpaperFrontSource());
-        newScreen.SetBackdropVisible(true);
+        await RunCrossfadeAsync(previousScreen, newScreen, duration,
+            ease ?? Easings.Linear,
+            tween => _activeCrossfade = tween);
 
+        // Clear the in-flight marker - if cancellation didn't fire, the
+        // tween ran to completion and the standard post-fade cleanup
+        // takes over below.
+        _activeCrossfade = null;
+        _activeCrossfadeFinalize = null;
+
+        // Backdrop is already visible (we revealed it before the fade).
         // Detach both screens from the overlay before reparenting the new one.
         // Order matters: clear the container first so newScreen has no parent
         // when we assign it as Content (avoids the "logical child already has
@@ -234,38 +288,73 @@ public class ScreenManager
         _container.Content = null;
     }
 
-    private static Task RunCrossfadeAsync(Visual fadeOut, Visual fadeIn, TimeSpan duration)
+    private static Task RunCrossfadeAsync(Visual fadeOut, Visual fadeIn, TimeSpan duration,
+        Func<double, double> ease, Action<Tween>? onStarted = null)
     {
-        var tcs = new TaskCompletionSource<bool>();
-
-        // Keep the outgoing screen fully opaque and fade the new screen in on top.
-        // This avoids the alpha-compositing darkening that occurs when both layers
-        // are partially transparent (combined coverage 1 - (1-a)(1-b) < 1, letting
-        // the window background bleed through).
+        // Two-phase wedge crossfade. The naive "fade both 0..1 in opposite
+        // directions" path produces the alpha-compositing darkening the
+        // original implementation worked around (combined coverage
+        // 1 - (1-a)(1-b) drops below 1 for the entire middle of the
+        // transition, letting the window background bleed through and
+        // flashing black on sign-out / shutdown screens that don't paint
+        // a solid backdrop).
+        //
+        // The original workaround held the outgoing screen at Opacity=1
+        // for the ENTIRE crossfade and only ever animated the incoming
+        // one. That fixed the darkening but introduced a visible artifact
+        // at the end: the outgoing screen stayed fully visible right up
+        // until the manager swapped Content, so it appeared to "snap"
+        // away in a single frame - most obvious on the InitialStartup
+        // -> LoginScreen handoff where the wizard's final step lingered
+        // behind / around the login card until the very last frame.
+        //
+        // Wedge fix:
+        //   Phase A (first half): incoming fades 0 -> 1, outgoing stays at 1.
+        //                         Coverage = 1 (outgoing alone).
+        //   Phase B (second half): outgoing fades 1 -> 0, incoming stays at 1.
+        //                          Coverage = 1 (incoming alone).
+        // Both phases run inside the same tween so the perceived motion
+        // is a continuous crossfade with no plateau, and the union of
+        // opacities never drops below 1 - so screens with non-opaque
+        // backdrops (sign-out, shutdown) still don't expose the window
+        // background.
         fadeOut.Opacity = 1;
         fadeIn.Opacity = 0;
 
-        // ~60 FPS
-        var interval = TimeSpan.FromMilliseconds(16);
-        var totalMs = Math.Max(1, duration.TotalMilliseconds);
-        var startTime = DateTime.UtcNow;
-
-        var timer = new DispatcherTimer { Interval = interval };
-        timer.Tick += (_, _) =>
-        {
-            var elapsed = (DateTime.UtcNow - startTime).TotalMilliseconds;
-            var t = Math.Clamp(elapsed / totalMs, 0d, 1d);
-
-            fadeIn.Opacity = t;
-
-            if (t >= 1d)
+        var tcs = new TaskCompletionSource<bool>();
+        var tween = Tween.Run(
+            durationMs: Math.Max(1, duration.TotalMilliseconds),
+            ease: ease,
+            apply: t =>
             {
-                timer.Stop();
+                // First half: bring the new screen up to full opacity over
+                // its own backdrop (revealed by NavigateToWithCrossfadeAsync
+                // before the fade starts, snapped to the outgoing screen's
+                // wallpaper source so there's no visible cutover).
+                if (t < 0.5)
+                {
+                    fadeIn.Opacity = t * 2.0;
+                    fadeOut.Opacity = 1.0;
+                }
+                else
+                {
+                    // Second half: incoming is already at 1, now retire the
+                    // outgoing screen. Linear is fine here - the incoming
+                    // is fully covering, so the outgoing's alpha contributes
+                    // nothing visible past pixels the incoming doesn't paint
+                    // (which on every DOSIScreen is zero, since each owns an
+                    // opaque accent + wallpaper backdrop).
+                    fadeIn.Opacity = 1.0;
+                    fadeOut.Opacity = 1.0 - (t - 0.5) * 2.0;
+                }
+            },
+            onCompleted: () =>
+            {
+                fadeIn.Opacity = 1;
+                fadeOut.Opacity = 0;
                 tcs.TrySetResult(true);
-            }
-        };
-        timer.Start();
-
+            });
+        onStarted?.Invoke(tween);
         return tcs.Task;
     }
 }

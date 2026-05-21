@@ -104,21 +104,10 @@ public class DOSIDropDown : ContentControl
             MinHeight = 28
         };
 
-        _root.PointerEntered += (_, _) =>
-            _root.Background = new SolidColorBrush(Color.FromArgb(60, 255, 255, 255));
-        _root.PointerExited += (_, _) =>
-        {
-            if (!_popup.IsOpen)
-                _root.Background = new SolidColorBrush(Color.FromArgb(30, 255, 255, 255));
-        };
-        _root.PointerReleased += (_, e) =>
-        {
-            e.Handled = true;
-            _popup.IsOpen = !_popup.IsOpen;
-        };
-
         // Popup holds the items list. Placement under the trigger Border;
         // sized to match the trigger's width so long labels don't reflow.
+        // Constructed BEFORE the _root pointer handlers so they can safely
+        // capture _popup without nullable-warning gymnastics.
         _itemsHost = new StackPanel
         {
             Orientation = Orientation.Vertical,
@@ -146,6 +135,19 @@ public class DOSIDropDown : ContentControl
             VerticalOffset = 4,
             IsLightDismissEnabled = true,
             Child = popupChrome
+        };
+
+        _root.PointerEntered += (_, _) =>
+            _root.Background = new SolidColorBrush(Color.FromArgb(60, 255, 255, 255));
+        _root.PointerExited += (_, _) =>
+        {
+            if (!_popup.IsOpen)
+                _root.Background = new SolidColorBrush(Color.FromArgb(30, 255, 255, 255));
+        };
+        _root.PointerReleased += (_, e) =>
+        {
+            e.Handled = true;
+            _popup.IsOpen = !_popup.IsOpen;
         };
 
         var hostGrid = new Grid { Children = { _root, _popup } };

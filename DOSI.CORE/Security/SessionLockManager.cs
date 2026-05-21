@@ -287,17 +287,16 @@ public sealed class SessionLockManager : IDisposable
         var control = _lockScreenFactory(user);
         if (control == null) return;
 
-        // Discover Unlocked / SignOutRequested events via reflection so the
-        // manager doesn't take a hard dependency on a specific lock-screen type.
-        WireEvent(control, "Unlocked", () => DismissWithFade());
-        WireEvent(control, "SignOutRequested", () =>
+        // Wire Unlocked / SignOutRequested through the typed contract.
+        // Factories that don't return an IDOSILockScreen are silently
+        // unsupported - the lock screen will then have no way to dismiss
+        // itself, which fails loudly on the very first lock and is
+        // therefore caught at integration time, not in production.
+        if (control is IDOSILockScreen lockView)
         {
-            // Sign-out doesn't need a fade-out (the host runs its own farewell
-            // animation), but we still need to remove our control + fire the
-            // event so the host can react.
-            DismissImmediate();
-            SignOutRequested?.Invoke(this, EventArgs.Empty);
-        });
+            lockView.Unlocked += OnLockViewUnlocked;
+            lockView.SignOutRequested += OnLockViewSignOutRequested;
+        }
 
         _activeLockControl = control;
         control.Opacity = 0;
@@ -336,6 +335,15 @@ public sealed class SessionLockManager : IDisposable
     private void DismissImmediate()
     {
         if (_activeLockControl == null) return;
+
+        // Unhook events so the lock-screen control can be GC'd without
+        // keeping us (or vice versa) alive past its visual life.
+        if (_activeLockControl is IDOSILockScreen lockView)
+        {
+            lockView.Unlocked -= OnLockViewUnlocked;
+            lockView.SignOutRequested -= OnLockViewSignOutRequested;
+        }
+
         _activeFadeTween?.Stop();
         _activeFadeTween = null;
         _lockHost.Children.Remove(_activeLockControl);
@@ -344,21 +352,31 @@ public sealed class SessionLockManager : IDisposable
         _idleWarningShown = false;
     }
 
-    private static void WireEvent(object target, string eventName, Action handler)
+    private void OnLockViewUnlocked(object? sender, EventArgs e) => DismissWithFade();
+
+    private void OnLockViewSignOutRequested(object? sender, EventArgs e)
     {
-        var evt = target.GetType().GetEvent(eventName);
-        if (evt == null) return;
-        var del = Delegate.CreateDelegate(evt.EventHandlerType!, handler.Target!,
-            handler.Method.Name, false, false);
-        // Fallback path: use a thunked EventHandler since the event signature is EventHandler.
-        if (del == null)
-        {
-            EventHandler thunk = (_, _) => handler();
-            evt.AddEventHandler(target, thunk);
-            return;
-        }
-        evt.AddEventHandler(target, del);
+        // Sign-out doesn't need a fade-out (the host runs its own farewell
+        // animation), but we still need to remove our control + fire the
+        // event so the host can react.
+        DismissImmediate();
+        SignOutRequested?.Invoke(this, EventArgs.Empty);
     }
 
     public void Dispose() => Stop();
+}
+
+/// <summary>
+/// Implemented by any control intended to serve as the session lock
+/// screen. <see cref="SessionLockManager"/> wires these events on the
+/// control returned by its factory; controls that do not implement this
+/// contract cannot be unlocked.
+/// </summary>
+public interface IDOSILockScreen
+{
+    /// <summary>Raised once the user has authenticated and unlocked the session.</summary>
+    event EventHandler? Unlocked;
+
+    /// <summary>Raised when the user chooses to sign out from the lock screen.</summary>
+    event EventHandler? SignOutRequested;
 }

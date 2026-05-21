@@ -58,6 +58,12 @@ public class DOSIPopNotification : Border
     {
         ArgumentNullException.ThrowIfNull(host);
 
+        // Mirror every shown toast into the process-wide history so a
+        // Notification Center can resurrect missed alerts. Done before
+        // any UI work so even a host-construction failure later still
+        // records the event.
+        NotificationHistory.Add(text);
+
         _host = host;
         HookHostIfNeeded(host);
 
@@ -84,9 +90,17 @@ public class DOSIPopNotification : Border
     /// </summary>
     public static DOSIPopNotification Show(string text, TimeSpan? lifetime = null)
     {
-        var host = DefaultHost ?? _host
-            ?? throw new InvalidOperationException(
+        var host = DefaultHost ?? _host;
+        if (host == null)
+        {
+            // No host yet (e.g. very-early-boot toast such as the crash
+            // recovery message). Still record into history so the user can
+            // see it later in the Notification Center, then fail quietly
+            // by throwing the same exception the original API documented.
+            NotificationHistory.Add(text);
+            throw new InvalidOperationException(
                 "DOSIPopNotification.DefaultHost has not been set. Call Show(host, text) at least once or assign DefaultHost.");
+        }
         return Show(host, text, lifetime);
     }
 
@@ -131,6 +145,23 @@ public class DOSIPopNotification : Border
         }
     }
 
+    /// <summary>
+    /// Dismisses every currently-visible toast. Useful for "Clear all"
+    /// gestures from a future Notification Center, or for screens that
+    /// want to take over the foreground without competing alerts (e.g.
+    /// the shutdown handoff). Each toast still runs its normal fade-out
+    /// animation, so the clear reads as a soft cascade rather than a
+    /// hard pop.
+    /// </summary>
+    public static void DismissAll()
+    {
+        // Snapshot - DismissAsync mutates _active.
+        foreach (var n in _active.ToList())
+        {
+            _ = n.DismissAsync();
+        }
+    }
+
     #endregion
 
     #region Instance
@@ -138,6 +169,10 @@ public class DOSIPopNotification : Border
     private readonly TranslateTransform _translate;
     private double _currentY;
     private bool _isClosing;
+    // Hover-pause state: while true, the lifecycle's auto-dismiss timer
+    // keeps polling without advancing toward expiry. Flipped by the
+    // pointer-enter/exit handlers attached in the ctor.
+    private bool _hoverPaused;
 
     private DOSIPopNotification(string text)
     {
@@ -170,7 +205,16 @@ public class DOSIPopNotification : Border
                     Color = Color.FromArgb(90, accent.R, accent.G, accent.B)
                 }
             ]);
-        IsHitTestVisible = false;
+        // Toasts are interactive: click to dismiss, hover to pause the
+        // auto-dismiss countdown so the user can finish reading a
+        // longer message without it vanishing mid-glance. Both
+        // affordances are stocked-on by default - the upgrade from the
+        // previous "purely passive" model is invisible until you try.
+        IsHitTestVisible = true;
+        Cursor = new Avalonia.Input.Cursor(Avalonia.Input.StandardCursorType.Hand);
+        PointerEntered += (_, _) => _hoverPaused = true;
+        PointerExited  += (_, _) => _hoverPaused = false;
+        PointerPressed += (_, _) => _ = DismissAsync();
 
         Child = new TextBlock
         {
@@ -246,7 +290,19 @@ public class DOSIPopNotification : Border
         }.RunAsync(this);
         Opacity = 1;
 
-        await Task.Delay(lifetime);
+        // Hover-aware countdown: ticks 50 ms at a time, only advances the
+        // remaining-life counter when the pointer ISN'T over the toast.
+        // Net effect - hovering a toast freezes it on screen, moving the
+        // pointer away resumes the dismiss timer from where it paused.
+        // No coupling to the underlying Animation pipeline; we still
+        // hit DismissAsync at expiry, which runs the proper fade-out.
+        var remaining = lifetime;
+        while (remaining > TimeSpan.Zero && !_isClosing)
+        {
+            var tick = TimeSpan.FromMilliseconds(50);
+            await Task.Delay(tick);
+            if (!_hoverPaused) remaining -= tick;
+        }
 
         await DismissAsync();
     }

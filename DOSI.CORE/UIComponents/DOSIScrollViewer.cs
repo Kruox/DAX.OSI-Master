@@ -201,6 +201,17 @@ public class DOSIScrollViewer : Control
         _horizontalScrollBar.Value = _horizontalScrollBar.Maximum;
     }
 
+    /// <summary>
+    /// Sets the vertical scroll offset directly (clamped to [0, Maximum]).
+    /// Used by consumers that need to programmatically reveal a specific
+    /// child - e.g. file-explorer keyboard navigation scrolling the
+    /// freshly-selected tile into view.
+    /// </summary>
+    public void ScrollVerticalTo(double offset)
+    {
+        _verticalScrollBar.Value = Math.Clamp(offset, 0, _verticalScrollBar.Maximum);
+    }
+
     #endregion
 
     #region Layout

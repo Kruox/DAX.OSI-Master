@@ -138,6 +138,11 @@ public static class SystemShutdown
             // and remains visible on top of the shutdown screen.
             SafeInvoke(ShutdownStarting);
 
+            // Persist any debounced window-geometry writes before the
+            // dispatcher tears down. Same reason as in SystemSignOut.Begin.
+            try { DOSI.CORE.UIComponents.WindowManagement.WindowGeometryRegistry.FlushNow(); } catch { }
+            try { DOSI.CORE.UIComponents.WindowManagement.DesktopIconLayout.FlushNow(); } catch { }
+
             var seq = ShutdownSequence;
             if (seq != null)
             {

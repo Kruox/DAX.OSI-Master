@@ -266,8 +266,8 @@ public static class DOSIFormCodeBehind
     private static string TrimBraces(string s)
     {
         s = s.Trim();
-        if (s.StartsWith("{")) s = s.Substring(1);
-        if (s.EndsWith("}")) s = s.Substring(0, s.Length - 1);
+        if (s.StartsWith('{')) s = s[1..];
+        if (s.EndsWith('}')) s = s[..^1];
         return s.Trim('\r', '\n');
     }
 

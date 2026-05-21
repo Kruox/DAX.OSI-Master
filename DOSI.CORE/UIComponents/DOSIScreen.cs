@@ -72,6 +72,91 @@ public abstract class DOSIScreen : UserControl
     /// <summary>Duration of the accent ↔ wallpaper cross-fade.</summary>
     protected virtual TimeSpan WallpaperTransitionDuration => TimeSpan.FromMilliseconds(550);
 
+    /// <summary>
+    /// When <c>true</c>, this screen's wallpaper transitions are broadcast
+    /// system-wide via <see cref="WallpaperSyncBroadcast"/> so secondary
+    /// monitors (which run their own <c>DOSIScreen</c> instance per
+    /// physical display) can mirror the animation in the SAME frame and
+    /// for the SAME duration. Set to <c>false</c> on screens that exist
+    /// to FOLLOW the primary (e.g. <c>ExtensionScreen</c>) so they don't
+    /// echo the broadcast back and trigger a feedback loop.
+    /// </summary>
+    protected virtual bool IsWallpaperBroadcaster => true;
+
+    /// <summary>
+    /// Per-frame state of a system-wide wallpaper cross-fade. Emitted by
+    /// the master (primary) screen's transition timer on every tick so
+    /// secondary monitors can apply the IDENTICAL opacities in the same
+    /// frame instead of running their own (drift-prone) timers.
+    /// </summary>
+    /// <param name="Target">Bitmap being faded TO. Null = fade to accent-only.</param>
+    /// <param name="FrontOpacity">Opacity to apply to the local front wallpaper layer.</param>
+    /// <param name="BackOpacity">Opacity to apply to the local back wallpaper layer.</param>
+    /// <param name="UseFrontForTarget">
+    /// True when the master is ramping the FRONT layer (front was empty
+    /// at start of fade); false when it's ramping the BACK over a
+    /// visible front. Tells the secondary which layer to stage the
+    /// target bitmap onto so the visual matches exactly.
+    /// </param>
+    /// <param name="IsFinal">
+    /// True for the last tick of the animation. Tells secondaries to
+    /// promote back-&gt;front (when applicable) and reset the back layer,
+    /// keeping post-transition state identical to the master.
+    /// </param>
+    public readonly record struct WallpaperSyncFrame(
+        Bitmap? Target,
+        double FrontOpacity,
+        double BackOpacity,
+        bool UseFrontForTarget,
+        bool IsFinal);
+
+    /// <summary>
+    /// Fired on EVERY tick of a broadcaster screen's wallpaper cross-fade,
+    /// carrying the exact per-frame opacity state. Secondary monitors
+    /// subscribe to this and apply the values to their own layers - no
+    /// local timer, no per-monitor drift, no compositor desync. Also
+    /// fires once with the FINAL frame so listeners can settle post-state.
+    /// <para>
+    /// Static so listeners don't have to find the broadcaster screen
+    /// instance - it can be on a different visual tree (different
+    /// IDosiHost) entirely.
+    /// </para>
+    /// </summary>
+    public static event EventHandler<WallpaperSyncFrame>? WallpaperSyncBroadcast;
+
+    /// <summary>
+    /// Previously drove <c>_accentBackdrop.Opacity</c> as the inverse of
+    /// current wallpaper coverage to prevent any accent bleed-through
+    /// during fade-in seams. That bleed-through is already prevented at
+    /// the source: the empty-front fade-in path snaps the target bitmap
+    /// onto the front at <c>Opacity = 1</c> in a single frame instead
+    /// of ramping (see <see cref="AnimateWallpaperTransition"/>), and the
+    /// back-ramp path pins the front opaque throughout.
+    /// <para>
+    /// Keeping the accent permanently masked below the wallpaper layer
+    /// (even when the wallpaper layer reports <c>Opacity = 1</c>) visibly
+    /// flattened screens under the Light accent: at scaled-bitmap edge
+    /// AA, letterbox bands in <c>Stretch.Uniform</c> fit modes, and the
+    /// faint sub-pixel transparency along the wallpaper rectangle's
+    /// outline, the accent vignette used to lift the composite and give
+    /// the Light theme its luminous quality. Masking it to 0 killed that
+    /// lift - <c>LoginScreen</c> in particular read as "duller" under
+    /// Light. The accent backdrop is now always visible underneath the
+    /// wallpaper, restoring the original look while the snap-on-fade-in
+    /// keeps the ghost gone.
+    /// </para>
+    /// <para>
+    /// Method kept as a no-op so the existing call sites in the
+    /// animation paths don't need surgery; if a future regression
+    /// surfaces an accent ghost we have one place to re-enable the
+    /// inverse-mask behaviour.
+    /// </para>
+    /// </summary>
+    private void RefreshAccentMask()
+    {
+        // Intentionally empty - see XML doc.
+    }
+
     protected DOSIScreen()
     {
         HorizontalAlignment = Avalonia.Layout.HorizontalAlignment.Stretch;
@@ -167,6 +252,14 @@ public abstract class DOSIScreen : UserControl
         // Subscribe/unsubscribe properly to avoid memory leaks
         AttachedToVisualTree += OnAttachedToVisualTree;
         DetachedFromVisualTree += OnDetachedFromVisualTree;
+
+        // Initial accent-mask sync so the backdrop opacity is correctly
+        // inverted against the starting wallpaper coverage. Without this,
+        // a screen born with no resolvable bitmap would render with both
+        // the (full) accent vignette AND a transparent wallpaper layer
+        // until the first opacity mutation - the same composite that
+        // produces the accent ghost during transitions.
+        RefreshAccentMask();
     }
 
     private void OnAttachedToVisualTree(object? sender, VisualTreeAttachmentEventArgs e)
@@ -285,6 +378,7 @@ public abstract class DOSIScreen : UserControl
     {
         _accentBackdrop.IsVisible = visible;
         _wallpaperHost.IsVisible = visible;
+        if (visible) RefreshAccentMask();
     }
 
     /// <summary>
@@ -349,6 +443,7 @@ public abstract class DOSIScreen : UserControl
         _wallpaperFront.Opacity = bitmap != null ? 1 : 0;
         SetLayerSource(_wallpaperBack, null);
         _wallpaperBack.Opacity = 0;
+        RefreshAccentMask();
     }
 
     /// <summary>
@@ -375,7 +470,7 @@ public abstract class DOSIScreen : UserControl
     /// <paramref name="targetBitmap"/>. Pass <c>null</c> to fade back to the
     /// accent-only vignette.
     /// </summary>
-    private void AnimateWallpaperTransition(Bitmap? targetBitmap)
+    protected void AnimateWallpaperTransition(Bitmap? targetBitmap)
     {
         // No change? Nothing to animate.
         if (ReferenceEquals(GetLayerSource(_wallpaperFront), targetBitmap) &&
@@ -388,38 +483,117 @@ public abstract class DOSIScreen : UserControl
 
         var duration = WallpaperTransitionDuration.TotalMilliseconds;
         var startTime = DateTime.UtcNow;
+        bool broadcaster = IsWallpaperBroadcaster;
+
+        // Helper: fire a per-frame sync packet with the current
+        // opacities + bitmap. Secondaries apply these values directly,
+        // so the master and every listener show the same coverage on
+        // the same compositor frame.
+        void Emit(double frontOp, double backOp, bool useFront, bool isFinal)
+        {
+            if (!broadcaster) return;
+            try
+            {
+                WallpaperSyncBroadcast?.Invoke(this,
+                    new WallpaperSyncFrame(targetBitmap, frontOp, backOp, useFront, isFinal));
+            }
+            catch { /* never let a listener break the primary transition */ }
+        }
 
         if (targetBitmap != null)
         {
-            // Fading INTO an image: stage it on the back layer at opacity 0
-            // and ramp it up over the front (which keeps showing whatever it
-            // had until we swap on completion).
-            SetLayerSource(_wallpaperBack, targetBitmap);
-            _wallpaperBack.Opacity = 0;
+            // FRONT-COVERAGE GUARANTEE during a fade-in:
+            //
+            // The naive "stage target on back, ramp back 0->1, leave front
+            // alone" plan only holds if the front is currently FULLY opaque
+            // with a real bitmap. Several paths violate that assumption:
+            //   * SetWallpaperFrontSourceImmediate(null) leaves front
+            //     Opacity=0 with source=null,
+            //   * a previous fade-out branch completed and left front=0,
+            //   * a screen's initial ResolveWallpaperBitmap returned null.
+            // Whenever the front is empty/transparent at the start of a
+            // fade-in, the back ramping 0->1 visually composites OVER the
+            // accent vignette below the wallpaper host - which is exactly
+            // the "accent color flashes during the wallpaper transition"
+            // symptom.
+            //
+            // Fix: when the front carries a visible bitmap, pin it at 1
+            // and run a true cross-fade on the back. When the front is
+            // EMPTY, skip the back-layer staging entirely - put the target
+            // straight on the front and ramp the FRONT's own opacity to 1.
+            bool frontHasImage = GetLayerSource(_wallpaperFront) != null
+                                 && _wallpaperFront.Opacity > 0.001;
 
-            var startBack = 0d;
-            const double targetBack = 1d;
-
-            _wallpaperAnimTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
-            _wallpaperAnimTimer.Tick += (_, _) =>
+            if (frontHasImage)
             {
-                var t = Math.Clamp((DateTime.UtcNow - startTime).TotalMilliseconds / duration, 0d, 1d);
-                var eased = 1 - Math.Pow(1 - t, 3); // ease-out cubic
-                _wallpaperBack.Opacity = startBack + (targetBack - startBack) * eased;
+                _wallpaperFront.Opacity = 1; // defensive: kill any lingering partial state
+                SetLayerSource(_wallpaperBack, targetBitmap);
+                _wallpaperBack.Opacity = 0;
+                RefreshAccentMask();
 
-                if (t >= 1d)
+                Emit(frontOp: 1, backOp: 0, useFront: false, isFinal: false);
+
+                _wallpaperAnimTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
+                _wallpaperAnimTimer.Tick += (_, _) =>
                 {
-                    _wallpaperAnimTimer?.Stop();
-                    _wallpaperAnimTimer = null;
-                    // Promote back -> front and reset back so subsequent
-                    // transitions start from a clean slate.
-                    SetLayerSource(_wallpaperFront, targetBitmap);
-                    _wallpaperFront.Opacity = 1;
-                    SetLayerSource(_wallpaperBack, null);
-                    _wallpaperBack.Opacity = 0;
-                }
-            };
-            _wallpaperAnimTimer.Start();
+                    var t = Math.Clamp((DateTime.UtcNow - startTime).TotalMilliseconds / duration, 0d, 1d);
+                    var eased = 1 - Math.Pow(1 - t, 3); // ease-out cubic
+                    _wallpaperBack.Opacity = eased;
+                    RefreshAccentMask();
+
+                    if (t < 1d)
+                    {
+                        Emit(frontOp: 1, backOp: eased, useFront: false, isFinal: false);
+                    }
+                    else
+                    {
+                        _wallpaperAnimTimer?.Stop();
+                        _wallpaperAnimTimer = null;
+                        SetLayerSource(_wallpaperFront, targetBitmap);
+                        _wallpaperFront.Opacity = 1;
+                        SetLayerSource(_wallpaperBack, null);
+                        _wallpaperBack.Opacity = 0;
+                        RefreshAccentMask();
+                        Emit(frontOp: 1, backOp: 0, useFront: false, isFinal: true);
+                    }
+                };
+                _wallpaperAnimTimer.Start();
+            }
+            else
+            {
+                // Front is currently invisible/empty (e.g. after a fade
+                // back to accent-only, or first attach with no resolvable
+                // bitmap).
+                //
+                // GHOST ELIMINATION: do NOT ramp the front's opacity from
+                // 0 -> 1 here. While the front is at intermediate opacity
+                // (say 0.4), the compositor renders:
+                //     0.4 * wallpaper + 0.6 * accent-vignette
+                // ...so the user's accent colour visibly bleeds through
+                // the wallpaper for the entire duration of the ramp -
+                // that's the "slight accent ghost" the user reported. No
+                // amount of easing can remove it; it's straight alpha math.
+                //
+                // The clean fix is to skip the ramp entirely for this
+                // path and SNAP the target bitmap onto the front at full
+                // opacity. The wallpaper appears in a single frame with
+                // no accent bleed-through. (The "elegant cross-fade"
+                // intent is preserved for the common path - desktop blur
+                // toggles, screen handoffs via
+                // SetWallpaperFrontSourceImmediate, etc - because that
+                // path takes the frontHasImage=true branch above where
+                // the front is pinned opaque throughout.)
+                //
+                // Followers receive a single final sync frame so every
+                // monitor flips in the same compositor tick - no
+                // per-monitor drift, no ghost on any display.
+                SetLayerSource(_wallpaperFront, targetBitmap);
+                SetLayerSource(_wallpaperBack, null);
+                _wallpaperFront.Opacity = 1;
+                _wallpaperBack.Opacity = 0;
+                RefreshAccentMask();
+                Emit(frontOp: 1, backOp: 0, useFront: true, isFinal: true);
+            }
         }
         else
         {
@@ -428,15 +602,24 @@ public abstract class DOSIScreen : UserControl
             var startFront = _wallpaperFront.Opacity;
             var startBack = _wallpaperBack.Opacity;
 
+            Emit(frontOp: startFront, backOp: startBack, useFront: false, isFinal: false);
+
             _wallpaperAnimTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
             _wallpaperAnimTimer.Tick += (_, _) =>
             {
                 var t = Math.Clamp((DateTime.UtcNow - startTime).TotalMilliseconds / duration, 0d, 1d);
                 var eased = t * t; // ease-in quad
-                _wallpaperFront.Opacity = startFront * (1 - eased);
-                _wallpaperBack.Opacity = startBack * (1 - eased);
+                var fop = startFront * (1 - eased);
+                var bop = startBack * (1 - eased);
+                _wallpaperFront.Opacity = fop;
+                _wallpaperBack.Opacity = bop;
+                RefreshAccentMask();
 
-                if (t >= 1d)
+                if (t < 1d)
+                {
+                    Emit(frontOp: fop, backOp: bop, useFront: false, isFinal: false);
+                }
+                else
                 {
                     _wallpaperAnimTimer?.Stop();
                     _wallpaperAnimTimer = null;
@@ -444,9 +627,74 @@ public abstract class DOSIScreen : UserControl
                     _wallpaperFront.Opacity = 0;
                     SetLayerSource(_wallpaperBack, null);
                     _wallpaperBack.Opacity = 0;
+                    RefreshAccentMask();
+                    Emit(frontOp: 0, backOp: 0, useFront: false, isFinal: true);
                 }
             };
             _wallpaperAnimTimer.Start();
+        }
+    }
+
+    /// <summary>
+    /// Applies a single per-frame wallpaper sync packet to this screen.
+    /// Called by follower screens (e.g. <c>ExtensionScreen</c>) from the
+    /// master's tick broadcast so every monitor's compositor frame shows
+    /// the IDENTICAL coverage with zero local timer drift.
+    /// </summary>
+    protected void ApplyWallpaperSyncFrame(WallpaperSyncFrame frame)
+    {
+        // Kill any local timer that was still running from a previous
+        // (non-synced) path so we can't have two writers fighting over
+        // the same layers.
+        _wallpaperAnimTimer?.Stop();
+        _wallpaperAnimTimer = null;
+
+        if (frame.Target != null)
+        {
+            // Mode parity with the broadcaster: front-ramp vs back-ramp.
+            // Stage the target on whichever layer the master is animating
+            // so the bitmap arrives synchronously with the first ramped
+            // opacity > 0.
+            if (frame.UseFrontForTarget)
+            {
+                if (!ReferenceEquals(GetLayerSource(_wallpaperFront), frame.Target))
+                    SetLayerSource(_wallpaperFront, frame.Target);
+                if (GetLayerSource(_wallpaperBack) != null)
+                    SetLayerSource(_wallpaperBack, null);
+            }
+            else
+            {
+                // Master is back-ramping: front shows the OUTGOING bitmap,
+                // back shows the target. Pin the front opaque (defensive)
+                // and stage target on back.
+                if (!ReferenceEquals(GetLayerSource(_wallpaperBack), frame.Target))
+                    SetLayerSource(_wallpaperBack, frame.Target);
+            }
+        }
+
+        _wallpaperFront.Opacity = frame.FrontOpacity;
+        _wallpaperBack.Opacity = frame.BackOpacity;
+        RefreshAccentMask();
+
+        if (frame.IsFinal)
+        {
+            // Settle into the steady-state the master ends in: target on
+            // front at 1, back cleared. Skipped when fading to null - the
+            // ramps already drove both to 0 above and we want to keep them
+            // there (no bitmap painted).
+            if (frame.Target != null)
+            {
+                SetLayerSource(_wallpaperFront, frame.Target);
+                _wallpaperFront.Opacity = 1;
+                SetLayerSource(_wallpaperBack, null);
+                _wallpaperBack.Opacity = 0;
+            }
+            else
+            {
+                SetLayerSource(_wallpaperFront, null);
+                SetLayerSource(_wallpaperBack, null);
+            }
+            RefreshAccentMask();
         }
     }
 

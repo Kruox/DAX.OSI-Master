@@ -1009,6 +1009,18 @@ public class WebViewWrapper : UserControl, IDisposable
     }
     function clickHandler(e) {
         try {
+            // Bail on right-button events. auxclick fires for both middle
+            // (button 1) and right (button 2); without this guard a
+            // right-click on a target=_blank anchor would simultaneously
+            // raise dosi-contextmenu (from the separate contextmenu
+            // handler) AND dosi-newwindow here, so the host opens a
+            // new browser window every time the user tries to bring up
+            // the right-click menu over a link/image - the
+            // 'right-click sometimes auto-opens a new window for no
+            // reason' bug. Right-click is contextmenu-only; new-window
+            // is left-click + modifier, middle-click, or a programmatic
+            // window.open (handled separately above).
+            if (e.button === 2) return;
             var anchor = e.target && e.target.closest ? e.target.closest('a[href]') : null;
             if (!shouldIntercept(e, anchor)) return;
             e.preventDefault();
@@ -1357,12 +1369,36 @@ public class WebViewWrapper : UserControl, IDisposable
     /// and republishes it as a strongly-typed <see cref="ContextMenuRequested"/>
     /// event. Silently ignores anything that isn't our own message so we
     /// coexist with other JS bridges on the page.
+    /// <para>
+    /// THREADING: <c>WebMessageReceived</c> is delivered on the WebView2
+    /// COM apartment thread, NOT the Avalonia UI thread. Every downstream
+    /// event raised here ends up touching Avalonia visuals (opening
+    /// context menus, opening new browser windows, updating scroll
+    /// state), and those mutations MUST happen on the UI thread or we
+    /// hit "The calling thread cannot access this object because a
+    /// different thread owns it." Worse, when that exception unwinds
+    /// inside the bridge it can leave the message queue in a state
+    /// where the next right-click silently routes its payload to the
+    /// NewWindowRequested branch instead of the contextmenu branch -
+    /// which is the "right-click sometimes auto-opens a new window for
+    /// no reason" symptom. Marshalling the entire decode + dispatch
+    /// onto the UI thread fixes both bugs in one place.
+    /// </para>
     /// </summary>
     private void OnWebMessageReceived(object? sender, WebMessageReceivedEventArgs e)
     {
         var payload = e.Body;
         if (string.IsNullOrEmpty(payload)) return;
 
+        // Capture the payload string (a value type for our purposes) and
+        // post the heavy work onto the UI thread. Post (not InvokeAsync)
+        // because we don't need to await completion - the JS side
+        // doesn't wait for an ack.
+        Avalonia.Threading.Dispatcher.UIThread.Post(() => HandleWebMessage(payload));
+    }
+
+    private void HandleWebMessage(string payload)
+    {
         try
         {
             using var doc = JsonDocument.Parse(payload);
@@ -1446,7 +1482,7 @@ public class WebViewWrapper : UserControl, IDisposable
         {
             _webView.Source = new Uri(url);
         }
-        catch (UriFormatException) when (!url.StartsWith("http://") && !url.StartsWith("https://"))
+        catch (UriFormatException) when (!url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) && !url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
         {
             try
             {
