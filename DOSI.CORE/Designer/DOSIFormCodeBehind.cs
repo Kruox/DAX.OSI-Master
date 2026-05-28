@@ -70,7 +70,8 @@ public static class DOSIFormCodeBehind
                 }
                 else
                 {
-                    sb.AppendLine("        // Write your code here.");
+                    foreach (var line in DefaultBodyFor("Form", evName).Split('\n'))
+                        sb.Append("        ").AppendLine(line.TrimEnd());
                 }
                 sb.AppendLine("    }");
             }
@@ -116,7 +117,9 @@ public static class DOSIFormCodeBehind
                 }
                 else
                 {
-                    sb.AppendLine("        // Write your code here.");
+                    var hint = def.Type + " '" + def.Name + "'";
+                    foreach (var line in DefaultBodyFor(hint, evName).Split('\n'))
+                        sb.Append("        ").AppendLine(line.TrimEnd());
                 }
                 sb.AppendLine("    }");
             }
@@ -174,9 +177,40 @@ public static class DOSIFormCodeBehind
           .Append(sig.SenderType).Append(" sender, ")
           .Append(sig.ArgsType).AppendLine(" e)");
         sb.AppendLine("    {");
-        sb.AppendLine("        // Write your code here.");
+        foreach (var line in DefaultBodyFor(ownerHint, eventName).Split('\n'))
+            sb.Append("        ").AppendLine(line.TrimEnd());
         sb.AppendLine("    }");
         return sb.ToString();
+    }
+
+    /// <summary>
+    /// Per-(control, event) opinionated starter body. Beats a generic
+    /// "Write your code here." comment because the user can immediately
+    /// see HOW to interact with sender / args - the most common friction
+    /// point reported on the visual designer.
+    /// </summary>
+    private static string DefaultBodyFor(string ownerHint, string eventName)
+    {
+        // Owner hint shape is "&lt;Type&gt; '&lt;name&gt;'" for control events,
+        // and just "Form" for form-level events. We only need the type
+        // prefix to specialise the stub.
+        bool isButton = ownerHint.StartsWith("DOSIButton", StringComparison.OrdinalIgnoreCase);
+        bool isLabel = ownerHint.StartsWith("DOSILabel", StringComparison.OrdinalIgnoreCase);
+        bool isTextBox = ownerHint.StartsWith("DOSITextBox", StringComparison.OrdinalIgnoreCase);
+        bool isSlider = ownerHint.StartsWith("DOSISlider", StringComparison.OrdinalIgnoreCase);
+        bool isForm = ownerHint.Equals("Form", StringComparison.OrdinalIgnoreCase);
+
+        return (isForm, eventName.ToLowerInvariant()) switch
+        {
+            (true,  "load")    => "// Fires once after the form is shown.\n// Write initial setup here.",
+            (true,  "closing") => "// Set e.Cancel = true to prevent the form from closing.",
+            (true,  "closed")  => "// The form has closed. Release any resources here.",
+            _ when isButton    => "var btn = (DOSIButton)sender;\n// Toast example - shown on whichever DOSI screen is active.\n// (Use the parameterless DOSIPopNotification.Show(text) overload;\n//  the host-aware overload requires a Panel you don't have here.)\nDOSIPopNotification.Show($\"You clicked '{btn.Text}'\");",
+            _ when isLabel     => "var label = (DOSILabel)sender;\n// The label was clicked. Read or change label.Text here.\nDOSIPopNotification.Show($\"Label clicked: '{label.Text}'\");",
+            _ when isTextBox   => "var box = (DOSITextBox)sender;\n// box.Text is the current contents.\nSystem.Diagnostics.Debug.WriteLine(box.Text);",
+            _ when isSlider    => "var slider = (DOSISlider)sender;\n// e is the new value (double).\nSystem.Diagnostics.Debug.WriteLine($\"Slider: {(int)e}\");",
+            _ => "// Write your code here."
+        };
     }
 
     private static (string SenderType, string ArgsType)? FormSignatureFor(string evName) =>

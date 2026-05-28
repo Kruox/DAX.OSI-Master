@@ -290,41 +290,42 @@ public sealed class DOSIImageViewer : DOSIWindow
     {
         if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return;
 
-        Bitmap? next;
-        try
-        {
-            using var stream = File.OpenRead(path);
-            next = new Bitmap(stream);
-        }
-        catch
-        {
-            // Decode failure - leave existing image (if any) untouched.
-            return;
-        }
+        // Decode off the UI thread via the shared ImageCache so a
+        // 24 MP+ phone photo doesn't freeze the dispatcher for several
+        // hundred ms (which is exactly the lag the user reported when
+        // clicking a large image in DOSIFileExplorer). The cache also
+        // ensures the second view of the same file is instant.
+        DOSI.CORE.ImageManagement.ImageCache.LoadAsync(
+            path,
+            DOSI.CORE.ImageManagement.ImageCache.ViewMaxDimension,
+            next =>
+            {
+                if (next == null) return; // decode failure - keep prior image
 
-        // Dispose the old bitmap so we don't accumulate decoded pixel data
-        // when the user pages through a folder of large photos.
-        _bitmap?.Dispose();
-        _bitmap = next;
-        _currentPath = path;
-        _imageView.Source = _bitmap;
-        _emptyState.IsVisible = false;
+                // The previous bitmap was potentially shared via the cache,
+                // so don't dispose it here - the cache owns its lifetime.
+                _bitmap = next;
+                _currentPath = path;
+                _imageView.Source = _bitmap;
+                _emptyState.IsVisible = false;
 
-        // Reset transform state for the new image.
-        _rotate.Angle = 0;
-        _translate.X = 0;
-        _translate.Y = 0;
+                // Reset transform state for the new image.
+                _rotate.Angle = 0;
+                _translate.X = 0;
+                _translate.Y = 0;
 
-        Title = $"{Path.GetFileName(path)} - Image Viewer";
+                Title = $"{Path.GetFileName(path)} - Image Viewer";
 
-        // Build the sibling list lazily on first navigation request rather
-        // than eagerly here - opening a folder with thousands of images
-        // shouldn't pay the directory-enumeration cost up front.
-        _siblings = new List<string>();
-        _siblingIndex = -1;
+                // Build the sibling list lazily on first navigation request
+                // rather than eagerly here - opening a folder with thousands
+                // of images shouldn't pay the directory-enumeration cost up
+                // front.
+                _siblings = new List<string>();
+                _siblingIndex = -1;
 
-        SetFitMode(true);
-        UpdateUiState();
+                SetFitMode(true);
+                UpdateUiState();
+            });
     }
 
     // =====================================================================

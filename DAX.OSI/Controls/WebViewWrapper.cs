@@ -32,6 +32,25 @@ public sealed class WebViewContextMenuRequestedEventArgs : EventArgs
 }
 
 /// <summary>
+/// Payload for <see cref="WebViewWrapper.DownloadRequested"/>. Carries the
+/// information the page's JS bridge captured at the click site so the host
+/// can show a custom DOSI download flyout, route the bytes to the user's
+/// Downloads folder, and skip the renderer's own (un-themed) save dialog.
+/// </summary>
+public sealed class WebViewDownloadRequestedEventArgs : EventArgs
+{
+    /// <summary>Absolute URL of the resource the user asked to download.</summary>
+    public required string Url { get; init; }
+    /// <summary>Filename suggested by the page (<c>&lt;a download="..."&gt;</c>
+    /// attribute, the URL's last path segment, or a generated fallback).</summary>
+    public required string SuggestedFileName { get; init; }
+    /// <summary>Page URL that initiated the download - used as the HTTP
+    /// <c>Referer</c> header so sites that require a same-origin referrer
+    /// (Steam, CDNs, attachment endpoints) still serve the file.</summary>
+    public string? Referer { get; init; }
+}
+
+/// <summary>
 /// Why the WebView is currently hidden behind the placeholder card. Drives
 /// the chip color, headline, and copy so an inactive / dragging window reads
 /// as a friendly status message instead of a hard error page.
@@ -165,6 +184,17 @@ public class WebViewWrapper : UserControl, IDisposable
     /// WebKitGTK) supports a host-page postMessage channel.
     /// </summary>
     public event EventHandler<WebViewContextMenuRequestedEventArgs>? ContextMenuRequested;
+
+    /// <summary>
+    /// Raised when the user clicks something the in-page JS bridge classifies
+    /// as a download (an <c>&lt;a download&gt;</c> anchor, a link to a known
+    /// downloadable file extension, etc). The wrapper has already cancelled
+    /// the renderer's own download flow, so the host owns the entire UX:
+    /// show a popup, fetch the bytes, write them to the user's Downloads
+    /// folder, and surface progress / completion. No native save-as dialog
+    /// ever appears.
+    /// </summary>
+    public event EventHandler<WebViewDownloadRequestedEventArgs>? DownloadRequested;
 
     /// <summary>
     /// Raised when the page (or host F11 logic) requests a fullscreen state
@@ -855,6 +885,199 @@ public class WebViewWrapper : UserControl, IDisposable
 })();
 ";
 
+    // =====================================================================
+    // Download interception bridge
+    //
+    // Captures clicks the page would otherwise turn into a renderer download
+    // (anchor with a 'download' attribute, link with a downloadable file
+    // extension, etc), cancels the click, and posts the resolved URL +
+    // suggested filename back to the host. The host owns the actual fetch
+    // and writes the bytes into the signed-in user's Downloads folder via
+    // a DOSI flyout - so the user never sees WebView2's chrome-styled save
+    // dialog or its bottom-bar download shelf.
+    //
+    // Heuristic (matches Chrome / Edge behaviour):
+    //   * <a download[="name"]>           -> always treated as a download
+    //   * href with a known file extension -> treated as a download
+    //   * everything else                  -> normal navigation, untouched
+    //
+    // Modifier keys (Ctrl, Shift, Meta, middle-click) are explicitly NOT
+    // hijacked - those still flow into the new-window bridge so power
+    // users keep their open-in-new-tab muscle memory.
+    //
+    // Extension list is intentionally lean: archives, installers, media,
+    // documents, fonts. False positives are cheap (user still gets a
+    // download popup with the file) and false negatives are easy to add.
+    // =====================================================================
+
+    private const string DownloadBridgeScript = @"
+(function() {
+    if (window.__dosiDlInstalled) return;
+    window.__dosiDlInstalled = true;
+    var DL_EXT = /\.(zip|rar|7z|tar|gz|tgz|bz2|xz|iso|dmg|pkg|deb|rpm|appimage|exe|msi|msix|apk|ipa|jar|war|aar|nupkg|whl|crx|xpi|cab|mp3|wav|flac|ogg|opus|m4a|mp4|m4v|mov|mkv|avi|webm|wmv|3gp|pdf|epub|mobi|azw3|djvu|psd|ai|svgz|sketch|fig|blend|fbx|obj|stl|gltf|glb|usdz|csv|xls|xlsx|xlsm|doc|docx|ppt|pptx|odt|ods|odp|rtf|txt|json|xml|yaml|yml|sql|db|sqlite|bak|log|ttf|otf|woff|woff2|eot|bin|img|vhd|vhdx|ova|ovf)(\?.*)?$/i;
+    // Cache HEAD probes by URL so a re-click on the same link doesn't
+    // re-issue the network probe. We only need a positive/negative bit.
+    var headCache = Object.create(null);
+    function send(payload) {
+        var msg;
+        try { msg = JSON.stringify(payload); } catch (e) { return; }
+        try { if (window.chrome && window.chrome.webview && window.chrome.webview.postMessage) { window.chrome.webview.postMessage(msg); return; } } catch (e) {}
+        try {
+            if (window.webkit && window.webkit.messageHandlers) {
+                for (var k in window.webkit.messageHandlers) {
+                    var h = window.webkit.messageHandlers[k];
+                    if (h && typeof h.postMessage === 'function') { h.postMessage(msg); return; }
+                }
+            }
+        } catch (e) {}
+        try { if (typeof window.PostMessageBridge === 'function') { window.PostMessageBridge(msg); return; } } catch (e) {}
+    }
+    function resolveUrl(href) {
+        if (!href) return null;
+        try { return new URL(href, document.baseURI || location.href).href; }
+        catch (e) { return String(href); }
+    }
+    function fileNameFromUrl(u) {
+        try {
+            var url = new URL(u, document.baseURI || location.href);
+            var seg = url.pathname.split('/').filter(function(s){ return s.length; }).pop();
+            return seg ? decodeURIComponent(seg) : null;
+        } catch (e) { return null; }
+    }
+    function fileNameFromDisposition(cd) {
+        if (!cd) return null;
+        // RFC 6266 filename* (UTF-8) takes precedence over filename=
+        var star = /filename\*=(?:UTF-8''|)([^;]+)/i.exec(cd);
+        if (star && star[1]) {
+            try { return decodeURIComponent(star[1].trim().replace(/^""|""$/g, '')); }
+            catch (e) {}
+        }
+        var basic = /filename=""?([^"";]+)""?/i.exec(cd);
+        if (basic && basic[1]) return basic[1].trim();
+        return null;
+    }
+    function isDownloadableByUrl(anchor, href) {
+        if (!anchor || !href) return false;
+        // Explicit download attribute -> always a download.
+        if (anchor.hasAttribute && anchor.hasAttribute('download')) return true;
+        // Known file extension -> treat as download.
+        try {
+            var url = new URL(href, document.baseURI || location.href);
+            if (!/^https?:$/i.test(url.protocol)) return false;
+            return DL_EXT.test(url.pathname);
+        } catch (e) { return false; }
+    }
+    // Async fallback: when the URL doesn't match the extension list,
+    // fire a HEAD probe and let the response tell us whether the server
+    // intends this URL to be saved (Content-Disposition: attachment, or
+    // a non-displayable Content-Type like application/octet-stream).
+    // Same-origin probes only - cross-origin would 403/CORS most of
+    // the time and we don't want to spend time waiting on doomed
+    // requests. The fallback is gated to http(s) protocols.
+    function probeDownloadable(href) {
+        if (headCache[href] !== undefined) return Promise.resolve(headCache[href]);
+        var url;
+        try { url = new URL(href, document.baseURI || location.href); }
+        catch (e) { return Promise.resolve(null); }
+        if (!/^https?:$/i.test(url.protocol)) return Promise.resolve(null);
+        if (url.origin !== location.origin) return Promise.resolve(null);
+
+        return fetch(href, { method: 'HEAD', credentials: 'include', redirect: 'follow' })
+            .then(function (resp) {
+                if (!resp || !resp.ok) { headCache[href] = null; return null; }
+                var cd = resp.headers.get('content-disposition') || '';
+                var ct = (resp.headers.get('content-type') || '').toLowerCase();
+                var looksAttachment = /attachment/i.test(cd);
+                var binaryType =
+                    ct.indexOf('application/octet-stream') === 0 ||
+                    ct.indexOf('application/zip') === 0 ||
+                    ct.indexOf('application/pdf') === 0 ||
+                    ct.indexOf('application/x-msdownload') === 0 ||
+                    ct.indexOf('application/x-msi') === 0 ||
+                    ct.indexOf('application/vnd.android.package-archive') === 0 ||
+                    ct.indexOf('application/x-apple-diskimage') === 0;
+                if (!looksAttachment && !binaryType) { headCache[href] = null; return null; }
+                var name = fileNameFromDisposition(cd) || fileNameFromUrl(href) || 'download';
+                var result = { name: name };
+                headCache[href] = result;
+                return result;
+            })
+            .catch(function () { headCache[href] = null; return null; });
+    }
+    function handler(e) {
+        // Skip non-primary buttons and any modifier - those go through
+        // new-window / context-menu paths.
+        if (e.button !== 0) return;
+        if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey) return;
+        var anchor = e.target && e.target.closest ? e.target.closest('a') : null;
+        if (!anchor) return;
+        var href = anchor.href;
+        if (!href) return;
+        // Fast path: URL pattern says download.
+        if (isDownloadableByUrl(anchor, href)) {
+            e.preventDefault();
+            e.stopPropagation();
+            var resolved = resolveUrl(href);
+            var dlAttr = anchor.getAttribute && anchor.getAttribute('download');
+            var suggested = (dlAttr && dlAttr.trim()) ? dlAttr.trim() : fileNameFromUrl(resolved);
+            send({
+                type: 'dosi-download',
+                url: resolved,
+                filename: suggested || 'download',
+                referer: location.href
+            });
+            return false;
+        }
+        // Slow path: probe the server. We can't synchronously cancel
+        // and then asynchronously decide - the engine will have already
+        // started the navigation. So if the probe is unresolved, just
+        // let the navigation proceed; if a previous probe of the same
+        // href came back positive we suppress and forward to the host.
+        var cached = headCache[anchor.href];
+        if (cached && cached.name) {
+            e.preventDefault();
+            e.stopPropagation();
+            send({
+                type: 'dosi-download',
+                url: resolveUrl(href),
+                filename: cached.name,
+                referer: location.href
+            });
+            return false;
+        }
+        // Warm the cache so a second click hits the fast path above.
+        try { probeDownloadable(href); } catch (ignore) {}
+    }
+    try { document.addEventListener('click', handler, { capture: true, passive: false }); }
+    catch (e) { document.addEventListener('click', handler, true); }
+
+    // Mouse-over warm-up: when the user hovers a link for >120 ms,
+    // pre-probe it so by the time they click we already know whether
+    // the server wants it downloaded. Massively improves the hit rate
+    // for sites whose download URLs don't carry a file extension.
+    var hoverTimer = null;
+    var hoverHref = null;
+    document.addEventListener('mouseover', function (e) {
+        var a = e.target && e.target.closest ? e.target.closest('a[href]') : null;
+        if (!a) return;
+        var href = a.href;
+        if (!href || isDownloadableByUrl(a, href)) return;
+        if (headCache[href] !== undefined) return;
+        if (hoverTimer) clearTimeout(hoverTimer);
+        hoverHref = href;
+        hoverTimer = setTimeout(function () {
+            if (hoverHref === href) {
+                try { probeDownloadable(href); } catch (ignore) {}
+            }
+        }, 120);
+    }, true);
+    document.addEventListener('mouseout', function () {
+        if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
+        hoverHref = null;
+    }, true);
+})();
+";
+
     /// <summary>
     /// Best-effort: subscribe to the wrapper's JS-&gt;host postMessage channel.
     /// Wrapped in a try block because the event names belong to the
@@ -891,6 +1114,7 @@ public class WebViewWrapper : UserControl, IDisposable
             await _webView.InvokeScript(ScrollBridgeScript);
             await _webView.InvokeScript(NewWindowBridgeScript);
             await _webView.InvokeScript(FullScreenBridgeScript);
+            await _webView.InvokeScript(DownloadBridgeScript);
             await TryApplyZoomAsync();
         }
         catch { /* page may not be ready yet, or script API unavailable */ }
@@ -1439,6 +1663,27 @@ public class WebViewWrapper : UserControl, IDisposable
                 bool enter = root.TryGetProperty("enter", out var enterProp) &&
                              enterProp.ValueKind == JsonValueKind.True;
                 FullScreenChangeRequested?.Invoke(this, enter);
+                return;
+            }
+
+            if (msgType == "dosi-download")
+            {
+                string? dlUrl = root.TryGetProperty("url", out var dlUrlProp) &&
+                                dlUrlProp.ValueKind == JsonValueKind.String
+                    ? dlUrlProp.GetString() : null;
+                if (string.IsNullOrEmpty(dlUrl)) return;
+                string? dlName = root.TryGetProperty("filename", out var dlNameProp) &&
+                                 dlNameProp.ValueKind == JsonValueKind.String
+                    ? dlNameProp.GetString() : null;
+                string? dlReferer = root.TryGetProperty("referer", out var dlRefProp) &&
+                                    dlRefProp.ValueKind == JsonValueKind.String
+                    ? dlRefProp.GetString() : null;
+                DownloadRequested?.Invoke(this, new WebViewDownloadRequestedEventArgs
+                {
+                    Url = dlUrl,
+                    SuggestedFileName = string.IsNullOrWhiteSpace(dlName) ? "download" : dlName,
+                    Referer = dlReferer
+                });
                 return;
             }
 

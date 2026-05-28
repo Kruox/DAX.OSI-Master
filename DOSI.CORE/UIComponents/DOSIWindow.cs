@@ -304,6 +304,17 @@ public class DOSIWindow : UserControl
     }
 
     /// <summary>
+    /// The visual that represents the actual window UI: chrome (title bar
+    /// + traffic-light buttons), content area, accent border, and rounded
+    /// corners. Excludes the 50 px shadow gutter that surrounds the
+    /// window for drop-shadow rendering. Exposed for snapshot consumers
+    /// (the taskbar live-preview popover) so they can capture a clean
+    /// rectangle of "just the window" without the surrounding shadow
+    /// margin that would otherwise force a tiny letterboxed thumbnail.
+    /// </summary>
+    internal Visual WindowVisual => _windowBorder;
+
+    /// <summary>
     /// True while this window is currently in immersive fullscreen
     /// (filling the entire DOSI desktop canvas, with chrome hidden).
     /// </summary>

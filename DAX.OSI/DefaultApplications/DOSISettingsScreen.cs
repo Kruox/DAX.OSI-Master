@@ -1029,7 +1029,13 @@ public class DOSISettingsScreen : DOSIWindow
             foreach (var w in wm.AvailableWallpapers)
             {
                 var captured = w;
-                var bmp = wm.LoadBitmap(captured.Key);
+                // Use the thumbnail cache, NOT LoadBitmap - LoadBitmap
+                // returns the full-resolution desktop bitmap (potentially
+                // tens of MB per image as a live GPU texture). With even a
+                // handful of custom wallpapers that pinned the compositor's
+                // texture budget hard enough to lag the whole UI - which is
+                // exactly what users hit after picking phone-shot photos.
+                var bmp = wm.LoadThumbnail(captured.Key);
                 var tile = BuildWallpaperTile(
                     captured.DisplayName,
                     bmp,

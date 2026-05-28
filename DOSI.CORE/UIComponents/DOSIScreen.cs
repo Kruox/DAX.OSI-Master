@@ -186,15 +186,23 @@ public abstract class DOSIScreen : UserControl
             VerticalAlignment = Avalonia.Layout.VerticalAlignment.Stretch
         };
 
-        // Use high-quality bitmap interpolation for the backdrop. The
-        // wallpaper is the most prominent visual on screen, especially when
-        // stretched UniformToFill across a 4K desktop - the previous
-        // LowQuality setting saved a few ms per composite when translucent
-        // windows were dragged on top, but produced visibly blurred / muddy
-        // output at non-integer scales (most obvious with portrait
-        // wallpapers stretched to a landscape display). Quality wins.
-        RenderOptions.SetBitmapInterpolationMode(_wallpaperFront, BitmapInterpolationMode.HighQuality);
-        RenderOptions.SetBitmapInterpolationMode(_wallpaperBack, BitmapInterpolationMode.HighQuality);
+        // Bilinear (LowQuality) interpolation for the wallpaper layers. The
+        // historical comment that lived here claimed HighQuality was needed
+        // to avoid a "blurred / muddy" look at non-integer scales - but that
+        // was written when the source bitmap was the raw photo. Today the
+        // wallpaper pipeline pre-bakes a Gaussian blur into the cached
+        // bitmap AND caps the cached dimension at 4K (see WallpaperManager),
+        // so:
+        //   * Bicubic sharpening has nothing left to sharpen - the high
+        //     frequencies were intentionally destroyed at load time.
+        //   * Bilinear is 4x cheaper per sample (2x2 vs 4x4 source taps),
+        //     which dominates the per-frame cost because window drag /
+        //     scale-on-open / menu slide-in all produce dirty rectangles
+        //     that cover large stretches of wallpaper.
+        // Net result: identical-looking wallpaper, smooth animations even
+        // on integrated GPUs and with large custom photos selected.
+        RenderOptions.SetBitmapInterpolationMode(_wallpaperFront, BitmapInterpolationMode.LowQuality);
+        RenderOptions.SetBitmapInterpolationMode(_wallpaperBack, BitmapInterpolationMode.LowQuality);
 
         // Disable edge antialiasing on the wallpaper layers. The wallpaper
         // fills the whole desktop and never has visible edges of its own
@@ -321,7 +329,39 @@ public abstract class DOSIScreen : UserControl
         // skipping the visible fade. Result: instant wallpaper on first select.
         if (!_isCurrentScreen) return;
 
-        AnimateWallpaperTransition(ResolveWallpaperBitmap());
+        // Resolve the target bitmap WITHOUT blocking the UI thread. The
+        // bitmap may still need to decode + downscale + Skia blur-bake -
+        // up to a couple of seconds on a 24 MP source - and doing that
+        // synchronously here freezes the whole dispatcher for the
+        // duration, which kills every concurrent animation (the accent
+        // tween, the panel cross-fade, the avatar pop-in). That hang is
+        // exactly the "click user tile, screen freezes for a second,
+        // then everything snaps in" symptom.
+        //
+        // Off-thread resolve + post-back to UI thread for the actual
+        // fade keeps every animation smooth. The wallpaper fade-in
+        // simply starts a tick later than the accent/panel animations,
+        // which reads naturally - the wallpaper is the heaviest visual
+        // change on screen and a tiny extra delay before it lands is
+        // imperceptible compared to a frozen dispatcher.
+        var currentKey = WallpaperManager.Instance.CurrentWallpaperKey;
+        System.Threading.Tasks.Task.Run(() =>
+        {
+            Bitmap? bmp;
+            try { bmp = ResolveWallpaperBitmap(); }
+            catch { bmp = null; }
+
+            Avalonia.Threading.Dispatcher.UIThread.Post(() =>
+            {
+                // Bail if the wallpaper changed again before we finished
+                // resolving (rapid user-tile-clicking on the login screen).
+                // The next OnWallpaperChanged will animate to the latest.
+                if (!_isCurrentScreen) return;
+                if (!string.Equals(WallpaperManager.Instance.CurrentWallpaperKey,
+                                   currentKey, StringComparison.OrdinalIgnoreCase)) return;
+                AnimateWallpaperTransition(bmp);
+            });
+        });
     }
 
     /// <summary>
@@ -563,36 +603,58 @@ public abstract class DOSIScreen : UserControl
             {
                 // Front is currently invisible/empty (e.g. after a fade
                 // back to accent-only, or first attach with no resolvable
-                // bitmap).
+                // bitmap). Stage the target ON THE FRONT at Opacity=0 and
+                // ramp it up to 1 with an ease-out cubic. The accent
+                // vignette underneath remains fully opaque the whole time
+                // and is gradually covered by the rising wallpaper - which
+                // is exactly the visual the login screen wants when the
+                // user picks their tile (accent gracefully dissolves into
+                // the chosen wallpaper instead of snapping in one frame).
                 //
-                // GHOST ELIMINATION: do NOT ramp the front's opacity from
-                // 0 -> 1 here. While the front is at intermediate opacity
-                // (say 0.4), the compositor renders:
-                //     0.4 * wallpaper + 0.6 * accent-vignette
-                // ...so the user's accent colour visibly bleeds through
-                // the wallpaper for the entire duration of the ramp -
-                // that's the "slight accent ghost" the user reported. No
-                // amount of easing can remove it; it's straight alpha math.
-                //
-                // The clean fix is to skip the ramp entirely for this
-                // path and SNAP the target bitmap onto the front at full
-                // opacity. The wallpaper appears in a single frame with
-                // no accent bleed-through. (The "elegant cross-fade"
-                // intent is preserved for the common path - desktop blur
-                // toggles, screen handoffs via
-                // SetWallpaperFrontSourceImmediate, etc - because that
-                // path takes the frontHasImage=true branch above where
-                // the front is pinned opaque throughout.)
-                //
-                // Followers receive a single final sync frame so every
-                // monitor flips in the same compositor tick - no
-                // per-monitor drift, no ghost on any display.
+                // HISTORY: an earlier version of this branch snapped the
+                // wallpaper to Opacity=1 in a single frame to avoid what
+                // was called an "accent ghost" - i.e. seeing the accent
+                // through a partially-opaque wallpaper during the ramp.
+                // That snap eliminated the cross-fade itself; on the boot
+                // -> login -> user-wallpaper path the wallpaper appeared
+                // instantaneously which read as cheap. The accent
+                // "bleed-through" IS the cross-fade in this branch: the
+                // accent backdrop is the FROM frame, the wallpaper is the
+                // TO frame, and the ramp is the interpolation between
+                // them. Restoring the ramp gives the login transition its
+                // beautiful "dissolve into the user's world" feel.
                 SetLayerSource(_wallpaperFront, targetBitmap);
                 SetLayerSource(_wallpaperBack, null);
-                _wallpaperFront.Opacity = 1;
+                _wallpaperFront.Opacity = 0;
                 _wallpaperBack.Opacity = 0;
                 RefreshAccentMask();
-                Emit(frontOp: 1, backOp: 0, useFront: true, isFinal: true);
+
+                Emit(frontOp: 0, backOp: 0, useFront: true, isFinal: false);
+
+                _wallpaperAnimTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
+                _wallpaperAnimTimer.Tick += (_, _) =>
+                {
+                    var t = Math.Clamp((DateTime.UtcNow - startTime).TotalMilliseconds / duration, 0d, 1d);
+                    var eased = 1 - Math.Pow(1 - t, 3); // ease-out cubic
+                    _wallpaperFront.Opacity = eased;
+                    RefreshAccentMask();
+
+                    if (t < 1d)
+                    {
+                        Emit(frontOp: eased, backOp: 0, useFront: true, isFinal: false);
+                    }
+                    else
+                    {
+                        _wallpaperAnimTimer?.Stop();
+                        _wallpaperAnimTimer = null;
+                        _wallpaperFront.Opacity = 1;
+                        SetLayerSource(_wallpaperBack, null);
+                        _wallpaperBack.Opacity = 0;
+                        RefreshAccentMask();
+                        Emit(frontOp: 1, backOp: 0, useFront: true, isFinal: true);
+                    }
+                };
+                _wallpaperAnimTimer.Start();
             }
         }
         else

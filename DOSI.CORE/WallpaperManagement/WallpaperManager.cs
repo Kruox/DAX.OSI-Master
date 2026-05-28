@@ -78,6 +78,16 @@ public sealed class WallpaperManager
         }
     };
 
+    // Guards every read/write of <see cref="_wallpapers"/>. The list is a
+    // plain List<T> but it is touched from multiple threads now that boot
+    // (BootScreen.PrewarmUserWallpapersInBackground) and the
+    // WallpaperManager's own ctor prewarm both auto-register custom
+    // file-path wallpapers off the UI thread. Without this lock a
+    // concurrent foreach over the list (e.g. TryGetWallpaper from the UI
+    // thread) throws "Collection was modified; enumeration operation may
+    // not execute." the moment the background thread adds a new entry.
+    private readonly object _wallpapersLock = new();
+
     // Concurrent so the background prewarm thread (kicked off in the
     // constructor) and the UI thread can safely populate / read the bitmap
     // caches without a separate lock - reads are wait-free, writes are
@@ -86,6 +96,15 @@ public sealed class WallpaperManager
         new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, Bitmap> _sharpBitmapCache =
         new(StringComparer.OrdinalIgnoreCase);
+    // Tiny preview bitmaps used by settings / picker grids. Decoded at
+    // ~320 px on the long edge so a grid of N tiles costs N * (320*200*4)
+    // bytes of GPU texture instead of N * (native*native*4). Without this
+    // a single open of Settings with a handful of phone-shot custom
+    // wallpapers easily allocates 600+ MB of resident GPU textures - the
+    // root cause of the "everything lags after adding a wallpaper" report.
+    private readonly ConcurrentDictionary<string, Bitmap> _thumbnailCache =
+        new(StringComparer.OrdinalIgnoreCase);
+    private const int ThumbnailMaxDimension = 320;
 
     private WallpaperManager()
     {
@@ -116,8 +135,22 @@ public sealed class WallpaperManager
     /// </summary>
     private void PrewarmBitmapCache()
     {
-        foreach (var wallpaper in _wallpapers)
+        // Snapshot under the lock so a concurrent RegisterCustomWallpaper
+        // can't mutate the list mid-enumeration.
+        DOSIWallpaper[] snapshot;
+        lock (_wallpapersLock)
         {
+            snapshot = _wallpapers.ToArray();
+        }
+        foreach (var wallpaper in snapshot)
+        {
+            // Warm the thumbnail first - it's the smallest decode and the
+            // most likely first read (settings / picker grids hit it on
+            // open). Doing it before the full bitmaps means a grid of
+            // wallpaper tiles materialises instantly even if the larger
+            // sharp/blurred bakes are still in flight.
+            try { LoadThumbnail(wallpaper.Key); }
+            catch { /* prewarm is best-effort */ }
             try { LoadBitmap(wallpaper.Key, blurred: true); }
             catch { /* prewarm is best-effort */ }
             try { LoadBitmap(wallpaper.Key, blurred: false); }
@@ -174,7 +207,19 @@ public sealed class WallpaperManager
         TryGetWallpaper(CurrentWallpaperKey!, out _);
 
     /// <summary>The list of wallpapers shipped with DOSI.</summary>
-    public IReadOnlyList<DOSIWallpaper> AvailableWallpapers => _wallpapers;
+    public IReadOnlyList<DOSIWallpaper> AvailableWallpapers
+    {
+        get
+        {
+            // Return a snapshot so callers can iterate without racing a
+            // background RegisterCustomWallpaper that would otherwise
+            // mutate the live list and throw "Collection was modified".
+            lock (_wallpapersLock)
+            {
+                return _wallpapers.ToArray();
+            }
+        }
+    }
 
     /// <summary>
     /// Looks up a wallpaper descriptor by key. Returns <c>false</c> for the
@@ -182,12 +227,17 @@ public sealed class WallpaperManager
     /// </summary>
     public bool TryGetWallpaper(string key, out DOSIWallpaper wallpaper)
     {
-        foreach (var w in _wallpapers)
+        // Lock so we don't enumerate while another thread is adding a
+        // custom wallpaper via RegisterCustomWallpaper.
+        lock (_wallpapersLock)
         {
-            if (string.Equals(w.Key, key, StringComparison.OrdinalIgnoreCase))
+            foreach (var w in _wallpapers)
             {
-                wallpaper = w;
-                return true;
+                if (string.Equals(w.Key, key, StringComparison.OrdinalIgnoreCase))
+                {
+                    wallpaper = w;
+                    return true;
+                }
             }
         }
         wallpaper = null!;
@@ -218,6 +268,43 @@ public sealed class WallpaperManager
 
         if (string.Equals(normalized, CurrentWallpaperKey, StringComparison.OrdinalIgnoreCase))
             return;
+
+        // Pre-warm the bitmap caches off the UI thread for any real
+        // wallpaper that isn't already decoded. Critical for huge custom
+        // photos (24 MP+ phone shots) where the first synchronous decode
+        // on the UI thread would otherwise lock the dispatcher for
+        // hundreds of milliseconds and skip the cross-fade animation.
+        //
+        // IMPORTANT: WallpaperChanged is raised IMMEDIATELY (not after
+        // the warmup completes). Two reasons:
+        //   1. The cross-fade animation in DOSIScreen.AnimateWallpaperTransition
+        //      is what the user reads as "the wallpaper appearing" - if
+        //      we delay the event until decode finishes, the click-to-paint
+        //      latency on shipped wallpapers (~50-100 ms) becomes a visible
+        //      pause where nothing happens, and any orchestrated transition
+        //      from LoginScreen / DesktopScreen has already moved past its
+        //      timing window.
+        //   2. The 4K cache cap + bilinear interpolation already removed
+        //      the multi-second freeze on giant photos that motivated the
+        //      original delay-the-event design. A best-effort head start
+        //      on decode is enough; the synchronous LoadBitmap call from
+        //      the screen will either hit the warm cache (fast) or fall
+        //      through to a quick decode (4K-capped, also fast).
+        var needsWarmup =
+            !string.Equals(normalized, AccentOnlyKey, StringComparison.OrdinalIgnoreCase) &&
+            TryGetWallpaper(normalized, out _) &&
+            !_blurredBitmapCache.ContainsKey(normalized) &&
+            !_sharpBitmapCache.ContainsKey(normalized);
+
+        if (needsWarmup)
+        {
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                try { LoadBitmap(normalized, blurred: true); } catch { }
+                try { LoadBitmap(normalized, blurred: false); } catch { }
+            });
+            // Deliberately NOT awaited - see comment block above.
+        }
 
         CurrentWallpaperKey = normalized;
         WallpaperChanged?.Invoke(this, EventArgs.Empty);
@@ -253,12 +340,23 @@ public sealed class WallpaperManager
         var displayName = Path.GetFileNameWithoutExtension(absolutePath);
         if (string.IsNullOrWhiteSpace(displayName)) displayName = "Custom";
 
-        _wallpapers.Add(new DOSIWallpaper
+        // Re-check + add under the lock so two concurrent registrations
+        // for the same path don't insert duplicate entries, and so any
+        // in-flight enumeration on another thread sees a stable list.
+        lock (_wallpapersLock)
         {
-            Key = absolutePath,
-            DisplayName = displayName,
-            AssetUri = uri
-        });
+            foreach (var existing in _wallpapers)
+            {
+                if (string.Equals(existing.Key, absolutePath, StringComparison.OrdinalIgnoreCase))
+                    return absolutePath;
+            }
+            _wallpapers.Add(new DOSIWallpaper
+            {
+                Key = absolutePath,
+                DisplayName = displayName,
+                AssetUri = uri
+            });
+        }
 
         if (raiseEvent) WallpapersChanged?.Invoke(this, EventArgs.Empty);
         return absolutePath;
@@ -270,15 +368,51 @@ public sealed class WallpaperManager
                           s.StartsWith("\\\\", StringComparison.Ordinal)));
 
     /// <summary>
-    /// Hard cap on either dimension of a cached wallpaper bitmap, in pixels.
-    /// Source PNGs larger than this are downscaled once at load time so per-
-    /// frame compositing operates on a smaller GPU texture. The wallpaper is
-    /// stretched <c>UniformToFill</c> across the desktop, so a 4K source and
-    /// a 2.5K source look identical at any reasonable display size while the
-    /// 2.5K version costs roughly 60% less to resample for every dirty rect
-    /// produced by window drags, shadows, and translucency.
+    /// Absolute safety ceiling (in pixels) on either dimension of a cached
+    /// wallpaper bitmap. Defaults to 3840 px (4K width) - which is the
+    /// "fidelity sweet spot" for desktop wallpaper:
+    /// <list type="bullet">
+    /// <item>On any monitor up to 4K, a UniformToFill at this resolution
+    /// produces pixel-perfect output. There is no perceivable detail
+    /// added by holding a larger source; you're paying GPU memory and
+    /// per-frame bicubic sampling for samples the display literally
+    /// cannot show.</item>
+    /// <item>On a 1080p or 1440p monitor, downsampling from 4K is still
+    /// cheap enough that translucent window drags / open-scale tweens
+    /// stay smooth even on integrated GPUs.</item>
+    /// <item>On a 5K+ monitor, the user can lift the cap via
+    /// <see cref="SetMaxCachedWallpaperDimension"/> and accept the
+    /// per-frame sampling cost as a deliberate trade-off.</item>
+    /// </list>
+    /// <para>
+    /// This was previously 7680 px (8K). At that cap a typical 24 MP
+    /// phone photo cached as a ~96 MB GPU texture, and EVERY dirty
+    /// rectangle that crossed the wallpaper (window drag, scale-on-open
+    /// animation, menu slide-in, scroll repaint of a translucent window)
+    /// forced the compositor to resample that giant texture with
+    /// <see cref="BitmapInterpolationMode.HighQuality"/>. That was the
+    /// "everything lags when I use a big custom wallpaper" symptom -
+    /// most visible in Fill / Fit / Stretch (which sample the entire
+    /// texture per frame) and barely visible in Tile (which samples at
+    /// native size, no scaling math). Capping at 4K width keeps the
+    /// shipped wallpapers crisp AND keeps custom photos cheap.
+    /// </para>
     /// </summary>
-    private const int MaxCachedWallpaperDimension = 2560;
+    public static int MaxCachedWallpaperDimension { get; private set; } = 3840;
+
+    /// <summary>
+    /// Override the cached-wallpaper dimension cap. Useful for 5K / 6K /
+    /// 8K display owners who want to pay the per-frame sampling cost in
+    /// exchange for sharper wallpaper at extreme zoom levels. Must be
+    /// called BEFORE any wallpaper is loaded; existing cached bitmaps
+    /// are not re-baked.
+    /// </summary>
+    public static void SetMaxCachedWallpaperDimension(int pixels)
+    {
+        if (pixels < 1024) pixels = 1024;   // minimum sanity
+        if (pixels > 16384) pixels = 16384; // ceiling sanity
+        MaxCachedWallpaperDimension = pixels;
+    }
 
     /// <summary>
     /// Canonical Gaussian blur sigma baked into every cached wallpaper at
@@ -294,12 +428,143 @@ public sealed class WallpaperManager
     private const float WallpaperBlurSigma = 22f;
 
     /// <summary>
-    /// Loads the canonical (blurred) bitmap for the given wallpaper key.
-    /// Equivalent to <c>LoadBitmap(key, blurred: true)</c>. Kept as a
-    /// separate overload so the very common consumer pattern stays
-    /// readable and so existing call sites compile unchanged.
+    /// Returns a small (~320 px long-edge) preview bitmap for the given
+    /// wallpaper key, decoded once and cached separately from the full-res
+    /// bitmaps used by the live desktop. Settings and picker grids must
+    /// use this instead of <see cref="LoadBitmap"/> for tile previews: a
+    /// thumbnail occupies ~250 KB of GPU memory, while the full-res
+    /// bitmap can easily be 50+ MB on a 24 MP source - and a grid of
+    /// 20 of those will exhaust the compositor's texture budget and
+    /// drag the whole UI to a crawl. Returns <c>null</c> for unknown
+    /// keys or decode failures (same contract as LoadBitmap).
     /// </summary>
+    public Bitmap? LoadThumbnail(string key)
+    {
+        if (!TryGetWallpaper(key, out var wallpaper)) return null;
+
+        if (_thumbnailCache.TryGetValue(wallpaper.Key, out var cached)) return cached;
+
+        Bitmap? produced = null;
+        try
+        {
+            var winner = _thumbnailCache.GetOrAdd(wallpaper.Key, _ =>
+            {
+                // Use Bitmap.DecodeToWidth so the platform decoder produces
+                // the thumbnail directly at the target size - we never hold
+                // the full-resolution decode in memory at all, which is the
+                // whole point of the preview cache.
+                Stream stream;
+                if (wallpaper.AssetUri.IsAbsoluteUri && wallpaper.AssetUri.IsFile)
+                    stream = File.OpenRead(wallpaper.AssetUri.LocalPath);
+                else
+                    stream = AssetLoader.Open(wallpaper.AssetUri);
+
+                using (stream)
+                {
+                    // DecodeToWidth keeps aspect; pass the long-edge cap
+                    // and let the decoder fit-to-width internally. For
+                    // portrait sources this still stays under the cap on
+                    // the height axis (the picker tiles are wider than
+                    // tall, so any extra width is fine).
+                    var bmp = Bitmap.DecodeToWidth(stream, ThumbnailMaxDimension,
+                        BitmapInterpolationMode.HighQuality);
+                    produced = bmp;
+                    return bmp;
+                }
+            });
+
+            if (produced != null && !ReferenceEquals(produced, winner))
+                produced.Dispose();
+            return winner;
+        }
+        catch
+        {
+            produced?.Dispose();
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Loads the canonical (blurred) bitmap for the given wallpaper key.</summary>
     public Bitmap? LoadBitmap(string key) => LoadBitmap(key, blurred: true);
+
+    /// <summary>
+    /// Asynchronously loads the bitmap for the given wallpaper key and
+    /// invokes <paramref name="onLoaded"/> on the UI thread with the
+    /// result (or <c>null</c> on failure). Fast-paths a cache hit so it
+    /// returns immediately without a thread hop. Use this anywhere a
+    /// synchronous <see cref="LoadBitmap"/> would otherwise freeze the
+    /// dispatcher on a large custom photo.
+    /// </summary>
+    public void LoadBitmapAsync(string key, bool blurred, Action<Bitmap?> onLoaded)
+    {
+        if (onLoaded == null) return;
+
+        // Fast path: cache hit -> no thread hop.
+        var cache = blurred ? _blurredBitmapCache : _sharpBitmapCache;
+        if (cache.TryGetValue(key, out var cached))
+        {
+            onLoaded(cached);
+            return;
+        }
+
+        System.Threading.Tasks.Task.Run(() =>
+        {
+            Bitmap? bmp = null;
+            try { bmp = LoadBitmap(key, blurred); } catch { bmp = null; }
+            var produced = bmp;
+            Avalonia.Threading.Dispatcher.UIThread.Post(() => onLoaded(produced));
+        });
+    }
+
+    /// <summary>
+    /// Asynchronous variant of <see cref="LoadThumbnail"/>. See
+    /// <see cref="LoadBitmapAsync"/> for the contract.
+    /// </summary>
+    public void LoadThumbnailAsync(string key, Action<Bitmap?> onLoaded)
+    {
+        if (onLoaded == null) return;
+        if (_thumbnailCache.TryGetValue(key, out var cached))
+        {
+            onLoaded(cached);
+            return;
+        }
+        System.Threading.Tasks.Task.Run(() =>
+        {
+            Bitmap? bmp = null;
+            try { bmp = LoadThumbnail(key); } catch { bmp = null; }
+            var produced = bmp;
+            Avalonia.Threading.Dispatcher.UIThread.Post(() => onLoaded(produced));
+        });
+    }
+
+    /// <summary>
+    /// Best-effort: kicks a background decode of every variant (thumbnail
+    /// + blurred + sharp) for the given wallpaper key so subsequent
+    /// synchronous loads hit the warm cache. Useful when a screen knows
+    /// it's about to display a wallpaper (e.g. login pre-warming each
+    /// user's pick during boot).
+    /// </summary>
+    public void Prewarm(string key)
+    {
+        if (string.IsNullOrEmpty(key)) return;
+        if (string.Equals(key, AccentOnlyKey, StringComparison.OrdinalIgnoreCase)) return;
+
+        // If the key is a file path and isn't registered yet, register
+        // it on the same thread that's about to decode - LoadBitmap /
+        // LoadThumbnail will no-op otherwise.
+        if (!TryGetWallpaper(key, out _) && LooksLikeFilePath(key))
+        {
+            TryRegisterCustomWallpaperInternal(key, raiseEvent: false);
+        }
+
+        System.Threading.Tasks.Task.Run(() =>
+        {
+            try { LoadThumbnail(key); } catch { }
+            try { LoadBitmap(key, blurred: true); } catch { }
+            try { LoadBitmap(key, blurred: false); } catch { }
+        });
+    }
 
     /// <summary>
     /// Loads the bitmap for the given wallpaper key in either the soft
@@ -538,6 +803,14 @@ public sealed class WallpaperManager
     /// stored. Defaults to the first shipped wallpaper, or the accent-only
     /// sentinel if the wallpaper list is empty.
     /// </summary>
-    public string DefaultWallpaperKey =>
-        _wallpapers.Count > 0 ? _wallpapers[0].Key : AccentOnlyKey;
+    public string DefaultWallpaperKey
+    {
+        get
+        {
+            lock (_wallpapersLock)
+            {
+                return _wallpapers.Count > 0 ? _wallpapers[0].Key : AccentOnlyKey;
+            }
+        }
+    }
 }

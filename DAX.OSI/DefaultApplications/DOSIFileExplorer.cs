@@ -217,6 +217,13 @@ public class DOSIFileExplorer : DOSIWindow
     // so the user can still navigate. Set via EnablePickerMode.
     private string[]? _pickerExtensions;
     private Action<string>? _pickerCallback;
+    // "Choose" / "Cancel" buttons mounted in the status bar while in
+    // picker mode. Without these the only way to commit a selection was
+    // double-click, which isn't discoverable - users would single-click
+    // a file, see it appear in the details panel, and then be stuck.
+    private DOSIButton? _pickerChooseButton;
+    private DOSIButton? _pickerCancelButton;
+    private StackPanel? _pickerActionStack;
 
     // ----- Tile drag-out (file -> desktop / other explorer) -----
     // Mirrors the proven DesktopIconLayer.ArmDragGhost pattern so the
@@ -583,12 +590,64 @@ public class DOSIFileExplorer : DOSIWindow
         var statusGrid = new Grid
         {
             // Three columns: item count (left), disk usage (center), selection summary (right).
-            ColumnDefinitions = new ColumnDefinitions("*,Auto,*"),
+            ColumnDefinitions = new ColumnDefinitions("*,Auto,*,Auto"),
             Margin = new Thickness(14, 6)
         };
         statusGrid.Children.Add(_statusItemCount); Grid.SetColumn(_statusItemCount, 0);
         statusGrid.Children.Add(_statusDiskUsage); Grid.SetColumn(_statusDiskUsage, 1);
         statusGrid.Children.Add(_statusSelection); Grid.SetColumn(_statusSelection, 2);
+
+        // Picker-mode actions: a Cancel + Choose pair lives in the
+        // rightmost status-bar column and is invisible until
+        // EnablePickerMode flips them on. This gives the user a clear,
+        // discoverable way to commit (or back out of) a selection
+        // instead of having to remember the double-click gesture. The
+        // buttons reflect the live singular selection - Choose is only
+        // enabled when a whitelisted FILE is selected (not a folder,
+        // since folders are navigation-only in picker mode).
+        _pickerCancelButton = new DOSIButton
+        {
+            Text = "Cancel",
+            FontSize = 11,
+            Height = 22,
+            CornerRadius = new CornerRadius(4),
+            Padding = new Thickness(10, 0),
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        _pickerCancelButton.Click += (_, _) =>
+        {
+            _pickerCallback = null;
+            _ = PlayCloseAnimationAsync().ContinueWith(_ => { });
+        };
+        _pickerChooseButton = new DOSIButton
+        {
+            Text = "Choose",
+            FontSize = 11,
+            Height = 22,
+            CornerRadius = new CornerRadius(4),
+            Padding = new Thickness(12, 0),
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        _pickerChooseButton.Click += (_, _) =>
+        {
+            if (_pickerCallback == null) return;
+            if (_selectedTile?.Tag is not string p) return;
+            if (Directory.Exists(p)) return; // can't pick a folder
+            if (_pickerExtensions != null &&
+                !_pickerExtensions.Contains(Path.GetExtension(p), StringComparer.OrdinalIgnoreCase))
+                return;
+            ActivateTile(p, isDirectory: false);
+        };
+        _pickerActionStack = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            Spacing = 8,
+            VerticalAlignment = VerticalAlignment.Center,
+            HorizontalAlignment = HorizontalAlignment.Right,
+            IsVisible = false,
+            Children = { _pickerCancelButton, _pickerChooseButton }
+        };
+        statusGrid.Children.Add(_pickerActionStack); Grid.SetColumn(_pickerActionStack, 3);
 
         var statusBar = new Border
         {
@@ -2639,6 +2698,7 @@ public class DOSIFileExplorer : DOSIWindow
         _statusSelection.Text = $"{Path.GetFileName(path)}  \u2022  {info}";
 
         ShowDetailsPanel(path, isDirectory);
+        UpdatePickerActionState();
     }
 
     private void ClearSelection()
@@ -2656,6 +2716,7 @@ public class DOSIFileExplorer : DOSIWindow
         ClearMarqueeSelection();
         _statusSelection.Text = "";
         HideDetailsPanel();
+        UpdatePickerActionState();
     }
 
     private void ActivateTile(string path, bool isDirectory)
@@ -2738,8 +2799,36 @@ public class DOSIFileExplorer : DOSIWindow
         _pickerExtensions = extensions ?? Array.Empty<string>();
         _pickerCallback = onPicked;
         Title = string.IsNullOrWhiteSpace(prompt) ? "Choose a file" : prompt;
+        // Surface the Cancel + Choose action buttons in the status bar.
+        // Choose stays disabled until the user selects a valid file -
+        // see UpdatePickerActionState.
+        if (_pickerActionStack != null) _pickerActionStack.IsVisible = true;
+        UpdatePickerActionState();
         // Re-render so the extension filter takes effect immediately.
         PopulateItems();
+    }
+
+    /// <summary>
+    /// Enables / disables the picker-mode "Choose" button based on the
+    /// current singular selection. Folders are navigation targets in
+    /// picker mode, never pickable, so the button stays disabled when a
+    /// folder is selected; files outside the extension whitelist are
+    /// hidden by PopulateItems so any visible file selection is valid.
+    /// Called from SelectTile and ClearSelection so the button tracks
+    /// the user's intent live.
+    /// </summary>
+    private void UpdatePickerActionState()
+    {
+        if (_pickerChooseButton == null) return;
+        if (_pickerCallback == null) { _pickerChooseButton.IsEnabled = false; return; }
+
+        bool canPick = false;
+        if (_selectedTile?.Tag is string p && File.Exists(p))
+        {
+            canPick = _pickerExtensions == null ||
+                      _pickerExtensions.Contains(Path.GetExtension(p), StringComparer.OrdinalIgnoreCase);
+        }
+        _pickerChooseButton.IsEnabled = canPick;
     }
 
     private static long SafeFileSize(string path)
@@ -3829,17 +3918,34 @@ public class DOSIFileExplorer : DOSIWindow
         {
             try
             {
-                using var fs = File.OpenRead(path);
-                var bmp = new Avalonia.Media.Imaging.Bitmap(fs);
-                icon = new Image
+                // Use the shared ImageCache so the details preview is
+                // produced at a small thumbnail size (~320 px long edge)
+                // off the UI thread. Without this, clicking a large
+                // photo in the explorer's list view used to freeze the
+                // dispatcher for several hundred ms while the full-res
+                // JPEG decoded and then the result was scaled down to
+                // a 100 px preview anyway.
+                var img = new Image
                 {
-                    Source = bmp,
                     Stretch = Stretch.Uniform,
                     Width = 100,
                     Height = 100,
                     HorizontalAlignment = HorizontalAlignment.Center,
                     VerticalAlignment = VerticalAlignment.Center
                 };
+                var pathSnapshot = path;
+                DOSI.CORE.ImageManagement.ImageCache.LoadAsync(
+                    path,
+                    DOSI.CORE.ImageManagement.ImageCache.ThumbnailMaxDimension,
+                    bmp =>
+                    {
+                        // The preview panel may have moved on to another
+                        // file before the decode finished; only apply
+                        // the bitmap if we're still showing the same one.
+                        if (!ReferenceEquals(img.Parent, _detailsIconHost)) return;
+                        if (bmp != null) img.Source = bmp;
+                    });
+                icon = img;
             }
             catch
             {

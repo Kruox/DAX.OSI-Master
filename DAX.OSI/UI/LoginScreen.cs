@@ -96,6 +96,17 @@ public class LoginScreen : DOSIScreen
     private DOSIUser? _selectedUser;
     private DOSIAccent _systemDefaultAccent;
 
+    /// <summary>
+    /// Longer-than-default wallpaper cross-fade for the login screen so
+    /// selecting a user reads as a cinematic "dissolve into your world"
+    /// moment rather than a quick swap. The base class uses 550 ms which
+    /// is tuned for desktop blur toggles and rapid screen handoffs; here
+    /// the wallpaper is changing FROM the accent vignette TO the user's
+    /// chosen photo, which is the most emotionally loaded transition in
+    /// the whole sign-in flow.
+    /// </summary>
+    protected override TimeSpan WallpaperTransitionDuration => TimeSpan.FromMilliseconds(900);
+
     public LoginScreen()
     {
         // ===== Ambient overlay (clock + date) =====
@@ -668,6 +679,42 @@ public class LoginScreen : DOSIScreen
 
         foreach (var user in users)
             _userTilesWrap.Children.Add(BuildUserTile(user));
+
+        // Pre-warm each user's preferred wallpaper bitmap off-thread so
+        // selecting a tile doesn't pay the decode + downscale + Skia
+        // blur-bake cost on click. Without this, the user clicks their
+        // tile and the wallpaper visibly takes a couple of seconds to
+        // resolve (most painful with large custom photos): the
+        // OnWallpaperChanged async resolve runs only AFTER SelectUser
+        // fires WallpaperChanged, so the cross-fade waits on the decode.
+        // By kicking the decode here, the cache is hot by the time the
+        // user actually clicks and the transition starts immediately.
+        PrewarmUserWallpapers(users);
+    }
+
+    /// <summary>
+    /// Best-effort: kick a background decode of every known user's
+    /// preferred wallpaper so the bitmap cache is hot before any tile
+    /// is clicked. Custom file-path wallpapers are auto-registered with
+    /// <see cref="WallpaperManager"/> so the subsequent
+    /// <see cref="WallpaperManager.SetWallpaper"/> call from
+    /// <see cref="SelectUser"/> hits the cache instead of starting a
+    /// fresh decode. Safe to call repeatedly; cache hits are no-ops.
+    /// </summary>
+    private static void PrewarmUserWallpapers(IReadOnlyList<DOSIUser> users)
+    {
+        if (users == null || users.Count == 0) return;
+        var wm = WallpaperManager.Instance;
+        foreach (var u in users)
+        {
+            var k = UserManager.GetUserWallpaper(u);
+            if (string.IsNullOrWhiteSpace(k)) continue;
+            // WallpaperManager.Prewarm handles the AccentOnlyKey + custom
+            // file-path registration internally and runs the decode on a
+            // worker thread. Cache hits are no-ops, so re-prewarming
+            // every time the picker rebuilds is cheap.
+            try { wm.Prewarm(k!); } catch { /* best-effort */ }
+        }
     }
 
     /// <summary>
@@ -918,12 +965,16 @@ public class LoginScreen : DOSIScreen
         _passwordBox.Text = string.Empty;
 
         // Cross-fade picker -> sign-in so the swap is always visibly animated,
-        // not just when the accent change masks the snap.
-        CrossFadePanels(_pickerPanel, _signInPanel, 280);
+        // not just when the accent change masks the snap. Run the panel
+        // and accent durations a touch longer than the default so they
+        // breathe in sync with the new (longer) wallpaper dissolve below -
+        // everything finishes within ~50 ms of each other for a cohesive
+        // "the screen rearranges itself into your space" feel.
+        CrossFadePanels(_pickerPanel, _signInPanel, 520);
 
         // Animate to the user's preferred accent (or system default if none set).
         var targetAccent = UserManager.GetUserAccent(user) ?? _systemDefaultAccent;
-        Accents.ApplyAccentAnimated(targetAccent, TimeSpan.FromMilliseconds(550));
+        Accents.ApplyAccentAnimated(targetAccent, TimeSpan.FromMilliseconds(850));
 
         // Cross-fade in this user's chosen wallpaper. A null/missing pref
         // (or the explicit accent-only sentinel) leaves the accent vignette

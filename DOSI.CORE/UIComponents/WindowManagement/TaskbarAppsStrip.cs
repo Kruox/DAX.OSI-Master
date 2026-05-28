@@ -2,13 +2,14 @@ using System;
 using System.Collections.Generic;
 using Avalonia;
 using Avalonia.Controls;
+using Avalonia.Controls.Shapes;
 using Avalonia.Controls.Primitives;
-using Avalonia.Controls.Primitives.PopupPositioning;
 using Avalonia.Input;
 using Avalonia.Layout;
 using Avalonia.Media;
 using Avalonia.Media.Imaging;
 using Avalonia.Threading;
+using Avalonia.VisualTree;
 using DOSI.CORE.AccentManagement;
 
 namespace DOSI.CORE.UIComponents.WindowManagement;
@@ -59,30 +60,43 @@ public sealed class TaskbarAppsStrip : Border
     // Preview popover sizing. The thumbnail area is locked to a 16:10
     // rectangle so previews of any window aspect ratio land in the same
     // visual footprint - the snapshot itself is letterboxed inside via
-    // Stretch.Uniform.
+    // Stretch.Uniform. Sized for a compact, modern look (Win11 / macOS
+    // dock tooltip scale) so a sparse window snapshot doesn't dominate
+    // the popover.
     private const double PreviewWidth = 280;
-    private const double PreviewImageHeight = 158;
+    private const double PreviewImageHeight = 180;
     private const int HoverDelayMs = 380;
     private const int CloseGraceMs = 140;
 
     private readonly StackPanel _chipStrip;
     private readonly Dictionary<DOSIWindow, ChipEntry> _chips = new();
+    // Cache thumbnails briefly to avoid repeated expensive renders while
+    // the user moves the cursor across chips. Keeps UI snappy and cuts
+    // down on RenderTargetBitmap churn.
+    private readonly Dictionary<DOSIWindow, (RenderTargetBitmap? Bitmap, DateTime Timestamp)> _previewCache
+        = new();
 
     private WindowManager? _boundManager;
 
     // ---- Live-preview popover state -------------------------------------
-    // One popup reused for every chip; the popover's PlacementTarget is
-    // swapped to the currently-hovered chip so we never juggle multiple
-    // popups in flight. Built lazily on first hover.
-    private Popup? _previewPopup;
+    // The preview is hosted INSIDE the same TopLevel as the taskbar via
+    // Avalonia's OverlayLayer - NOT inside a Popup. A Popup spawns its own
+    // OS-level child window with a native frame around it (the gray square
+    // border the user reported), and on Windows that frame can't be styled
+    // away short of swapping out the entire popup host. OverlayLayer is
+    // just an in-window Panel that sits above every other in-window
+    // visual, so the card renders as a regular Avalonia control with the
+    // accent border + rounded corners we actually asked for, matching how
+    // the apps menu / notification popover are hosted in _layoutRoot.
     private Border? _previewCard;
     private Image? _previewImage;
-    private TextBlock? _previewTitle;
-    private TextBlock? _previewSubtitle;
-    private Border? _previewBadge;
+    private TextBlock? _previewPlaceholderText;
+    private Avalonia.Controls.Primitives.OverlayLayer? _previewHostLayer;
     private DOSIWindow? _hoverWindow;
+    private Control? _previewAnchor;
     private DispatcherTimer? _hoverOpenTimer;
     private DispatcherTimer? _hoverCloseTimer;
+    private EventHandler? _previewLayoutHandler;
 
     public TaskbarAppsStrip()
     {
@@ -105,7 +119,62 @@ public sealed class TaskbarAppsStrip : Border
         {
             Unbind();
             ClosePreview(immediate: true);
+            DetachPreviewFromHost();
         };
+    }
+
+    // Render the captured bitmap into the exact preview pixel rect so
+    // the Image control always has a correctly-sized source to stretch
+    // from. This avoids cases where a small captured bitmap ends up in
+    // the corner of the preview because of DPI/Stretch interaction.
+    private static RenderTargetBitmap? EnsureBitmapFitsPreview(RenderTargetBitmap src)
+    {
+        try
+        {
+            var px = new PixelSize((int)Math.Ceiling(PreviewWidth), (int)Math.Ceiling(PreviewImageHeight));
+            var dpi = new Vector(96, 96);
+            var rtb = new RenderTargetBitmap(px, dpi);
+            // Draw the source into the target, scaling to fill while
+            // preserving aspect ratio (UniformToFill behaviour). We use
+            // RenderTargetBitmap.Render since Avalonia doesn't provide a
+            // direct blit-with-scale API - the simplest approach is to
+            // place the Image inside a temporary control tree, but that
+            // is heavier. As a pragmatic compromise, if the source size
+            // already matches, return it directly.
+            if (src.PixelSize == px) return src;
+            // Fallback: render the src visual via an Image control hosted
+            // in an offscreen Border. This keeps scaling via Layout out of
+            // the live visual tree.
+            // Host the source inside an offscreen Border using an ImageBrush
+            // with UniformToFill so scaling + centering are handled by the
+            // brush rasterization. Render that host into our fixed-size
+            // preview bitmap. This avoids the quirks of rendering an Image
+            // control and guarantees the source covers the preview area.
+            var host = new Border
+            {
+                Width = PreviewWidth,
+                Height = PreviewImageHeight,
+                Background = new ImageBrush(src)
+                {
+                    Stretch = Stretch.UniformToFill,
+                    AlignmentX = AlignmentX.Center,
+                    AlignmentY = AlignmentY.Center
+                }
+            };
+            try
+            {
+                host.Measure(new Size(PreviewWidth, PreviewImageHeight));
+                host.Arrange(new Rect(0, 0, PreviewWidth, PreviewImageHeight));
+                rtb.Render(host);
+                return rtb;
+            }
+            catch
+            {
+                rtb.Dispose();
+                return src;
+            }
+        }
+        catch { return src; }
     }
 
     // =====================================================================
@@ -160,6 +229,8 @@ public sealed class TaskbarAppsStrip : Border
         _chipStrip.Children.Remove(entry.Chip);
         _chips.Remove(e.Window);
         if (ReferenceEquals(_hoverWindow, e.Window)) ClosePreview(immediate: true);
+        // Drop any cached snapshot for the closed window
+        _previewCache.Remove(e.Window);
     }
 
     private void OnWindowFocusChanged(object? sender, DOSIWindowFocusEventArgs e)
@@ -251,8 +322,10 @@ public sealed class TaskbarAppsStrip : Border
 
         EventHandler<DOSIWindowStateChangedEventArgs> stateHandler = (_, _) => RefreshActiveTint();
         EventHandler<DOSIWindowFocusEventArgs> focusHandler = (_, _) => RefreshActiveTint();
+        EventHandler? layoutHandler = (_, _) => _previewCache.Remove(window);
         window.StateChanged += stateHandler;
         window.FocusChanged += focusHandler;
+        window.LayoutUpdated += layoutHandler;
 
         chip.PointerEntered += (_, _) =>
         {
@@ -273,7 +346,7 @@ public sealed class TaskbarAppsStrip : Border
         };
 
         _chips[window] = new ChipEntry(chip, titleText, badge, initial, underline,
-            window, stateHandler, focusHandler);
+            window, stateHandler, focusHandler, layoutHandler);
         _chipStrip.Children.Add(chip);
     }
 
@@ -348,15 +421,17 @@ public sealed class TaskbarAppsStrip : Border
         // popover closed; just retarget and re-snapshot.
         _hoverCloseTimer?.Stop();
         _hoverCloseTimer = null;
-        if (_previewPopup?.IsOpen == true && !ReferenceEquals(_hoverWindow, window))
+        if (_previewCard != null && _previewCard.IsVisible && !ReferenceEquals(_hoverWindow, window))
         {
             _hoverWindow = window;
-            _previewPopup.PlacementTarget = anchor;
+            _previewAnchor = anchor;
             RefreshPreviewContent(window);
+            UpdatePreviewPosition();
             return;
         }
 
         _hoverWindow = window;
+        _previewAnchor = anchor;
         _hoverOpenTimer?.Stop();
         _hoverOpenTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(HoverDelayMs) };
         _hoverOpenTimer.Tick += (_, _) =>
@@ -387,11 +462,42 @@ public sealed class TaskbarAppsStrip : Border
     private void OpenPreview(DOSIWindow window, Control anchor)
     {
         EnsurePreviewBuilt();
-        if (_previewPopup == null) return;
+        if (_previewCard == null) return;
 
-        _previewPopup.PlacementTarget = anchor;
+        _previewAnchor = anchor;
         RefreshPreviewContent(window);
-        if (!_previewPopup.IsOpen) _previewPopup.IsOpen = true;
+
+        // Mount into the OverlayLayer (idempotent) and position under the
+        // anchor chip. The layer is resolved from the anchor's TopLevel,
+        // so this works correctly on both the primary monitor and any
+        // secondary MonitorWindow.
+        var layer = Avalonia.Controls.Primitives.OverlayLayer.GetOverlayLayer(anchor);
+        if (layer == null) return;
+
+        if (!ReferenceEquals(_previewHostLayer, layer))
+        {
+            // Layer changed (rare - happens if the taskbar gets reparented
+            // between monitors). Detach from the old one first so we don't
+            // leak a ghost card on the previous host.
+            DetachPreviewFromHost();
+            _previewHostLayer = layer;
+        }
+
+        if (_previewCard.Parent == null)
+        {
+            layer.Children.Add(_previewCard);
+        }
+
+        _previewCard.IsVisible = true;
+
+        // Position now and on every subsequent layout pass so anchor
+        // movement (window resize, taskbar reflow) keeps the card pinned.
+        UpdatePreviewPosition();
+        if (_previewLayoutHandler == null)
+        {
+            _previewLayoutHandler = (_, _) => UpdatePreviewPosition();
+            layer.LayoutUpdated += _previewLayoutHandler;
+        }
     }
 
     private void ClosePreview(bool immediate)
@@ -403,167 +509,231 @@ public sealed class TaskbarAppsStrip : Border
             _hoverCloseTimer?.Stop();
             _hoverCloseTimer = null;
         }
-        if (_previewPopup != null && _previewPopup.IsOpen)
-            _previewPopup.IsOpen = false;
+
+        if (_previewCard != null) _previewCard.IsVisible = false;
         _hoverWindow = null;
+        _previewAnchor = null;
+    }
+
+    /// <summary>
+    /// Removes the preview card from its current OverlayLayer and detaches
+    /// the layout-updated handler. Called when the strip is leaving the
+    /// visual tree or when the OverlayLayer changes (reparenting between
+    /// monitors).
+    /// </summary>
+    private void DetachPreviewFromHost()
+    {
+        if (_previewHostLayer != null && _previewLayoutHandler != null)
+        {
+            _previewHostLayer.LayoutUpdated -= _previewLayoutHandler;
+        }
+        _previewLayoutHandler = null;
+        if (_previewCard?.Parent is Panel parent)
+        {
+            parent.Children.Remove(_previewCard);
+        }
+        _previewHostLayer = null;
+    }
+
+    /// <summary>
+    /// Recomputes the preview card's position so it sits horizontally
+    /// centred under <see cref="_previewAnchor"/> and a small gap below
+    /// the taskbar. The card is clamped to the host layer's bounds so it
+    /// can't bleed off-screen on narrow monitors. Skipped silently when
+    /// any of the inputs aren't ready yet (no anchor, no layer, layout
+    /// hasn't run) - the next LayoutUpdated tick retries with valid
+    /// values.
+    /// </summary>
+    private void UpdatePreviewPosition()
+    {
+        if (_previewCard == null || _previewHostLayer == null || _previewAnchor == null) return;
+        // Bail if anchor hasn't been laid out yet (no parent visual root means
+        // TranslatePoint will throw or return null).
+        if (((Visual)_previewAnchor).GetVisualParent() == null) return;
+
+        Point anchorTopLeft;
+        try
+        {
+            anchorTopLeft = _previewAnchor.TranslatePoint(new Point(0, 0), _previewHostLayer)
+                            ?? new Point(0, 0);
+        }
+        catch
+        {
+            return;
+        }
+
+        var anchorWidth = _previewAnchor.Bounds.Width;
+        var anchorHeight = _previewAnchor.Bounds.Height;
+        // PreviewWidth is the card's fixed visible width. The card hasn't
+        // measured yet on first show, so use the constant rather than
+        // _previewCard.Bounds.Width (which would be 0 the first frame).
+        var cardWidth = PreviewWidth;
+        var desiredX = anchorTopLeft.X + (anchorWidth - cardWidth) / 2;
+        var desiredY = anchorTopLeft.Y + anchorHeight + 10;
+
+        // Clamp so the card stays inside the layer's bounds. 8 px breathing
+        // room on each edge matches the apps-menu margin.
+        var layerWidth = _previewHostLayer.Bounds.Width;
+        if (layerWidth > cardWidth + 16)
+        {
+            desiredX = Math.Clamp(desiredX, 8, layerWidth - cardWidth - 8);
+        }
+
+        // OverlayLayer is a Panel - children honour Margin for placement
+        // (it has no Canvas-style attached props). A left/top margin is
+        // the cleanest way to position an absolute child inside it.
+        _previewCard.HorizontalAlignment = HorizontalAlignment.Left;
+        _previewCard.VerticalAlignment = VerticalAlignment.Top;
+        _previewCard.Margin = new Thickness(desiredX, desiredY, 0, 0);
     }
 
     private void EnsurePreviewBuilt()
     {
-        if (_previewPopup != null) return;
+        if (_previewCard != null) return;
 
-        // ---- Header --------------------------------------------------
-        // Small accent badge carrying the window's title initial, mirroring
-        // the chip badge for visual continuity, plus a stacked
-        // title / status caption.
-        var badgeInitial = new TextBlock
-        {
-            Text = "?",
-            FontSize = 12,
-            FontWeight = FontWeight.Bold,
-            Foreground = new SolidColorBrush(Accents.TextOnAccent),
-            HorizontalAlignment = HorizontalAlignment.Center,
-            VerticalAlignment = VerticalAlignment.Center
-        };
-        _previewBadge = new Border
-        {
-            Width = 22,
-            Height = 22,
-            CornerRadius = new CornerRadius(6),
-            Background = new SolidColorBrush(Accents.AccentPrimary),
-            VerticalAlignment = VerticalAlignment.Center,
-            Margin = new Thickness(0, 0, 10, 0),
-            Child = badgeInitial
-        };
-
-        _previewTitle = new TextBlock
-        {
-            Text = string.Empty,
-            FontSize = 13,
-            FontWeight = FontWeight.SemiBold,
-            Foreground = Brushes.White,
-            TextTrimming = TextTrimming.CharacterEllipsis,
-            VerticalAlignment = VerticalAlignment.Center
-        };
-        _previewSubtitle = new TextBlock
-        {
-            Text = string.Empty,
-            FontSize = 10,
-            FontWeight = FontWeight.SemiBold,
-            Opacity = 0.7,
-            Foreground = new SolidColorBrush(Color.FromArgb(220, 255, 255, 255)),
-            VerticalAlignment = VerticalAlignment.Center,
-            Margin = new Thickness(0, 2, 0, 0)
-        };
-
-        var titleStack = new StackPanel
-        {
-            Spacing = 0,
-            VerticalAlignment = VerticalAlignment.Center
-        };
-        titleStack.Children.Add(_previewTitle);
-        titleStack.Children.Add(_previewSubtitle);
-
-        var header = new Grid
-        {
-            ColumnDefinitions = new ColumnDefinitions("Auto,*"),
-            Margin = new Thickness(14, 12, 14, 12)
-        };
-        header.Children.Add(_previewBadge); Grid.SetColumn(_previewBadge, 0);
-        header.Children.Add(titleStack); Grid.SetColumn(titleStack, 1);
-
-        // ---- Thumbnail frame ----------------------------------------
-        // The thumbnail itself gets a rounded 10 px corner radius and a
-        // soft inset shadow + 1 px white hairline so it reads as a real
-        // window snapshot dropped onto the card surface, not a flat
-        // texture pasted onto the background.
+        // ---- Thumbnail surface --------------------------------------
+        // The popover now shows ONLY the live window snapshot - no header,
+        // no badge, no title chrome. The window UI itself already carries
+        // its own title bar / traffic-light buttons / accent border, so a
+        // second header on top of that read as redundant chrome on chrome.
+        // Stretch.Uniform keeps the captured aspect ratio intact and the
+        // image is centred so square / portrait / ultrawide windows all
+        // look intentional inside the fixed-size popover frame.
         _previewImage = new Image
         {
+            // Show the entire window scaled to fit the preview area while
+            // preserving aspect ratio (no cropping). This matches the
+            // user's preference to always see the whole UI inside the
+            // preview plate.
             Stretch = Stretch.Uniform,
             StretchDirection = StretchDirection.Both,
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            VerticalAlignment = VerticalAlignment.Stretch
+        };
+        RenderOptions.SetBitmapInterpolationMode(_previewImage, BitmapInterpolationMode.HighQuality);
+
+        // Placeholder text shown when SnapshotWindow returns null - i.e.
+        // when the window is minimized, hasn't been laid out yet, or
+        // hosts a native surface (WebView2) that can't be captured into
+        // a managed bitmap. Mounted on top of _previewImage in the same
+        // plate; one of the two is always invisible.
+        _previewPlaceholderText = new TextBlock
+        {
+            FontSize = 12,
+            FontWeight = FontWeight.SemiBold,
+            Foreground = new SolidColorBrush(Color.FromArgb(180, 255, 255, 255)),
+            TextAlignment = TextAlignment.Center,
+            TextWrapping = TextWrapping.Wrap,
             HorizontalAlignment = HorizontalAlignment.Center,
-            VerticalAlignment = VerticalAlignment.Center
+            VerticalAlignment = VerticalAlignment.Center,
+            Margin = new Thickness(20),
+            IsVisible = false
         };
 
-        var imageFrame = new Border
+        // ---- Snapshot plate -----------------------------------------
+        // The snapshot itself lives inside a small Border that gives it
+        // its OWN rounded corners + hairline edge + soft drop shadow, so
+        // it reads as a miniature floating window sitting on the popover
+        // surface rather than a flat texture pasted onto the card. This
+        // is the visual idiom Windows 11 / macOS Mission Control use for
+        // window thumbnails and it's what makes the preview feel like a
+        // real preview instead of a clipped screenshot.
+        //
+        // The plate's own corner radius (8) is intentionally smaller than
+        // the card's (12) so the snapshot reads as nested INSIDE the
+        // card - the way a polaroid sits on a desk - rather than fighting
+        // the card's outer curvature.
+        var snapshotPlate = new Border
         {
-            Width = PreviewWidth - 28,
-            Height = PreviewImageHeight,
-            CornerRadius = new CornerRadius(10),
-            Background = new SolidColorBrush(Color.FromArgb(110, 0, 0, 0)),
-            BorderBrush = new SolidColorBrush(Color.FromArgb(40, 255, 255, 255)),
+            CornerRadius = new CornerRadius(8),
+            // 1 px hairline so the snapshot has a crisp edge against the
+            // card surface even when the captured window's chrome happens
+            // to match the card's gradient (dark accents on dark cards).
+            BorderBrush = new SolidColorBrush(Color.FromArgb(55, 255, 255, 255)),
             BorderThickness = new Thickness(1),
+            // Dark plate so a captured window with transparent / glass
+            // chrome has something to composite against - prevents the
+            // snapshot from "dissolving into" the card gradient.
+            // Make the inner plate transparent so the preview bitmap's
+            // transparent pixels show the host desktop beneath the card
+            // instead of compositing against a dark plate.
+            Background = Brushes.Transparent,
             ClipToBounds = true,
-            Margin = new Thickness(14, 0, 14, 12),
-            Child = _previewImage,
+            // Soft elevation shadow so the snapshot visibly floats above
+            // the card surface. Tuned weaker than the card's own shadow
+            // (8 px blur vs 36 px) so it reads as "snapshot above plate"
+            // not "two cards at the same elevation".
             BoxShadow = new BoxShadows(new BoxShadow
             {
                 OffsetX = 0,
                 OffsetY = 4,
-                Blur = 12,
+                Blur = 14,
                 Spread = 0,
                 Color = Color.FromArgb(110, 0, 0, 0)
-            })
+            }),
+            Child = new Grid { Children = { _previewImage, _previewPlaceholderText } }
         };
 
-        var cardBody = new StackPanel { Spacing = 0 };
-        cardBody.Children.Add(header);
-        cardBody.Children.Add(imageFrame);
+        var imageFrame = new Border
+        {
+            Width = PreviewWidth,
+            Height = PreviewImageHeight,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+            // Generous padding around the snapshot plate so its own drop
+            // shadow has room to fade out without being clipped against
+            // the card's interior edge.
+            Padding = new Thickness(14, 12, 14, 14),
+            // Card uses ClipToBounds=false so its drop shadow halo can fade
+            // out fully around all four edges (matching the apps menu).
+            // The image frame picks up the corner-clipping responsibility
+            // here so the inner plate + snapshot still respect the card's
+            // 12 px rounded corners.
+            CornerRadius = new CornerRadius(11),
+            ClipToBounds = true,
+            Child = snapshotPlate
+        };
 
+        // ---- Card surface -------------------------------------------
+        // Visual parity with the apps menu / notification popover:
+        //   * Soft two-stop dark gradient background (Light-accent branch
+        //     keeps text readable in the Light theme).
+        //   * 12 px rounded corners - same radius as the apps menu so all
+        //     dropdown surfaces feel like one family.
+        //   * Accent-coloured border so the popover visibly belongs to
+        //     the user's chosen accent.
+        //   * Drop shadow recipe lifted DIRECTLY from BuildAppsMenu:
+        //     OffsetY=14, Blur=36, Spread=0, alpha 150/255. Because the
+        //     card is in OverlayLayer (not a Popup with its own OS
+        //     window), the 36 px blur halo renders fully on all four
+        //     sides instead of being clipped at any native-window edge.
+        //     ClipToBounds is left FALSE so the shadow halo has room to
+        //     fade out around the card; the inner image frame does its
+        //     own clipping so this doesn't leak any visible overflow.
         _previewCard = new Border
         {
             Width = PreviewWidth,
-            CornerRadius = new CornerRadius(14),
-            // Vertical glassy gradient with the accent tint subtly
-            // bleeding in at the top - reads as a piece of premium
-            // taskbar chrome rather than a flat dialog. The base
-            // colour stays near-black so the snapshot is always the
-            // brightest element in the card.
-            Background = new LinearGradientBrush
-            {
-                StartPoint = new RelativePoint(0, 0, RelativeUnit.Relative),
-                EndPoint = new RelativePoint(0, 1, RelativeUnit.Relative),
-                GradientStops =
-                {
-                    new GradientStop(Color.FromArgb(240, 28, 32, 42), 0),
-                    new GradientStop(Color.FromArgb(240, 18, 22, 30), 1)
-                }
-            },
-            BorderBrush = new LinearGradientBrush
-            {
-                StartPoint = new RelativePoint(0, 0, RelativeUnit.Relative),
-                EndPoint = new RelativePoint(1, 1, RelativeUnit.Relative),
-                GradientStops =
-                {
-                    new GradientStop(Color.FromArgb(150,
-                        Accents.AccentPrimary.R, Accents.AccentPrimary.G, Accents.AccentPrimary.B), 0),
-                    new GradientStop(Color.FromArgb(40, 255, 255, 255), 1)
-                }
-            },
+            CornerRadius = new CornerRadius(12),
+            // Make the card background transparent so the area behind
+            // the preview shows through instead of a filled gradient.
+            Background = Brushes.Transparent,
+            BorderBrush = new SolidColorBrush(Accents.AccentSecondary),
             BorderThickness = new Thickness(1),
-            ClipToBounds = true,
-            BoxShadow = new BoxShadows(
-                new BoxShadow
-                {
-                    OffsetX = 0,
-                    OffsetY = 14,
-                    Blur = 36,
-                    Spread = 0,
-                    Color = Color.FromArgb(180, 0, 0, 0)
-                },
-                [
-                    new BoxShadow
-                    {
-                        OffsetX = 0,
-                        OffsetY = 0,
-                        Blur = 22,
-                        Spread = -6,
-                        Color = Color.FromArgb(110,
-                            Accents.AccentPrimary.R, Accents.AccentPrimary.G, Accents.AccentPrimary.B)
-                    }
-                ]),
+            ClipToBounds = false,
+            BoxShadow = new BoxShadows(new BoxShadow
+            {
+                OffsetX = 0,
+                OffsetY = 14,
+                Blur = 36,
+                Spread = 0,
+                Color = Color.FromArgb(150, 0, 0, 0)
+            }),
             Cursor = new Cursor(StandardCursorType.Hand),
-            Child = cardBody
+            Child = imageFrame,
+            // Born invisible; OpenPreview flips this to true after mounting
+            // into the OverlayLayer. Mounted-but-invisible costs nothing
+            // and lets us avoid Add/Remove churn on every hover.
+            IsVisible = false
         };
 
         // Keep the popover open while the cursor lives inside it (so the
@@ -583,93 +753,192 @@ public sealed class TaskbarAppsStrip : Border
             ClosePreview(immediate: true);
             ActivateChip(target);
         };
+    }
 
-        _previewPopup = new Popup
+    /// <summary>
+    /// Builds the popover card's background gradient. Mirrors the apps menu
+    /// / notification popover recipe so every DOSI dropdown surface reads
+    /// as the same family of card. Light-accent branch keeps the surface
+    /// pale enough for dark text to stay readable.
+    /// </summary>
+    private static IBrush BuildPreviewBackground()
+    {
+        if (Accents.CurrentAccent == DOSIAccent.Light)
         {
-            Placement = PlacementMode.AnchorAndGravity,
-            PlacementAnchor = PopupAnchor.Bottom,
-            PlacementGravity = PopupGravity.Bottom,
-            HorizontalOffset = 0,
-            VerticalOffset = 10,
-            // Keep the popup focusless so hovering over a chip doesn't
-            // steal focus from whatever the user is typing into.
-            IsLightDismissEnabled = false,
-            Child = _previewCard,
-            OverlayDismissEventPassThrough = true
+            return new LinearGradientBrush
+            {
+                StartPoint = new RelativePoint(0, 0, RelativeUnit.Relative),
+                EndPoint = new RelativePoint(0, 1, RelativeUnit.Relative),
+                GradientStops =
+                {
+                    new GradientStop(Color.FromArgb(245, 250, 251, 254), 0),
+                    new GradientStop(Color.FromArgb(238, 232, 236, 244), 1)
+                }
+            };
+        }
+        return new LinearGradientBrush
+        {
+            StartPoint = new RelativePoint(0, 0, RelativeUnit.Relative),
+            EndPoint = new RelativePoint(0, 1, RelativeUnit.Relative),
+            GradientStops =
+            {
+                new GradientStop(Color.FromArgb(235, 28, 30, 38), 0),
+                new GradientStop(Color.FromArgb(225, 16, 18, 26), 1)
+            }
         };
     }
 
     /// <summary>
     /// Renders a fresh thumbnail of <paramref name="window"/> into the
-    /// preview image. Uses <see cref="RenderTargetBitmap"/> on the window
-    /// visual itself so the image is whatever the user would see if they
-    /// pulled the window forward right now. Native WebView surfaces live
-    /// on the OS compositor and won't show in a managed bitmap; the
-    /// preview gracefully falls back to a title-only card in that case.
+    /// preview image. Uses <see cref="RenderTargetBitmap"/> on the window's
+    /// chrome+content visual (excluding the shadow gutter) so the image is
+    /// exactly the window UI the user would see if they pulled the window
+    /// forward right now. Native WebView surfaces live on the OS compositor
+    /// and won't show in a managed bitmap; the preview falls back to a
+    /// styled placeholder card carrying the app title in that case, and
+    /// also when the window is currently minimized (no visual to render).
     /// </summary>
     private void RefreshPreviewContent(DOSIWindow window)
     {
-        if (_previewTitle == null || _previewSubtitle == null ||
-            _previewBadge == null || _previewImage == null ||
-            _previewBadge.Child is not TextBlock badgeText) return;
+        if (_previewImage == null || _previewPlaceholderText == null) return;
 
-        _previewTitle.Text = string.IsNullOrWhiteSpace(window.Title) ? "Window" : window.Title;
-        _previewSubtitle.Text = window.WindowState == DOSIWindowState.Minimized
-            ? "MINIMIZED \u00B7 CLICK TO RESTORE"
-            : (IsActive(window)
-                ? "ACTIVE \u00B7 CLICK TO MINIMIZE"
-                : "CLICK TO BRING FORWARD");
-        badgeText.Text = ResolveInitial(window.Title);
-        _previewBadge.Background = new SolidColorBrush(Accents.AccentPrimary);
-        badgeText.Foreground = new SolidColorBrush(Accents.TextOnAccent);
-
-        try
+        // Re-apply accent-aware surfaces every refresh so a flip mid-hover
+        // re-tints without waiting for the popover to close + re-open.
+        if (_previewCard != null)
         {
-            var bmp = SnapshotWindow(window);
-            _previewImage.Source = bmp;
-            _previewImage.IsVisible = bmp != null;
+            _previewCard.Background = BuildPreviewBackground();
+            _previewCard.BorderBrush = new SolidColorBrush(Accents.AccentSecondary);
         }
-        catch
+
+        // Try a short-lived cache first to avoid expensive re-renders while
+        // the user moves across chips. Cached entries older than 1s are
+        // dropped so rapid state changes still refresh in a timely way.
+        var useCache = _previewCache.TryGetValue(window, out var cached) &&
+                       cached.Bitmap != null &&
+                       (DateTime.UtcNow - cached.Timestamp).TotalMilliseconds < 1000;
+        RenderTargetBitmap? bmp = null;
+        if (useCache)
         {
+            bmp = cached.Bitmap;
+        }
+        else
+        {
+            try { bmp = SnapshotWindow(window); }
+            catch { bmp = null; }
+            _previewCache[window] = (bmp, DateTime.UtcNow);
+        }
+
+        if (bmp != null)
+        {
+            // Ensure the bitmap fills the preview area visually. Some
+            // captures end up small or letterboxed; render the captured
+            // bitmap into a fixed-size preview bitmap that exactly fits
+            // the visible preview plate so Stretch/align quirks can't
+            // leave the thumbnail stuck in a corner.
+            var fitted = EnsureBitmapFitsPreview(bmp);
+            _previewImage.Source = fitted ?? bmp;
+            _previewImage.IsVisible = true;
+            _previewPlaceholderText.IsVisible = false;
+        }
+        else
+        {
+            // Minimized / not-yet-laid-out / native-surface windows can't be
+            // captured via RenderTargetBitmap. Show a graceful placeholder
+            // instead of the garbled output the user would otherwise see
+            // from rendering a 0x0 or invisible visual.
             _previewImage.Source = null;
             _previewImage.IsVisible = false;
+            _previewPlaceholderText.Text = window.WindowState == DOSIWindowState.Minimized
+                ? $"{(string.IsNullOrWhiteSpace(window.Title) ? "Window" : window.Title)}\nMinimized"
+                : (string.IsNullOrWhiteSpace(window.Title) ? "Preview unavailable" : window.Title);
+            _previewPlaceholderText.IsVisible = true;
         }
     }
 
     private static RenderTargetBitmap? SnapshotWindow(DOSIWindow window)
     {
-        // DOSIWindow embeds a 50 px shadow gutter on every side - its
-        // actual visual size is Width / Height, not WindowWidth /
-        // WindowHeight.
-        var width = window.Width;
-        var height = window.Height;
-        if (double.IsNaN(width) || double.IsNaN(height) ||
-            width <= 1 || height <= 1) return null;
+        // Minimized windows have IsVisible=false on the entire control, so
+        // the visual subtree never renders. Rendering one anyway produces
+        // the "tiny dark fragment in the top-left of a black canvas" image
+        // the user reported. Return null so the caller falls back to the
+        // styled placeholder.
+        if (window.WindowState == DOSIWindowState.Minimized) return null;
+        if (!window.IsVisible) return null;
 
-        // CRITICAL: RenderTargetBitmap.Render(Visual) paints the visual
-        // at its NATIVE pixel size into the bitmap's top-left corner -
-        // it does NOT scale to fit. Sizing the bitmap to (width*scale,
-        // height*scale) and rendering a 1000x700 window into it leaves
-        // only the top-left ~360x320 visible and clips the rest, which
-        // is the cut-off thumbnail the user keeps reporting.
-        //
-        // The supported way to downscale is via the bitmap's DPI: a 96
-        // DPI render of a 1000x700 visual produces 1000x700 pixels; at
-        // 48 DPI the SAME visual fills only 500x350 device pixels. We
-        // pick a target DPI so the WHOLE window fits inside a ~480 px
-        // longest-edge bitmap, then size the bitmap to the same scaled
-        // dimensions - result: the entire window (chrome + content +
-        // shadow gutter) ends up inside the bitmap with nothing clipped.
-        const double maxDim = 480;
-        var scale = Math.Min(1.0, maxDim / Math.Max(width, height));
-        var pixelW = Math.Max(1, (int)Math.Ceiling(width * scale));
-        var pixelH = Math.Max(1, (int)Math.Ceiling(height * scale));
-        var dpi = 96 * scale;
+        // Snapshot the window UI itself (chrome + content + accent border
+        // + rounded corners), NOT the outer container that includes the
+        // 50 px shadow gutter. WindowVisual.Bounds is sized to
+        // WindowWidth / WindowHeight when the visual has been laid out;
+        // before first measure (window opened this frame, never shown
+        // yet) we fall back to the public WindowWidth/WindowHeight which
+        // are always populated.
+        var visual = window.WindowVisual;
+
+        // Prefer the window's logical size (WindowWidth/WindowHeight) as
+        // the snapshot source dimensions so the captured thumbnail is
+        // independent of the on-screen control's current rendered size.
+        // This makes the taskbar preview behave like Windows: the full
+        // window contents are shown scaled to the preview area regardless
+        // of how the user sized the live window on the desktop.
+        var width = window.WindowWidth;
+        var height = window.WindowHeight;
+        // Fall back to the visual's measured bounds only if the logical
+        // dimensions are unavailable.
+        if (double.IsNaN(width) || double.IsNaN(height) || width < 1 || height < 1)
+        {
+            width = visual.Bounds.Width;
+            height = visual.Bounds.Height;
+        }
+        if (double.IsNaN(width) || double.IsNaN(height) || width < 1 || height < 1) return null;
+
+        // Render the visual into a bitmap sized exactly to the preview
+        // plate so the Image control always gets a source that fills the
+        // preview area. Do NOT modify the live visual. Instead use a
+        // VisualBrush that paints the live visual into an offscreen host
+        // at the desired preview size and rasterize that host.
+        var pixelW = Math.Max(1, (int)Math.Ceiling(PreviewWidth));
+        var pixelH = Math.Max(1, (int)Math.Ceiling(PreviewImageHeight));
+        var dpi = 96.0;
 
         var rtb = new RenderTargetBitmap(new PixelSize(pixelW, pixelH), new Vector(dpi, dpi));
         try
         {
-            rtb.Render(window);
+            // Host with a solid background so transparent regions composite
+            // against the window background rather than the card plate.
+            var host = new Grid
+            {
+                Width = PreviewWidth,
+                Height = PreviewImageHeight,
+                // Keep the raster host transparent so the rendered visual
+                // composite doesn't get an accent-coloured backing. The
+                // snapshot should be the window UI only; any surrounding
+                // card/background is provided by the popover visuals.
+                Background = Brushes.Transparent
+            };
+
+            // Paint the live visual into a Rectangle using a VisualBrush so
+            // we don't modify the live visual tree (no RenderTransform).
+            var vb = new VisualBrush
+            {
+                Visual = visual,
+                Stretch = Stretch.Uniform,
+                AlignmentX = AlignmentX.Center,
+                AlignmentY = AlignmentY.Center
+            };
+
+            var rect = new Rectangle
+            {
+                Width = PreviewWidth,
+                Height = PreviewImageHeight,
+                Fill = vb,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center
+            };
+            host.Children.Add(rect);
+
+            host.Measure(new Size(PreviewWidth, PreviewImageHeight));
+            host.Arrange(new Rect(0, 0, PreviewWidth, PreviewImageHeight));
+            rtb.Render(host);
             return rtb;
         }
         catch
@@ -744,11 +1013,13 @@ public sealed class TaskbarAppsStrip : Border
         public DOSIWindow Window { get; }
         private readonly EventHandler<DOSIWindowStateChangedEventArgs> _stateHandler;
         private readonly EventHandler<DOSIWindowFocusEventArgs> _focusHandler;
+        private readonly EventHandler? _layoutHandler;
 
         public ChipEntry(Border chip, TextBlock label, Border badge, TextBlock initial,
             Border underline, DOSIWindow window,
             EventHandler<DOSIWindowStateChangedEventArgs> stateHandler,
-            EventHandler<DOSIWindowFocusEventArgs> focusHandler)
+            EventHandler<DOSIWindowFocusEventArgs> focusHandler,
+            EventHandler? layoutHandler)
         {
             Chip = chip;
             Label = label;
@@ -758,12 +1029,14 @@ public sealed class TaskbarAppsStrip : Border
             Window = window;
             _stateHandler = stateHandler;
             _focusHandler = focusHandler;
+            _layoutHandler = layoutHandler;
         }
 
         public void Detach()
         {
             Window.StateChanged -= _stateHandler;
             Window.FocusChanged -= _focusHandler;
+            if (_layoutHandler != null) Window.LayoutUpdated -= _layoutHandler;
         }
     }
 }

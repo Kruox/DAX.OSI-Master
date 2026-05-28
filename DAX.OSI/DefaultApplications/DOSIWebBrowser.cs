@@ -48,6 +48,13 @@ public class DOSIWebBrowser : DOSIWindow
     private Border? _loadProgress;
     private Avalonia.Threading.DispatcherTimer? _loadProgressTimer;
     private double _loadProgressPhase;
+    // ---- Downloads flyout ---------------------------------------------------
+    // Owned per-window so each browser instance has its own download list,
+    // matching Edge / Chrome behaviour where the popover follows the
+    // originating window. The flyout's Root overlays the entire browser
+    // content; its ToolbarButton is hosted in the toolbar so the user has
+    // a stable affordance to reopen the popover after dismissing it.
+    private readonly DOSIDownloadsFlyout _downloadsFlyout = new();
     private readonly List<string> _history = [];
     private int _historyIndex = -1;
     private string _currentUrl = "dosi://home";
@@ -195,7 +202,7 @@ public class DOSIWebBrowser : DOSIWindow
         // Toolbar layout
         var toolbar = new Grid
         {
-            ColumnDefinitions = new ColumnDefinitions("Auto,*,Auto"),
+            ColumnDefinitions = new ColumnDefinitions("Auto,*,Auto,Auto"),
             Margin = new Thickness(8),
             Height = 38
         };
@@ -213,6 +220,12 @@ public class DOSIWebBrowser : DOSIWindow
 
         toolbar.Children.Add(goButton);
         Grid.SetColumn(goButton, 2);
+
+        // Downloads bell - opens the in-window downloads flyout (see
+        // DOSIDownloadsFlyout). Pulses with an accent badge while any
+        // download is active.
+        toolbar.Children.Add(_downloadsFlyout.ToolbarButton);
+        Grid.SetColumn(_downloadsFlyout.ToolbarButton, 3);
 
         // Content area (where web pages are displayed)
         _contentArea = new Border
@@ -335,7 +348,14 @@ public class DOSIWebBrowser : DOSIWindow
         mainGrid.Children.Add(_statusBar);
         Grid.SetRow(_statusBar, 3);
 
-        Content = mainGrid;
+        // Overlay grid: mainGrid + downloads flyout. The flyout anchors
+        // top-right inside the overlay so it floats above the WebView
+        // surface and the toolbar without being clipped to either row.
+        var rootOverlay = new Grid();
+        rootOverlay.Children.Add(mainGrid);
+        rootOverlay.Children.Add(_downloadsFlyout.Root);
+
+        Content = rootOverlay;
 
         // Subscribe to accent changes
         AttachedToVisualTree += (s, e) => Accents.AccentChanged += OnAccentChanged;
@@ -1082,6 +1102,12 @@ public class DOSIWebBrowser : DOSIWindow
         // here we collapse the browser chrome and maximise the host window
         // so the WebView surface fills the OS window edge-to-edge.
         _webView.FullScreenChangeRequested += OnWebViewFullScreenChangeRequested;
+
+        // Intercept download clicks before the renderer's own save dialog
+        // would appear. The flyout owns the actual fetch + on-disk write
+        // (always rooted in the user's Downloads folder) and surfaces a
+        // DOSI-themed popover in place of the native chrome.
+        _webView.DownloadRequested += (_, dl) => _downloadsFlyout.BeginDownload(dl);
 
         ShowTabContent(_webView);
         _webView.NavigateToUrl(url);
