@@ -931,6 +931,26 @@ internal sealed class DOSIDownloadsFlyout
         if (entry.StatusText != null) entry.StatusText.Text = "Open file";
         if (entry.ProgressFill != null && entry.ProgressTrack != null)
             entry.ProgressFill.Width = entry.ProgressTrack.Bounds.Width;
+
+        // Quick green-tinted pulse on the icon chip so the user catches
+        // completion peripherally even if they're not looking at the
+        // flyout. Reverts to the accent gradient after ~600 ms so the
+        // chip stays accent-consistent at rest.
+        if (entry.IconChip != null)
+        {
+            var originalBg = entry.IconChip.Background;
+            entry.IconChip.Background = new SolidColorBrush(Color.FromRgb(60, 180, 120));
+            var timer = new Avalonia.Threading.DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(600)
+            };
+            timer.Tick += (_, _) =>
+            {
+                timer.Stop();
+                if (entry.IconChip != null) entry.IconChip.Background = originalBg;
+            };
+            timer.Start();
+        }
     }
 
     private static void MarkRowFailed(DownloadEntry entry, string reason)

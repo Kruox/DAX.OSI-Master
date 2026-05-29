@@ -7,6 +7,7 @@ using Avalonia.Input;
 using Avalonia.Layout;
 using Avalonia.Media;
 using Avalonia.Threading;
+using Avalonia.VisualTree;
 using DOSI.CORE;
 using DOSI.CORE.AccentManagement;
 using DOSI.CORE.Animations;
@@ -831,6 +832,15 @@ public class LoginScreen : DOSIScreen
             Children = { ring, initial }
         };
 
+        // Personal touch: if the user has picked a wallpaper, paint its
+        // thumbnail UNDER the gradient ring so each tile is a tiny window
+        // into that user's world. The ring stays on top so the accent
+        // gradient still dominates - we just bleed a soft preview through.
+        // Async-loaded from the shared thumbnail cache (warmed at boot)
+        // so this is free at picker time. Skipped for accent-only users
+        // since there's nothing to preview.
+        TryAddWallpaperHalo(avatar, user, ring);
+
         var name = new TextBlock
         {
             Text = user.DisplayName,
@@ -910,6 +920,57 @@ public class LoginScreen : DOSIScreen
         };
         tile.PointerPressed += (_, _) => SelectUser(user);
         return tile;
+    }
+
+    /// <summary>
+    /// Inserts a circular, soft-edged wallpaper preview under the user's
+    /// gradient ring so each picker tile reads as "your space." Async
+    /// thumbnail load via WallpaperManager so the picker doesn't pay
+    /// decode cost; if the user has no wallpaper (or the decode fails),
+    /// the ring just stays gradient-only - same as before. The preview
+    /// is clipped to a circle via OpacityMask so the ring's circular
+    /// outline keeps reading cleanly.
+    /// </summary>
+    private static void TryAddWallpaperHalo(Grid avatar, DOSIUser user, Ellipse ring)
+    {
+        var key = UserManager.GetUserWallpaper(user);
+        if (string.IsNullOrWhiteSpace(key)) return;
+        if (string.Equals(key, WallpaperManager.AccentOnlyKey, StringComparison.OrdinalIgnoreCase)) return;
+
+        // Image rendered inside an Ellipse-clipped Border so the bitmap
+        // composites as a circle exactly the same diameter as the
+        // gradient ring above it.
+        var image = new Image
+        {
+            Stretch = Stretch.UniformToFill,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+            Opacity = 0.55  // muted so the accent ring still dominates
+        };
+        var halo = new Border
+        {
+            Width = 64,
+            Height = 64,
+            CornerRadius = new CornerRadius(32),
+            ClipToBounds = true,
+            HorizontalAlignment = HorizontalAlignment.Center,
+            VerticalAlignment = VerticalAlignment.Center,
+            IsHitTestVisible = false,
+            Child = image
+        };
+
+        // Insert BEFORE the existing children so the halo sits beneath the
+        // gradient ring and initial. Ring renders on top, halo behind it.
+        avatar.Children.Insert(0, halo);
+
+        WallpaperManager.Instance.LoadThumbnailAsync(key!, bmp =>
+        {
+            // Sanity: the avatar may have been detached before the
+            // decode landed (rapid sign-in/out). Skip the assign in
+            // that case so we don't pin the bitmap unnecessarily.
+            if (bmp != null && halo.Parent != null)
+                image.Source = bmp;
+        });
     }
 
     private static (Color Primary, Color Secondary) GetUserAccentColors(DOSIUser user)

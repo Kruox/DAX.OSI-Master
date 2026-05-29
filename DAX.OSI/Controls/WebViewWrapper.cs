@@ -916,8 +916,23 @@ public class WebViewWrapper : UserControl, IDisposable
     window.__dosiDlInstalled = true;
     var DL_EXT = /\.(zip|rar|7z|tar|gz|tgz|bz2|xz|iso|dmg|pkg|deb|rpm|appimage|exe|msi|msix|apk|ipa|jar|war|aar|nupkg|whl|crx|xpi|cab|mp3|wav|flac|ogg|opus|m4a|mp4|m4v|mov|mkv|avi|webm|wmv|3gp|pdf|epub|mobi|azw3|djvu|psd|ai|svgz|sketch|fig|blend|fbx|obj|stl|gltf|glb|usdz|csv|xls|xlsx|xlsm|doc|docx|ppt|pptx|odt|ods|odp|rtf|txt|json|xml|yaml|yml|sql|db|sqlite|bak|log|ttf|otf|woff|woff2|eot|bin|img|vhd|vhdx|ova|ovf)(\?.*)?$/i;
     // Cache HEAD probes by URL so a re-click on the same link doesn't
-    // re-issue the network probe. We only need a positive/negative bit.
+    // re-issue the network probe. Bounded to 256 entries so a long
+    // browsing session can't grow this unbounded; oldest entries are
+    // evicted in insertion order (good-enough LRU - we don't need
+    // true recency on a probe cache).
     var headCache = Object.create(null);
+    var headOrder = [];
+    var HEAD_CACHE_MAX = 256;
+    function headPut(key, value) {
+        if (headCache[key] === undefined) {
+            headOrder.push(key);
+            if (headOrder.length > HEAD_CACHE_MAX) {
+                var drop = headOrder.shift();
+                if (drop !== undefined) delete headCache[drop];
+            }
+        }
+        headCache[key] = value;
+    }
     function send(payload) {
         var msg;
         try { msg = JSON.stringify(payload); } catch (e) { return; }
@@ -984,7 +999,7 @@ public class WebViewWrapper : UserControl, IDisposable
 
         return fetch(href, { method: 'HEAD', credentials: 'include', redirect: 'follow' })
             .then(function (resp) {
-                if (!resp || !resp.ok) { headCache[href] = null; return null; }
+                if (!resp || !resp.ok) { headPut(href, null); return null; }
                 var cd = resp.headers.get('content-disposition') || '';
                 var ct = (resp.headers.get('content-type') || '').toLowerCase();
                 var looksAttachment = /attachment/i.test(cd);
@@ -996,13 +1011,13 @@ public class WebViewWrapper : UserControl, IDisposable
                     ct.indexOf('application/x-msi') === 0 ||
                     ct.indexOf('application/vnd.android.package-archive') === 0 ||
                     ct.indexOf('application/x-apple-diskimage') === 0;
-                if (!looksAttachment && !binaryType) { headCache[href] = null; return null; }
+                if (!looksAttachment && !binaryType) { headPut(href, null); return null; }
                 var name = fileNameFromDisposition(cd) || fileNameFromUrl(href) || 'download';
                 var result = { name: name };
-                headCache[href] = result;
+                headPut(href, result);
                 return result;
             })
-            .catch(function () { headCache[href] = null; return null; });
+            .catch(function () { headPut(href, null); return null; });
     }
     function handler(e) {
         // Skip non-primary buttons and any modifier - those go through

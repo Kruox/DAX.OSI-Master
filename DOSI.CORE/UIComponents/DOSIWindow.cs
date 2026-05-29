@@ -2187,6 +2187,17 @@ public class DOSIWindow : UserControl
         _windowBorder.BorderBrush = _isFocused
             ? Accents.WindowBorderFocusedBrush
             : Accents.WindowBorderUnfocusedBrush;
+
+        // Subtle opacity dip for unfocused windows so the active window
+        // visually pops without us having to brighten its chrome. 0.92
+        // is enough to register peripherally without making background
+        // windows feel disabled. Skipped while a drag/resize/animation
+        // is in flight - changing alpha mid-tween would jitter the
+        // composite.
+        if (!_isAnimating)
+        {
+            _windowBorder.Opacity = _isFocused ? 1.0 : 0.92;
+        }
     }
 
     private void OnAccentChanged(object? sender, EventArgs e)

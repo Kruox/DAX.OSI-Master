@@ -657,6 +657,7 @@ public sealed class DOSIImageViewer : DOSIWindow
         if (_siblings.Count == 0 || _siblingIndex < 0) return;
         _siblingIndex = (_siblingIndex - 1 + _siblings.Count) % _siblings.Count;
         LoadImage(_siblings[_siblingIndex]);
+        PrewarmAdjacentSiblings();
     }
 
     private void GoNext()
@@ -665,6 +666,23 @@ public sealed class DOSIImageViewer : DOSIWindow
         if (_siblings.Count == 0 || _siblingIndex < 0) return;
         _siblingIndex = (_siblingIndex + 1) % _siblings.Count;
         LoadImage(_siblings[_siblingIndex]);
+        PrewarmAdjacentSiblings();
+    }
+
+    /// <summary>
+    /// Best-effort: kick a background decode of the previous + next
+    /// sibling images so left/right arrow paging feels instant. The
+    /// decodes go into the shared ImageCache so a re-visit (e.g. user
+    /// pages forward then back) is a cache hit. Cheap - the cache
+    /// short-circuits already-decoded entries before any IO.
+    /// </summary>
+    private void PrewarmAdjacentSiblings()
+    {
+        if (_siblings.Count < 2 || _siblingIndex < 0) return;
+        var prev = _siblings[(_siblingIndex - 1 + _siblings.Count) % _siblings.Count];
+        var next = _siblings[(_siblingIndex + 1) % _siblings.Count];
+        try { DOSI.CORE.ImageManagement.ImageCache.Prewarm(prev, DOSI.CORE.ImageManagement.ImageCache.ViewMaxDimension); } catch { }
+        try { DOSI.CORE.ImageManagement.ImageCache.Prewarm(next, DOSI.CORE.ImageManagement.ImageCache.ViewMaxDimension); } catch { }
     }
 
     // =====================================================================

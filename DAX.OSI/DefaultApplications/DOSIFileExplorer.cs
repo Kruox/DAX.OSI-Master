@@ -3753,16 +3753,27 @@ public class DOSIFileExplorer : DOSIWindow
             }
             else if (IsImageExtensionForQuickLook(Path.GetExtension(path)))
             {
-                using var stream = File.OpenRead(path);
-                var bmp = new Avalonia.Media.Imaging.Bitmap(stream);
-                previewBody = new Image
+                // Use the shared ImageCache so a Quick Look on a 24 MP
+                // phone photo doesn't freeze the dispatcher for ~half a
+                // second decoding the source - the popup is at most
+                // 560x360 anyway, so we cap at 1600 px long edge for a
+                // crisp preview that still composites cheaply.
+                var img = new Image
                 {
-                    Source = bmp,
                     MaxWidth = 560,
                     MaxHeight = 360,
                     Stretch = Stretch.Uniform,
                     HorizontalAlignment = HorizontalAlignment.Center
                 };
+                DOSI.CORE.ImageManagement.ImageCache.LoadAsync(path, 1600, bmp =>
+                {
+                    // The overlay may have been dismissed before the
+                    // decode finished - only assign if we're still
+                    // attached to the visual tree.
+                    if (bmp != null && img.Parent != null)
+                        img.Source = bmp;
+                });
+                previewBody = img;
             }
             else if (IsTextExtensionForQuickLook(Path.GetExtension(path)))
             {

@@ -750,6 +750,18 @@ public static class UserManager
 
         CurrentUserChanged?.Invoke(null, user);
         LoginSucceeded?.Invoke(null, user.Username);
+
+        // Lazy trash retention sweep: if the user has set a retention
+        // window via the AutoEmptyDaysPreferenceKey preference, sweep
+        // stale entries now so the trash size doesn't quietly bloat
+        // across sessions. Best-effort, off the UI thread so a slow
+        // delete on a giant folder can't block sign-in.
+        System.Threading.Tasks.Task.Run(() =>
+        {
+            try { DOSI.CORE.UserManagement.FileTrash.SweepUsingUserPreference(user); }
+            catch { /* sweep is best-effort */ }
+        });
+
         return user;
     }
 

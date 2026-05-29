@@ -1029,17 +1029,23 @@ public class DOSISettingsScreen : DOSIWindow
             foreach (var w in wm.AvailableWallpapers)
             {
                 var captured = w;
-                // Use the thumbnail cache, NOT LoadBitmap - LoadBitmap
-                // returns the full-resolution desktop bitmap (potentially
-                // tens of MB per image as a live GPU texture). With even a
-                // handful of custom wallpapers that pinned the compositor's
-                // texture budget hard enough to lag the whole UI - which is
-                // exactly what users hit after picking phone-shot photos.
-                var bmp = wm.LoadThumbnail(captured.Key);
+                // Build the tile with no bitmap first - LoadThumbnailAsync
+                // populates the inner Image control once the decode lands
+                // off the UI thread. Without async loading, a settings
+                // open with a handful of cold custom wallpapers would
+                // spike the dispatcher decoding each thumbnail in turn.
                 var tile = BuildWallpaperTile(
                     captured.DisplayName,
-                    bmp,
-                    string.Equals(captured.Key, current, StringComparison.OrdinalIgnoreCase));
+                    bitmap: null,
+                    selected: string.Equals(captured.Key, current, StringComparison.OrdinalIgnoreCase));
+                wm.LoadThumbnailAsync(captured.Key, bmp =>
+                {
+                    if (bmp == null) return;
+                    // Find the inner Image (BuildWallpaperTile created it
+                    // empty when bitmap was null - locate it via the host
+                    // Border's known child shape).
+                    BindThumbnailToTile(tile, bmp);
+                });
                 tile.PointerPressed += (_, e) =>
                 {
                     e.Handled = true;
@@ -1165,7 +1171,12 @@ public class DOSISettingsScreen : DOSIWindow
     private static Border BuildWallpaperTile(string label, Bitmap? bitmap, bool selected)
     {
         Control inner;
-        if (bitmap != null)
+        // bitmap == null + label != "Accent" means "thumbnail decode in
+        // flight" - show an empty Image we can populate via
+        // BindThumbnailToTile when the decode lands. Only the special
+        // accent-only tile gets the live-accent gradient backdrop.
+        bool isAccentOnly = string.Equals(label, "Accent", StringComparison.OrdinalIgnoreCase);
+        if (bitmap != null || !isAccentOnly)
         {
             inner = new Image
             {
@@ -1256,6 +1267,22 @@ public class DOSISettingsScreen : DOSIWindow
                 : new SolidColorBrush(Color.FromArgb(50, 255, 255, 255));
             tile.BorderThickness = new Thickness(sel ? 2 : 1);
         }
+    }
+
+    /// <summary>
+    /// Walks the wallpaper tile's known visual shape (tile -&gt; stack -&gt;
+    /// imageHost -&gt; image) and assigns <paramref name="bitmap"/> to the
+    /// inner Image. No-op if the tile structure doesn't match (e.g. the
+    /// accent-only tile, which has a Border child instead of an Image).
+    /// Used by the async thumbnail loader to populate tiles after the
+    /// decode lands without rebuilding the visual subtree.
+    /// </summary>
+    private static void BindThumbnailToTile(Border tile, Bitmap bitmap)
+    {
+        if (tile.Child is not StackPanel stack) return;
+        if (stack.Children.Count == 0) return;
+        if (stack.Children[0] is not Border host) return;
+        if (host.Child is Image img) img.Source = bitmap;
     }
 
     // =====================================================================

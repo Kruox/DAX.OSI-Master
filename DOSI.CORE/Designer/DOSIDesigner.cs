@@ -130,6 +130,18 @@ public sealed class DOSIDesignerEditHandlerRequestedEventArgs : EventArgs
     public required string EventName { get; init; }
 }
 
+/// <summary>
+/// Payload for <see cref="DOSIDesigner.ControlRenamed"/>. Carries the old
+/// and new name of a control so the IDE can rewrite any open code-behind
+/// buffers (specifically: method names like <c>OldName_Click</c> become
+/// <c>NewName_Click</c>) before the user hits Run.
+/// </summary>
+public sealed class DOSIDesignerControlRenamedEventArgs : EventArgs
+{
+    public required string OldName { get; init; }
+    public required string NewName { get; init; }
+}
+
 /// <summary>JSON load/save for <see cref="DOSIFormDocument"/>.</summary>
 public static class DOSIFormSerializer
 {
@@ -591,6 +603,14 @@ public sealed class DOSIDesigner : UserControl
     /// code-behind tab - much better UX than a cramped modal dialog.
     /// </summary>
     public event EventHandler<DOSIDesignerEditHandlerRequestedEventArgs>? EditHandlerRequested;
+    /// <summary>
+    /// Raised when the user renames a control via the property panel's
+    /// Name row. The IDE handles this by renaming the corresponding
+    /// method(s) in any open code-behind buffer so handler bindings
+    /// don't silently break. The args carry both the old and new name
+    /// so a string-rename pass is trivial.
+    /// </summary>
+    public event EventHandler<DOSIDesignerControlRenamedEventArgs>? ControlRenamed;
     public bool IsDirty => _isDirty;
     public DOSIFormDocument Document => _doc;
 
@@ -1216,7 +1236,27 @@ public sealed class DOSIDesigner : UserControl
         {
             // Names must be C#-ident-friendly because the handler compiler
             // uses them verbatim as method-name prefixes.
-            ad.Def.Name = SanitizeIdentLoose(s);
+            var sanitized = SanitizeIdentLoose(s);
+            var previous = ad.Def.Name;
+            if (string.Equals(previous, sanitized, StringComparison.Ordinal)) return;
+            ad.Def.Name = sanitized;
+            // Notify the IDE so any open code-behind tab can rename
+            // <OldName>_<Event> methods to <NewName>_<Event> in place -
+            // otherwise the user's typed handler bodies silently
+            // disconnect from the renamed control at next Run.
+            if (!string.IsNullOrWhiteSpace(previous) && !string.IsNullOrWhiteSpace(sanitized))
+            {
+                try
+                {
+                    ControlRenamed?.Invoke(this,
+                        new DOSIDesignerControlRenamedEventArgs
+                        {
+                            OldName = previous,
+                            NewName = sanitized
+                        });
+                }
+                catch { /* listener errors must not break the property panel */ }
+            }
             MarkDirty();
         });
         AddDivider();

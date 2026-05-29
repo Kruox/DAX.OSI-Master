@@ -219,6 +219,52 @@ public static class FileTrash
         return removed;
     }
 
+    /// <summary>
+    /// User preference key for the trash auto-empty retention policy
+    /// (in days). 0 / missing = retain forever (the historical default).
+    /// </summary>
+    public const string AutoEmptyDaysPreferenceKey = "trash.autoEmptyDays";
+
+    /// <summary>
+    /// Sweeps the user's trash and permanently deletes any entry older
+    /// than <paramref name="retentionDays"/>. No-op when the retention
+    /// is &lt;= 0 (the "keep forever" sentinel). Safe to call from any
+    /// thread - each delete goes through the existing per-entry path
+    /// which holds the manifest write internally. Returns the number of
+    /// entries swept so callers can surface a status line.
+    /// </summary>
+    public static int SweepOlderThan(DOSIUser user, int retentionDays)
+    {
+        if (retentionDays <= 0) return 0;
+        var cutoff = DateTime.UtcNow.AddDays(-retentionDays);
+        var stale = List(user).Where(e => e.DeletedAtUtc < cutoff).ToList();
+        int removed = 0;
+        foreach (var e in stale)
+        {
+            if (DeleteForever(user, e.Id)) removed++;
+        }
+        return removed;
+    }
+
+    /// <summary>
+    /// Reads <see cref="AutoEmptyDaysPreferenceKey"/> from the user's
+    /// preferences and runs <see cref="SweepOlderThan"/> against it. The
+    /// boot / sign-in path calls this so retention is enforced lazily
+    /// (no background timer needed - the trash only grows when the user
+    /// is signed in, and we sweep on every sign-in). Best-effort.
+    /// </summary>
+    public static int SweepUsingUserPreference(DOSIUser user)
+    {
+        if (user == null) return 0;
+        try
+        {
+            if (!user.Preferences.TryGetValue(AutoEmptyDaysPreferenceKey, out var raw)) return 0;
+            if (!int.TryParse(raw, out var days) || days <= 0) return 0;
+            return SweepOlderThan(user, days);
+        }
+        catch { return 0; }
+    }
+
     /// <summary>Absolute path of the file/folder backing this trash entry.</summary>
     public static string ResolveItemPath(DOSIUser user, TrashEntry entry)
         => ResolveItemPath(GetTrashRoot(user), entry);
