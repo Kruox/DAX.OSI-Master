@@ -558,9 +558,13 @@ public class DOSIWindow : UserControl
         Width = 400;
         Height = 300;
 
-        // Start invisible for open animation
+        // Start invisible for open animation. Scale matches the
+        // first keyframe of PlayOpenAnimationAsync (0.92) so the very
+        // first paint doesn't snap from 0.95 -> 0.92 at the moment the
+        // animation starts (a one-frame pop the user reads as "the
+        // window flickered when opening").
         Opacity = 0;
-        RenderTransform = new ScaleTransform(0.95, 0.95);
+        RenderTransform = new ScaleTransform(0.92, 0.92);
         RenderTransformOrigin = new RelativePoint(0.5, 0.5, RelativeUnit.Relative);
 
         AddHandler(PointerPressedEvent, OnWindowPointerPressed, Avalonia.Interactivity.RoutingStrategies.Tunnel);
@@ -588,7 +592,14 @@ public class DOSIWindow : UserControl
     #region Animations
 
     /// <summary>
-    /// Plays the window open animation (fade in + scale up).
+    /// Plays the window open animation. The chrome enters from a slightly
+    /// smaller scale (0.92) and eases up to 1.0 with cubic ease-out so a
+    /// window opening reads as a visible "rise into place" rather than a
+    /// flat fade. CubicEaseOut (no overshoot) is intentional - earlier
+    /// experiments with BackEaseOut produced a visible wobble on large
+    /// windows because the easing's overshoot scaled the window past
+    /// 1.0 then back, which read as a flicker at the window's edges
+    /// even though the curve was smooth in absolute terms.
     /// </summary>
     public async Task PlayOpenAnimationAsync()
     {
@@ -608,8 +619,13 @@ public class DOSIWindow : UserControl
                     Setters =
                     {
                         new Setter(OpacityProperty, 0.0),
-                        new Setter(ScaleTransform.ScaleXProperty, 0.95),
-                        new Setter(ScaleTransform.ScaleYProperty, 0.95)
+                        // Slightly deeper start (0.92 vs the historical
+                        // 0.95) so the entrance motion is visible -
+                        // matched in the DOSIWindow constructor's
+                        // initial RenderTransform so the very first
+                        // paint doesn't snap.
+                        new Setter(ScaleTransform.ScaleXProperty, 0.92),
+                        new Setter(ScaleTransform.ScaleYProperty, 0.92)
                     }
                 },
                 new KeyFrame
@@ -630,10 +646,20 @@ public class DOSIWindow : UserControl
         Opacity = 1;
         RenderTransform = new ScaleTransform(1, 1);
         _isAnimating = false;
+        // Re-apply focus visuals (which UpdateFocusVisuals had skipped
+        // while _isAnimating was true) so the opacity dip catches up
+        // with the current focus state. Without this, a window that
+        // opens unfocused stays at full opacity until the next focus
+        // transition.
+        UpdateFocusVisuals();
     }
 
     /// <summary>
-    /// Plays the window close animation (fade out + scale down).
+    /// Plays the window close animation: scales down further than the
+    /// historical 0.95 (now 0.88) with quadratic ease-in so closing
+    /// reads as the window "departing" rather than dissolving in
+    /// place. Coupled with the BackEaseOut entry, lifecycle motion
+    /// reads as a real pair: pop in, pop out.
     /// </summary>
     public async Task PlayCloseAnimationAsync()
     {
@@ -644,7 +670,7 @@ public class DOSIWindow : UserControl
         var animation = new Animation
         {
             Duration = CloseAnimationDuration,
-            Easing = new CubicEaseIn(),
+            Easing = new QuadraticEaseIn(),
             FillMode = FillMode.Forward,
             Children =
             {
@@ -664,8 +690,10 @@ public class DOSIWindow : UserControl
                     Setters =
                     {
                         new Setter(OpacityProperty, 0.0),
-                        new Setter(ScaleTransform.ScaleXProperty, 0.95),
-                        new Setter(ScaleTransform.ScaleYProperty, 0.95)
+                        // Deeper than 0.95 so the closing motion is
+                        // legible - 0.95 was nearly a pure fade.
+                        new Setter(ScaleTransform.ScaleXProperty, 0.88),
+                        new Setter(ScaleTransform.ScaleYProperty, 0.88)
                     }
                 }
             }
@@ -806,12 +834,32 @@ public class DOSIWindow : UserControl
     /// <summary>
     /// Creates a beautiful macOS-style multi-layered drop shadow.
     /// </summary>
-    private static BoxShadows CreateMacOSShadow()
+    private static BoxShadows CreateMacOSShadow() => CreateMacOSShadow(focused: true);
+
+    /// <summary>
+    /// Builds the layered macOS-style window shadow. <paramref name="focused"/>
+    /// gates a deeper, slightly larger shadow stack so the active window
+    /// reads as physically nearer to the viewer than its peers - a subtle
+    /// but effective depth cue every modern shell uses. The unfocused
+    /// variant uses ~60% of the focused alpha so windows in the
+    /// background still cast a shadow but visibly recede.
+    /// </summary>
+    private static BoxShadows CreateMacOSShadow(bool focused)
     {
         // macOS uses multiple shadow layers for a realistic effect:
         // 1. Soft ambient shadow (large, subtle)
         // 2. Direct shadow (medium, offset down)
         // 3. Close contact shadow (small, sharp)
+        byte contactA = focused ? (byte)80 : (byte)50;
+        byte midA     = focused ? (byte)65 : (byte)40;
+        byte ambientA = focused ? (byte)45 : (byte)28;
+        // Focused window's mid + ambient shadows are slightly bigger /
+        // offset further so the depth cue is unmistakable.
+        double midOffsetY = focused ? 12 : 8;
+        double midBlur    = focused ? 24 : 18;
+        double ambOffsetY = focused ? 28 : 18;
+        double ambBlur    = focused ? 50 : 36;
+
         return new BoxShadows(
             new BoxShadow
             {
@@ -819,24 +867,24 @@ public class DOSIWindow : UserControl
                 OffsetY = 3,
                 Blur = 6,
                 Spread = 1,
-                Color = Color.FromArgb(80, 0, 0, 0)  // Sharp contact shadow
+                Color = Color.FromArgb(contactA, 0, 0, 0)  // Sharp contact shadow
             },
             [
                 new BoxShadow
                 {
                     OffsetX = 0,
-                    OffsetY = 12,
-                    Blur = 24,
+                    OffsetY = midOffsetY,
+                    Blur = midBlur,
                     Spread = 0,
-                    Color = Color.FromArgb(65, 0, 0, 0)  // Medium shadow
+                    Color = Color.FromArgb(midA, 0, 0, 0)  // Medium shadow
                 },
                 new BoxShadow
                 {
                     OffsetX = 0,
-                    OffsetY = 28,
-                    Blur = 50,
+                    OffsetY = ambOffsetY,
+                    Blur = ambBlur,
                     Spread = -2,
-                    Color = Color.FromArgb(45, 0, 0, 0)  // Soft ambient
+                    Color = Color.FromArgb(ambientA, 0, 0, 0)  // Soft ambient
                 }
             ]);
     }
@@ -2072,11 +2120,13 @@ public class DOSIWindow : UserControl
                 if (Parent is Canvas canvas)
                 {
                     // Fill the desktop work area, leaving the host's reserved
-                    // top inset (taskbar / menu bar) visible above the window.
+                    // top AND bottom insets (taskbar / menu bar) visible
+                    // above and below the window.
                     var topInset = OwnerManager?.TopWorkAreaInset ?? 0;
+                    var bottomInset = OwnerManager?.BottomWorkAreaInset ?? 0;
                     _ = AnimateWindowToAsync(0, topInset,
                                              canvas.Bounds.Width,
-                                             canvas.Bounds.Height - topInset);
+                                             canvas.Bounds.Height - topInset - bottomInset);
                 }
                 break;
         }
@@ -2090,9 +2140,26 @@ public class DOSIWindow : UserControl
         if (_isAnimating) return;
         _isAnimating = true;
 
+        // Compose Scale + Translate so the window appears to fall toward
+        // the taskbar baseline as it shrinks. Without the translate the
+        // shrink happens in place, which reads as "the window vanished"
+        // rather than "the window minimized somewhere." We don't know
+        // the exact taskbar tile position from inside DOSIWindow (the
+        // taskbar is in a different visual tree), so we translate
+        // straight down by ~40% of window height which lands every
+        // window in the lower third of the screen - close enough to
+        // read as "going down to the taskbar" without coupling the
+        // window to the taskbar's exact geometry.
+        var scale = new ScaleTransform(1, 1);
+        var translate = new TranslateTransform(0, 0);
+        RenderTransform = new TransformGroup
+        {
+            Children = { scale, translate }
+        };
+
         var animation = new Animation
         {
-            Duration = TimeSpan.FromMilliseconds(180),
+            Duration = TimeSpan.FromMilliseconds(220),
             Easing = new CubicEaseIn(),
             FillMode = FillMode.Forward,
             Children =
@@ -2102,9 +2169,7 @@ public class DOSIWindow : UserControl
                     Cue = new Cue(0),
                     Setters =
                     {
-                        new Setter(OpacityProperty, 1.0),
-                        new Setter(ScaleTransform.ScaleXProperty, 1.0),
-                        new Setter(ScaleTransform.ScaleYProperty, 1.0)
+                        new Setter(OpacityProperty, 1.0)
                     }
                 },
                 new KeyFrame
@@ -2112,13 +2177,37 @@ public class DOSIWindow : UserControl
                     Cue = new Cue(1),
                     Setters =
                     {
-                        new Setter(OpacityProperty, 0.0),
-                        new Setter(ScaleTransform.ScaleXProperty, 0.8),
-                        new Setter(ScaleTransform.ScaleYProperty, 0.8)
+                        new Setter(OpacityProperty, 0.0)
                     }
                 }
             }
         };
+
+        // Drive the scale + translate manually (KeyFrame setters bind
+        // by ScaleTransform.* properties which would target a single
+        // ScaleTransform - they can't reach into a TransformGroup's
+        // children. A short DispatcherTimer driving both transforms in
+        // lockstep with the opacity tween keeps everything in phase.)
+        var startTime = DateTime.UtcNow;
+        var duration = 220.0;
+        var fallDistance = Math.Max(40, this.Bounds.Height * 0.4);
+        var timer = new Avalonia.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(16)
+        };
+        timer.Tick += (_, _) =>
+        {
+            var t = Math.Clamp((DateTime.UtcNow - startTime).TotalMilliseconds / duration, 0d, 1d);
+            // Match CubicEaseIn so the manual transforms stay phase-locked
+            // with the Avalonia-driven opacity tween above.
+            var eased = t * t * t;
+            var s = 1.0 - 0.2 * eased; // 1.0 -> 0.8
+            scale.ScaleX = s;
+            scale.ScaleY = s;
+            translate.Y = fallDistance * eased;
+            if (t >= 1d) timer.Stop();
+        };
+        timer.Start();
 
         await animation.RunAsync(this);
 
@@ -2172,6 +2261,9 @@ public class DOSIWindow : UserControl
         Opacity = 1;
         RenderTransform = new ScaleTransform(1, 1);
         _isAnimating = false;
+        // Match focus state after restore-from-minimize, same reason
+        // as PlayOpenAnimationAsync above.
+        UpdateFocusVisuals();
     }
 
     private void UpdateFocusVisuals()
@@ -2187,6 +2279,16 @@ public class DOSIWindow : UserControl
         _windowBorder.BorderBrush = _isFocused
             ? Accents.WindowBorderFocusedBrush
             : Accents.WindowBorderUnfocusedBrush;
+
+        // Focused window casts a deeper / larger shadow stack so it
+        // reads as physically nearer than peers - subtle depth cue every
+        // modern shell uses. Defensive null check because UpdateFocusVisuals
+        // can fire from the OnAccentChanged path during construction
+        // before _windowBorder has been assigned (very edge case).
+        if (_windowBorder != null)
+        {
+            _windowBorder.BoxShadow = CreateMacOSShadow(_isFocused);
+        }
 
         // Subtle opacity dip for unfocused windows so the active window
         // visually pops without us having to brighten its chrome. 0.92
@@ -2207,7 +2309,7 @@ public class DOSIWindow : UserControl
         // already alpha-modulated by AccentManager.WindowOpacity, so this also
         // applies live transparency changes without an extra code path.
         _windowBorder.Background = Accents.WindowBackgroundBrush;
-        _windowBorder.BoxShadow = CreateMacOSShadow();
+        _windowBorder.BoxShadow = CreateMacOSShadow(_isFocused);
         _contentContainer.Background = Accents.WindowContentBrush;
 
         // Update icon

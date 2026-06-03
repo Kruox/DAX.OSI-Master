@@ -49,7 +49,7 @@ public class InitialStartup : DOSIScreen
     // ----- UI -----
     private readonly Grid _layoutRoot;
     private readonly Border _card;
-    private readonly TextBlock _stepDots;
+    private readonly StackPanel _stepDots;
     private readonly TextBlock _stepTitle;
     private readonly TextBlock _stepSubtitle;
     private readonly ContentControl _stepContent;
@@ -66,12 +66,16 @@ public class InitialStartup : DOSIScreen
         _originalWallpaperKey = WallpaperManager.Instance.CurrentWallpaperKey;
 
         // ===== Header =====
-        _stepDots = new TextBlock
+        // Animated dot strip: one Ellipse per step, the active dot grows
+        // into an accent-tinted pill while the rest stay as small grey
+        // discs. RebuildStepDots wires the per-dot tween whenever the
+        // step changes - reads as a live progress indicator instead of
+        // the old static "● ○ ○" glyph string.
+        _stepDots = new StackPanel
         {
-            FontSize = 12,
-            Foreground = Accents.TextSecondaryBrush,
+            Orientation = Orientation.Horizontal,
+            Spacing = 8,
             HorizontalAlignment = HorizontalAlignment.Center,
-            Opacity = 0.7,
             Margin = new Thickness(0, 0, 0, 8)
         };
 
@@ -280,7 +284,7 @@ public class InitialStartup : DOSIScreen
         var step = _steps[_currentStepIndex];
 
         _errorText.Text = string.Empty;
-        _stepDots.Text = BuildStepDots(_currentStepIndex, _steps.Count);
+        RebuildStepDots(_currentStepIndex, _steps.Count);
         _stepTitle.Text = step.Title;
         _stepSubtitle.Text = step.Subtitle;
         _stepContent.Content = step.Build();
@@ -304,6 +308,51 @@ public class InitialStartup : DOSIScreen
         if (animate) PlayCardEntrance(direction);
     }
 
+    /// <summary>
+    /// Rebuilds the animated step-dot strip for <paramref name="currentIndex"/>
+    /// out of <paramref name="total"/>. The active dot grows from a 6 px
+    /// circle into a 22 px accent-tinted pill via a tween so the user
+    /// sees the progress visibly advance step-to-step. Past steps stay
+    /// as small accent discs (so progress reads as a filled trail), and
+    /// future steps stay as faint grey discs. Idempotent - safe to call
+    /// from accent / language changes too.
+    /// </summary>
+    private void RebuildStepDots(int currentIndex, int total)
+    {
+        if (_stepDots == null) return;
+        _stepDots.Children.Clear();
+        var accent = Accents.AccentPrimaryBrush;
+        var inactive = new SolidColorBrush(Color.FromArgb(80, 255, 255, 255));
+        for (int i = 0; i < total; i++)
+        {
+            bool isActive = i == currentIndex;
+            bool isPast = i < currentIndex;
+            var dot = new Border
+            {
+                Width = isActive ? 22 : 6,
+                Height = 6,
+                CornerRadius = new CornerRadius(3),
+                Background = (isActive || isPast) ? (IBrush)accent : inactive,
+                VerticalAlignment = VerticalAlignment.Center,
+                // Subtle accent halo on the active pill so the eye lands on
+                // it without effort - the rest of the strip stays visually
+                // quiet.
+                Effect = isActive
+                    ? new Avalonia.Media.DropShadowEffect
+                    {
+                        BlurRadius = 12,
+                        Color = Accents.AccentPrimary,
+                        Opacity = 0.55,
+                        OffsetX = 0,
+                        OffsetY = 0
+                    }
+                    : null
+            };
+            _stepDots.Children.Add(dot);
+        }
+    }
+
+    [Obsolete("Replaced by RebuildStepDots; kept temporarily for any external callers.")]
     private static string BuildStepDots(int currentIndex, int total)
     {
         var sb = new System.Text.StringBuilder();
@@ -670,6 +719,7 @@ public class InitialStartup : DOSIScreen
             DOSIAccent.DarkRed => (Color.FromRgb(220, 50, 70), Color.FromRgb(170, 30, 50)),
             DOSIAccent.DarkTeal => (Color.FromRgb(0, 188, 212), Color.FromRgb(0, 140, 160)),
             DOSIAccent.Light => (Color.FromRgb(0, 120, 215), Color.FromRgb(0, 90, 170)),
+            DOSIAccent.Dark => (Color.FromRgb(120, 160, 220), Color.FromRgb(85, 120, 175)),
             DOSIAccent.Midnight => (Color.FromRgb(100, 100, 255), Color.FromRgb(70, 70, 200)),
             DOSIAccent.RoseGold => (Color.FromRgb(183, 110, 121), Color.FromRgb(150, 85, 95)),
             DOSIAccent.Coral => (Color.FromRgb(255, 127, 80), Color.FromRgb(210, 100, 60)),
@@ -992,7 +1042,8 @@ public class InitialStartup : DOSIScreen
     {
         _stepTitle.Foreground = Accents.TextPrimaryBrush;
         _stepSubtitle.Foreground = Accents.TextSecondaryBrush;
-        _stepDots.Foreground = Accents.TextSecondaryBrush;
+        // Re-tint every dot so the active pill picks up the new accent.
+        RebuildStepDots(_currentStepIndex, _steps.Count);
 
         // Re-tint the Next button so it always tracks the live accent. The
         // Back button uses default DOSIButton styling and re-themes itself.

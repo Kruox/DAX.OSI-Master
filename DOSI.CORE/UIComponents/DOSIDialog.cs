@@ -260,6 +260,67 @@ public class DOSIDialog : Control
         container.Children.Add(dialogContainer);
         dialogContainer.Focus();
 
+        // Soft fade-in for the backdrop dim + dialog box. The dim was
+        // already opaque from the moment ShowAsync ran which read as
+        // abrupt - especially over a busy desktop where the user's eye
+        // is anchored elsewhere. A 140 ms ease-out cubic on the overlay
+        // (and a quick scale-up on the dialog box) reads as a clear
+        // "modal context engaged" signal without slowing the user's
+        // path to the buttons.
+        _overlay.Opacity = 0;
+        _dialogBox.Opacity = 0;
+        _dialogBox.RenderTransform = new ScaleTransform(0.96, 0.96);
+        var fadeIn = new Avalonia.Animation.Animation
+        {
+            Duration = TimeSpan.FromMilliseconds(140),
+            Easing = new Avalonia.Animation.Easings.CubicEaseOut(),
+            FillMode = Avalonia.Animation.FillMode.Forward,
+            Children =
+            {
+                new Avalonia.Animation.KeyFrame
+                {
+                    Cue = new Avalonia.Animation.Cue(0),
+                    Setters = { new Avalonia.Styling.Setter(OpacityProperty, 0.0) }
+                },
+                new Avalonia.Animation.KeyFrame
+                {
+                    Cue = new Avalonia.Animation.Cue(1),
+                    Setters = { new Avalonia.Styling.Setter(OpacityProperty, 1.0) }
+                }
+            }
+        };
+        _ = fadeIn.RunAsync(_overlay);
+        var dialogIn = new Avalonia.Animation.Animation
+        {
+            Duration = TimeSpan.FromMilliseconds(160),
+            Easing = new Avalonia.Animation.Easings.CubicEaseOut(),
+            FillMode = Avalonia.Animation.FillMode.Forward,
+            Children =
+            {
+                new Avalonia.Animation.KeyFrame
+                {
+                    Cue = new Avalonia.Animation.Cue(0),
+                    Setters =
+                    {
+                        new Avalonia.Styling.Setter(OpacityProperty, 0.0),
+                        new Avalonia.Styling.Setter(ScaleTransform.ScaleXProperty, 0.96),
+                        new Avalonia.Styling.Setter(ScaleTransform.ScaleYProperty, 0.96)
+                    }
+                },
+                new Avalonia.Animation.KeyFrame
+                {
+                    Cue = new Avalonia.Animation.Cue(1),
+                    Setters =
+                    {
+                        new Avalonia.Styling.Setter(OpacityProperty, 1.0),
+                        new Avalonia.Styling.Setter(ScaleTransform.ScaleXProperty, 1.0),
+                        new Avalonia.Styling.Setter(ScaleTransform.ScaleYProperty, 1.0)
+                    }
+                }
+            }
+        };
+        _ = dialogIn.RunAsync(_dialogBox);
+
         return _resultSource.Task;
     }
 

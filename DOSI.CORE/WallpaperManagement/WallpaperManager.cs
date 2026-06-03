@@ -500,11 +500,17 @@ public sealed class WallpaperManager
     {
         if (onLoaded == null) return;
 
-        // Fast path: cache hit -> no thread hop.
+        // Fast path: cache hit. Post the callback through the
+        // dispatcher (don't invoke synchronously) so callers that build
+        // a control, hand it to this method, and only then attach it to
+        // a parent get the same timing on hit and miss. Without this,
+        // the second open of a wallpaper picker tile loader fires its
+        // callback while the Image is still parentless, the parent
+        // guard rejects the assign, and the tile silently stays empty.
         var cache = blurred ? _blurredBitmapCache : _sharpBitmapCache;
         if (cache.TryGetValue(key, out var cached))
         {
-            onLoaded(cached);
+            Avalonia.Threading.Dispatcher.UIThread.Post(() => onLoaded(cached));
             return;
         }
 
@@ -526,7 +532,8 @@ public sealed class WallpaperManager
         if (onLoaded == null) return;
         if (_thumbnailCache.TryGetValue(key, out var cached))
         {
-            onLoaded(cached);
+            // Same dispatcher-post rationale as LoadBitmapAsync above.
+            Avalonia.Threading.Dispatcher.UIThread.Post(() => onLoaded(cached));
             return;
         }
         System.Threading.Tasks.Task.Run(() =>
@@ -775,18 +782,27 @@ public sealed class WallpaperManager
             // isn't faded by the signout transition - see MainWindow.
             // RunSignOutSequenceAsync). AccentOnlyKey keeps the visual
             // continuous: signed-in accent-only -> signed-out accent-only.
-            SetWallpaper(AccentOnlyKey);
+            // Apply the fit mode BEFORE the wallpaper change (see below
+            // for rationale).
             SetFitMode(WallpaperFitMode.Fill);
+            SetWallpaper(AccentOnlyKey);
             return;
         }
 
-        if (user.Preferences.TryGetValue(WallpaperPreferenceKey, out var key) && !string.IsNullOrEmpty(key))
-            SetWallpaper(key);
-        else
-            SetWallpaper(DefaultWallpaperKey);
-
-        // Fit mode persisted as the enum name; bad / missing values fall
-        // back to Fill (the previous hard-coded behaviour).
+        // ORDER MATTERS: apply the fit mode FIRST, then the wallpaper.
+        // SetWallpaper raises WallpaperChanged synchronously -> every
+        // DOSIScreen begins its ~550ms cross-fade using whatever fit
+        // mode is CURRENTLY set on its ImageBrush (which would still be
+        // the previous user's). The subsequent SetFitMode then fires
+        // WallpaperFitChanged mid-animation, forcing every screen to
+        // rebuild its brushes WHILE the cross-fade is in flight - that
+        // is the "wallpaper visibly adjusts itself just after the
+        // transition" jolt the user reported, especially on secondary
+        // monitors which receive WallpaperSyncBroadcast frames keyed to
+        // the broadcaster's brush state. Setting the fit mode first
+        // means every screen rebuilds its brushes BEFORE the wallpaper
+        // bitmap change kicks off, so the cross-fade renders with the
+        // correct Stretch / TileMode from the very first frame.
         if (user.Preferences.TryGetValue(UserManager.WallpaperFitPreferenceKey, out var fit) &&
             Enum.TryParse<WallpaperFitMode>(fit, ignoreCase: true, out var parsed))
         {
@@ -796,6 +812,11 @@ public sealed class WallpaperManager
         {
             SetFitMode(WallpaperFitMode.Fill);
         }
+
+        if (user.Preferences.TryGetValue(WallpaperPreferenceKey, out var key) && !string.IsNullOrEmpty(key))
+            SetWallpaper(key);
+        else
+            SetWallpaper(DefaultWallpaperKey);
     }
 
     /// <summary>

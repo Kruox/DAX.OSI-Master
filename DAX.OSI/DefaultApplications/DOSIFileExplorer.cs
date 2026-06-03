@@ -184,6 +184,12 @@ public class DOSIFileExplorer : DOSIWindow
     // can pop them in with a small fade animation instead of redrawing
     // every tile silently).
     private readonly HashSet<string> _lastPopulatedNames = new(StringComparer.OrdinalIgnoreCase);
+    // Cache of last-built tiles keyed by file/folder name, so a refresh
+    // (FileSystemWatcher tick, F5, dropdown sort change) can REUSE the
+    // existing Border + its async-loaded image thumbnail instead of
+    // rebuilding every tile from scratch and forcing a wave of fresh
+    // ImageCache.LoadAsync calls. Cleared on directory navigation.
+    private readonly Dictionary<string, Border> _tileByName = new(StringComparer.OrdinalIgnoreCase);
 
     // ----- Rubber-band (marquee) selection state -----
     // The marquee paints a translucent accent rectangle while the user
@@ -1689,6 +1695,14 @@ public class DOSIFileExplorer : DOSIWindow
         UpdateBreadcrumb();
         RefreshSidebarHighlight();
         UpdateNavButtons();
+        // Drop the cached tile list on directory change so PopulateItems
+        // doesn't try to reuse tiles whose Tag points at the previous
+        // folder. Watcher / sort-only refreshes WANT the cache to
+        // survive (that's the whole point of the diff path), but a
+        // navigation is a hard reset.
+        _itemsPanel.Children.Clear();
+        _tileByName.Clear();
+        _lastPopulatedNames.Clear();
         PopulateItems();
         StartDirectoryWatcher(_currentPath);
     }
@@ -1917,7 +1931,9 @@ public class DOSIFileExplorer : DOSIWindow
 
     private void PopulateItems()
     {
-        _itemsPanel.Children.Clear();
+        // _itemsPanel.Children is reconciled below via the diff path
+        // (don't clear up-front - that defeats tile reuse and causes
+        // the whole grid to flash on every FileSystemWatcher tick).
         _selectedTile = null;
         _statusSelection.Text = "";
         HideDetailsPanel();
@@ -1985,24 +2001,78 @@ public class DOSIFileExplorer : DOSIWindow
         int dirCount = 0, fileCount = 0;
         var freshNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         var newcomerTiles = new List<Border>();
+
+        // DIFF-BASED REFRESH: instead of clearing _itemsPanel + rebuilding
+        // every tile (which forced a wave of fresh ImageCache.LoadAsync
+        // calls and a visible jank on every FileSystemWatcher tick),
+        // build a fresh ordered list of tiles - reusing the prior tile
+        // for any name that's still present - then reconcile the panel's
+        // children to match. Result: F5 / watcher refresh on a folder
+        // with hundreds of files no longer rebuilds visible UI; image
+        // thumbnails stay warm; only genuine additions trigger pop-in.
+        var nextTiles = new List<Border>();
+        var nextTileByName = new Dictionary<string, Border>(StringComparer.OrdinalIgnoreCase);
+
+        Border GetOrBuildTile(string path, bool isDirectory)
+        {
+            var n = Path.GetFileName(path);
+            if (_tileByName.TryGetValue(n, out var existing) &&
+                existing.Tag is string existingPath &&
+                string.Equals(existingPath, path, StringComparison.OrdinalIgnoreCase))
+            {
+                return existing;
+            }
+            return BuildTile(path, isDirectory);
+        }
+
         foreach (var d in dirs)
         {
-            var tile = BuildTile(d, isDirectory: true);
-            _itemsPanel.Children.Add(tile);
+            var tile = GetOrBuildTile(d, isDirectory: true);
+            nextTiles.Add(tile);
             var n = Path.GetFileName(d);
+            nextTileByName[n] = tile;
             freshNames.Add(n);
             if (!_lastPopulatedNames.Contains(n)) newcomerTiles.Add(tile);
             dirCount++;
         }
         foreach (var f in files)
         {
-            var tile = BuildTile(f, isDirectory: false);
-            _itemsPanel.Children.Add(tile);
+            var tile = GetOrBuildTile(f, isDirectory: false);
+            nextTiles.Add(tile);
             var n = Path.GetFileName(f);
+            nextTileByName[n] = tile;
             freshNames.Add(n);
             if (!_lastPopulatedNames.Contains(n)) newcomerTiles.Add(tile);
             fileCount++;
         }
+
+        // Reconcile _itemsPanel children to nextTiles. Common case: order
+        // unchanged + maybe a few additions/removals. We do a single
+        // pass: if the existing child list already matches nextTiles
+        // exactly we touch nothing; otherwise we Clear + Add (still
+        // cheaper than the original "always rebuild" because tiles
+        // themselves are reused, sparing the per-tile build work +
+        // restarting any in-flight thumbnail decodes).
+        bool sameOrder = _itemsPanel.Children.Count == nextTiles.Count;
+        if (sameOrder)
+        {
+            for (int i = 0; i < nextTiles.Count; i++)
+            {
+                if (!ReferenceEquals(_itemsPanel.Children[i], nextTiles[i]))
+                {
+                    sameOrder = false;
+                    break;
+                }
+            }
+        }
+        if (!sameOrder)
+        {
+            _itemsPanel.Children.Clear();
+            foreach (var t in nextTiles) _itemsPanel.Children.Add(t);
+        }
+
+        _tileByName.Clear();
+        foreach (var (n, t) in nextTileByName) _tileByName[n] = t;
 
         // Skip the pop-in animation on the very first population so the
         // initial open doesn't flash through N fades; ditto when the user
@@ -2040,6 +2110,10 @@ public class DOSIFileExplorer : DOSIWindow
     private void PopulateTrashItems()
     {
         if (_user == null) return;
+        // Trash view rebuilds wholesale (entries are GUID-keyed and the
+        // list is small); the diff path in PopulateItems doesn't apply.
+        _itemsPanel.Children.Clear();
+        _tileByName.Clear();
         var entries = FileTrash.List(_user);
         foreach (var entry in entries)
         {
@@ -2416,6 +2490,47 @@ public class DOSIFileExplorer : DOSIWindow
         if (string.IsNullOrEmpty(name)) name = path;
 
         var icon = isDirectory ? BuildFolderIcon() : BuildFileIcon(Path.GetExtension(name));
+
+        // For image files, swap the generic file icon for an actual
+        // thumbnail of the bitmap so the grid view reads like Finder /
+        // File Explorer instead of a sea of identical placeholder icons.
+        // The thumbnail is loaded async via the shared ImageCache (96 px
+        // long edge - tile icon space is 56x56 with padding) so a folder
+        // full of phone photos populates instantly with placeholders and
+        // fills in as decodes land. Cache hits are no-ops; subsequent
+        // navigations to the same folder are free.
+        if (!isDirectory && IsImageExtension(Path.GetExtension(name)))
+        {
+            var thumbHost = new Border
+            {
+                Width = 56,
+                Height = 52,
+                CornerRadius = new CornerRadius(4),
+                ClipToBounds = true,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Bottom,
+                Background = new SolidColorBrush(Color.FromArgb(80, 0, 0, 0)),
+                // Until the decode lands the user sees the original generic
+                // file icon as a placeholder so the tile never goes blank.
+                Child = icon
+            };
+            var capturedHost = thumbHost;
+            DOSI.CORE.ImageManagement.ImageCache.LoadAsync(
+                path,
+                96,
+                bmp =>
+                {
+                    if (bmp == null || capturedHost.Parent == null) return;
+                    capturedHost.Child = new Image
+                    {
+                        Source = bmp,
+                        Stretch = Stretch.UniformToFill,
+                        HorizontalAlignment = HorizontalAlignment.Stretch,
+                        VerticalAlignment = VerticalAlignment.Stretch
+                    };
+                });
+            icon = thumbHost;
+        }
 
         var label = new TextBlock
         {

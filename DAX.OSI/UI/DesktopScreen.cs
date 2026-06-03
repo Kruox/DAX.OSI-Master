@@ -68,7 +68,30 @@ public class DesktopScreen : DOSIScreen
         PrimaryDesktopReadyChanged?.Invoke(null, false);
     }
 
-    private const double TaskbarHeight = 28;
+    // Live taskbar height: reads from TaskbarMetrics so the user's
+    // saved preference applies on every layout pass. Subscribe to
+    // TaskbarMetrics.HeightChanged where you need to react to live
+    // updates (we do this in AttachedToVisualTree below).
+    private static double TaskbarHeight =>
+        DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.Height;
+
+    // Live taskbar dock edge. Same metric, sister property. Layout
+    // primitives that need to flip alignment / margin direction read
+    // this once at construction and then react to PositionChanged.
+    private static DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition TaskbarMetricsPosition =>
+        DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.Position;
+
+    /// <summary>
+    /// The off-screen Y the slide transform parks at when the bar is
+    /// hidden. Negative for top dock (above the screen), positive for
+    /// bottom dock (below the screen). Always re-derived from the
+    /// current Position + Height so a live position swap correctly
+    /// re-parks any in-flight animation.
+    /// </summary>
+    private static double OffScreenSlideY =>
+        TaskbarMetricsPosition == DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition.Top
+            ? -TaskbarHeight
+            :  TaskbarHeight;
     // ----- Layout -----
     private readonly Grid _layoutRoot;
     private readonly Grid _ambientLayer;
@@ -116,6 +139,9 @@ public class DesktopScreen : DOSIScreen
     private readonly TextBlock _clockText;
     private readonly TextBlock _dateText;
     private readonly TextBlock _versionText;
+    // Held so OnTaskbarPositionChanged can re-margin the clock when
+    // the user moves the taskbar between top and bottom dock.
+    private StackPanel? _clockStack;
 
     // ----- Apps menu -----
     private readonly Border _appsMenuBackdrop;
@@ -263,10 +289,15 @@ public class DesktopScreen : DOSIScreen
             VerticalAlignment = VerticalAlignment.Top
         };
 
-        var clockStack = new StackPanel
+        _clockStack = new StackPanel
         {
             Orientation = Orientation.Vertical,
-            Margin = new Thickness(36, 0, 0, 28),
+            // Margin is recomputed by OnTaskbarPositionChanged whenever
+            // the dock edge changes. Initial value here is just the
+            // top-dock case; the synchronous OnTaskbarPositionChanged
+            // call in AttachedToVisualTree corrects it for bottom dock
+            // before the first paint.
+            Margin = ComputeClockMargin(),
             HorizontalAlignment = HorizontalAlignment.Left,
             VerticalAlignment = VerticalAlignment.Bottom,
             Spacing = 2,
@@ -353,15 +384,28 @@ public class DesktopScreen : DOSIScreen
         {
             Height = TaskbarHeight,
             HorizontalAlignment = HorizontalAlignment.Stretch,
-            VerticalAlignment = VerticalAlignment.Top,
+            // Position-aware: TaskbarMetrics.Position drives whether the
+            // bar docks at the top or the bottom of the desktop. The
+            // initial value is read at construction; later changes from
+            // Settings flow through OnTaskbarPositionChanged below.
+            VerticalAlignment = TaskbarMetricsPosition == DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition.Top
+                ? VerticalAlignment.Top
+                : VerticalAlignment.Bottom,
             Background = BuildTaskbarBackground(),
             BorderBrush = BuildTaskbarBorderBrush(),
-            BorderThickness = new Thickness(0, 0, 0, 1),
+            // Border-line goes on the inside edge: bottom for a top
+            // dock, top for a bottom dock. Reads as a single 1px
+            // separator between chrome and content.
+            BorderThickness = TaskbarMetricsPosition == DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition.Top
+                ? new Thickness(0, 0, 0, 1)
+                : new Thickness(0, 1, 0, 0),
             Child = taskbarGrid,
-            // Start the bar parked above the screen so the slide-in animation
-            // (kicked off after AttachedToVisualTree) has somewhere to slide
-            // FROM. AnimateTaskbarInAsync drives Y back to 0.
-            RenderTransform = _taskbarSlide = new TranslateTransform(0, -TaskbarHeight)
+            // Park off-screen on the same edge we're docking against so
+            // the slide-in animation feels like the bar is entering from
+            // outside the screen. Top dock => -Height (above), bottom
+            // dock => +Height (below). AnimateTaskbarInAsync drives the
+            // translation back to 0.
+            RenderTransform = _taskbarSlide = new TranslateTransform(0, OffScreenSlideY)
         };
 
         // ===== Apps menu (popup) =====
@@ -385,7 +429,10 @@ public class DesktopScreen : DOSIScreen
             Opacity = 0.6,
             HorizontalAlignment = HorizontalAlignment.Right,
             VerticalAlignment = VerticalAlignment.Bottom,
-            Margin = new Thickness(0, 0, 24, 16)
+            // Margin recomputed with the dock edge so a bottom taskbar
+            // doesn't bury the version label. ComputeVersionMargin
+            // mirrors ComputeClockMargin.
+            Margin = ComputeVersionMargin()
         };
 
         _appsMenuTranslate = new TranslateTransform(0, -8);
@@ -413,7 +460,7 @@ public class DesktopScreen : DOSIScreen
             HorizontalAlignment = HorizontalAlignment.Stretch,
             VerticalAlignment = VerticalAlignment.Stretch,
             IsHitTestVisible = false,
-            Children = { clockStack, _versionText }
+            Children = { _clockStack, _versionText }
         };
 
         Desktop.Children.Add(_ambientLayer);
@@ -497,9 +544,27 @@ public class DesktopScreen : DOSIScreen
             // monitors reserve the inset on THEIR manager (not the global
             // one, which belongs to the primary monitor).
             _ownerHost = ResolveOwnerHost();
-            var ownerWm = _ownerHost?.WindowManager ?? WindowManager.Instance;
-            if (ownerWm != null)
-                ownerWm.TopWorkAreaInset = TaskbarHeight;
+            // Note: the work-area inset is published below via the
+            // synchronous OnTaskbarPositionChanged call - that path knows
+            // which side (top or bottom) to write so we don't have to
+            // branch here.
+
+            // React to live taskbar-height + position changes from
+            // Settings: resize the chrome border, flip alignment +
+            // margin direction, re-park any off-screen slide, and
+            // re-publish the work-area inset so DOSIWindow maximize +
+            // drag-clamp respect the new geometry immediately.
+            DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.HeightChanged += OnTaskbarHeightChanged;
+            DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.PositionChanged += OnTaskbarPositionChanged;
+            DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.ClockPositionChanged += OnClockPositionChanged;
+
+            // Re-apply position-dependent surfaces in case TaskbarMetrics
+            // was mutated AFTER our constructor ran (the sign-in pipeline
+            // pushes the user's persisted position right before this
+            // screen attaches). Cheaper than guarding every visual at
+            // construction time against a not-yet-applied preference.
+            OnTaskbarPositionChanged(null,
+                DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.Position);
 
             // Move the desktop chrome (taskbar / version / apps menu) into the
             // owning host's popup overlay so it always renders above any
@@ -580,6 +645,11 @@ public class DesktopScreen : DOSIScreen
             var detachWm = _ownerHost?.WindowManager ?? WindowManager.Instance;
             if (detachWm != null)
                 detachWm.TopWorkAreaInset = 0;
+                detachWm.BottomWorkAreaInset = 0;
+
+            DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.HeightChanged -= OnTaskbarHeightChanged;
+            DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.PositionChanged -= OnTaskbarPositionChanged;
+            DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.ClockPositionChanged -= OnClockPositionChanged;
 
             // Pull desktop chrome back out of the popup overlay so it doesn't
             // leak when this DesktopScreen instance is removed. Resolve via
@@ -734,8 +804,16 @@ public class DesktopScreen : DOSIScreen
         {
             Width = 280,
             HorizontalAlignment = HorizontalAlignment.Left,
-            VerticalAlignment = VerticalAlignment.Top,
-            Margin = new Thickness(8, TaskbarHeight + 4, 0, 0),
+            // Anchor to the same edge the taskbar lives on so the menu
+            // appears to grow OUT of the apps button.
+            VerticalAlignment = TaskbarMetricsPosition == DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition.Top
+                ? VerticalAlignment.Top
+                : VerticalAlignment.Bottom,
+            // Top-dock: leave room below the taskbar. Bottom-dock: leave
+            // room above the taskbar. Margin's 4-tuple is (L,T,R,B).
+            Margin = TaskbarMetricsPosition == DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition.Top
+                ? new Thickness(8, TaskbarHeight + 4, 0, 0)
+                : new Thickness(8, 0, 0, TaskbarHeight + 4),
             Padding = new Thickness(8),
             Background = BuildMenuBackground(),
             BorderBrush = new SolidColorBrush(Color.FromArgb(70, 255, 255, 255)),
@@ -1376,7 +1454,14 @@ public class DesktopScreen : DOSIScreen
     private void AnimateAppsMenu(bool opening)
     {
         const double duration = 180;
-        const double startOffset = -8;
+        // Slide direction matches the dock: top dock slides menu IN from
+        // above (-8 -> 0), bottom dock slides it IN from below (+8 -> 0).
+        // Closing reverses. Without this flip, a bottom-docked menu
+        // would slide UP off the screen on close, away from the
+        // direction the user clicked.
+        double startOffset = TaskbarMetricsPosition == DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition.Top
+            ? -8
+            :  8;
 
         var startOpacity = _appsMenu.Opacity;
         var targetOpacity = opening ? 1.0 : 0.0;
@@ -1601,8 +1686,12 @@ public class DesktopScreen : DOSIScreen
         {
             Width = 340,
             HorizontalAlignment = HorizontalAlignment.Right,
-            VerticalAlignment = VerticalAlignment.Top,
-            Margin = new Thickness(0, TaskbarHeight + 4, 8, 0),
+            VerticalAlignment = TaskbarMetricsPosition == DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition.Top
+                ? VerticalAlignment.Top
+                : VerticalAlignment.Bottom,
+            Margin = TaskbarMetricsPosition == DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition.Top
+                ? new Thickness(0, TaskbarHeight + 4, 8, 0)
+                : new Thickness(0, 0, 8, TaskbarHeight + 4),
             Padding = new Thickness(10),
             Background = BuildMenuBackground(),
             BorderBrush = new SolidColorBrush(Accents.AccentSecondary),
@@ -1688,7 +1777,10 @@ public class DesktopScreen : DOSIScreen
         if (_notifPopover == null || _notifPopoverBackdrop == null || _notifPopoverTranslate == null) return;
 
         const double duration = 180;
-        const double startOffset = -8;
+        // Slide direction matches the dock (same logic as AnimateAppsMenu).
+        double startOffset = TaskbarMetricsPosition == DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition.Top
+            ? -8
+            :  8;
 
         var startOpacity = _notifPopover.Opacity;
         var targetOpacity = opening ? 1.0 : 0.0;
@@ -1975,15 +2067,12 @@ public class DesktopScreen : DOSIScreen
     /// the bar is already on-screen (no-op then).
     /// </summary>
     public Task AnimateTaskbarInAsync(int durationMs = 380)
-        => AnimateTaskbarAsync(targetY: 0, durationMs, easeOut: true);
-
-    /// <summary>
-    /// Slides the taskbar back up off-screen. Used by the sign-out and
+        => AnimateTaskbarAsync(targetY: 0, durationMs, easeOut: true);    /// Slides the taskbar back up off-screen. Used by the sign-out and
     /// shutdown flows so the chrome retracts cleanly instead of just fading
     /// with everything else. Returns when the slide is complete.
     /// </summary>
     public Task AnimateTaskbarOutAsync(int durationMs = 280)
-        => AnimateTaskbarAsync(targetY: -TaskbarHeight, durationMs, easeOut: false);
+        => AnimateTaskbarAsync(targetY: OffScreenSlideY, durationMs, easeOut: false);
 
     private Task AnimateTaskbarAsync(double targetY, int durationMs, bool easeOut)
     {
@@ -2039,6 +2128,184 @@ public class DesktopScreen : DOSIScreen
         _taskbarAnimTcs = null;
         _taskbarSlide.Y = _taskbarAnimTargetY;
         tcs.TrySetResult(true);
+    }
+
+    /// <summary>
+    /// Live-resize the taskbar Border + re-publish the work-area inset
+    /// when the user changes the taskbar height in Settings. Subscribed
+    /// in AttachedToVisualTree, unsubscribed in detach.
+    /// </summary>
+    private void OnTaskbarHeightChanged(object? sender, double newHeight)
+    {
+        if (_taskbar != null) _taskbar.Height = newHeight;
+        // If the slide is parked off-screen at the OLD height, re-park
+        // at the new one so an entrance animation that hasn't run yet
+        // still starts from the correct off-screen Y. Use the absolute
+        // distance so this works regardless of dock edge (top: negative
+        // Y; bottom: positive Y).
+        if (_taskbarSlide != null && Math.Abs(_taskbarSlide.Y) > 0.5)
+            _taskbarSlide.Y = OffScreenSlideY;
+        var wm = _ownerHost?.WindowManager ?? WindowManager.Instance;
+        if (wm != null)
+        {
+            // Update whichever inset is currently active for this dock.
+            if (TaskbarMetricsPosition == DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition.Top)
+            { wm.TopWorkAreaInset = newHeight; wm.BottomWorkAreaInset = 0; }
+            else
+            { wm.TopWorkAreaInset = 0; wm.BottomWorkAreaInset = newHeight; }
+        }
+        // Bottom-dock margin formula includes TaskbarHeight so a height
+        // change has to re-lift the clock too.
+        ApplyClockLayout();
+        if (_versionText != null) _versionText.Margin = ComputeVersionMargin();
+    }
+
+    /// <summary>
+    /// Live-relocate the taskbar Border + apps menu + notification
+    /// popover to the new dock edge, and re-publish the work-area
+    /// reserve to the matching side. Subscribed in AttachedToVisualTree.
+    /// </summary>
+    private void OnTaskbarPositionChanged(object? sender, DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition pos)
+    {
+        bool top = pos == DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition.Top;
+        if (_taskbar != null)
+        {
+            _taskbar.VerticalAlignment = top ? VerticalAlignment.Top : VerticalAlignment.Bottom;
+            _taskbar.BorderThickness = top
+                ? new Thickness(0, 0, 0, 1)
+                : new Thickness(0, 1, 0, 0);
+        }
+        if (_taskbarSlide != null)
+        {
+            // Snap the slide to the docked position on the new edge so
+            // a position swap reads as instant rather than animating
+            // through the screen middle.
+            _taskbarSlide.Y = 0;
+        }
+        // Apps menu: realign and remargin to the new edge.
+        if (_appsMenu != null)
+        {
+            _appsMenu.VerticalAlignment = top ? VerticalAlignment.Top : VerticalAlignment.Bottom;
+            _appsMenu.Margin = top
+                ? new Thickness(8, TaskbarHeight + 4, 0, 0)
+                : new Thickness(8, 0, 0, TaskbarHeight + 4);
+        }
+        if (_notifPopover != null)
+        {
+            _notifPopover.VerticalAlignment = top ? VerticalAlignment.Top : VerticalAlignment.Bottom;
+            _notifPopover.Margin = top
+                ? new Thickness(0, TaskbarHeight + 4, 8, 0)
+                : new Thickness(0, 0, 8, TaskbarHeight + 4);
+        }
+        // Re-publish the work-area inset on the right side.
+        var wm = _ownerHost?.WindowManager ?? WindowManager.Instance;
+        if (wm != null)
+        {
+            if (top) { wm.TopWorkAreaInset = TaskbarHeight; wm.BottomWorkAreaInset = 0; }
+            else     { wm.TopWorkAreaInset = 0; wm.BottomWorkAreaInset = TaskbarHeight; }
+        }
+        // Lift the clock above the bottom taskbar (if any) so it stays
+        // at the same on-screen Y as the login screen's clock - the
+        // visual continuity through sign-in is what makes it feel like
+        // a single OS instead of two screens.
+        ApplyClockLayout();
+        if (_versionText != null) _versionText.Margin = ComputeVersionMargin();
+    }
+
+    /// <summary>
+    /// Computes the bottom margin that keeps the clock floating ~50 px
+    /// above whatever's beneath it - the screen edge for top dock, or
+    /// the top of the bottom-docked taskbar otherwise. Matches the
+    /// login screen's 50 px lift so the clock appears stationary
+    /// across the sign-in transition.
+    /// </summary>
+    /// <summary>
+    /// Returns the horizontal/vertical alignment + margin tuple that
+    /// places the ambient clock at the user's preferred corner. Bottom
+    /// rows include the dock-aware lift via TaskbarHeight so the clock
+    /// always floats clear of a bottom-docked taskbar; top rows leave
+    /// room for a top-docked one.
+    /// </summary>
+    private static (HorizontalAlignment H, VerticalAlignment V, Thickness M) ComputeClockLayout()
+    {
+        var pos = DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.ClockPosition;
+        bool top = pos == DOSI.CORE.UIComponents.WindowManagement.ClockPosition.TopLeft
+                || pos == DOSI.CORE.UIComponents.WindowManagement.ClockPosition.TopRight;
+        bool left = pos == DOSI.CORE.UIComponents.WindowManagement.ClockPosition.TopLeft
+                 || pos == DOSI.CORE.UIComponents.WindowManagement.ClockPosition.BottomLeft;
+
+        // Dock-aware lift: 50 px breathing space on the side AWAY from
+        // the screen edge, plus TaskbarHeight if the taskbar shares
+        // that edge.
+        var topLift = 50d + (top && TaskbarMetricsPosition == DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition.Top
+            ? TaskbarHeight : 0);
+        var bottomLift = 50d + (!top && TaskbarMetricsPosition == DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition.Bottom
+            ? TaskbarHeight : 0);
+        var sideMargin = 36d;
+
+        return (
+            left ? HorizontalAlignment.Left : HorizontalAlignment.Right,
+            top ? VerticalAlignment.Top : VerticalAlignment.Bottom,
+            new Thickness(
+                left ? sideMargin : 0,
+                top ? topLift : 0,
+                left ? 0 : sideMargin,
+                top ? 0 : bottomLift)
+        );
+    }
+
+    /// <summary>
+    /// Backward-compat shim: callers that still treat the clock layout
+    /// as a margin alone get the margin component of the full layout.
+    /// New chrome code should call <see cref="ComputeClockLayout"/> and
+    /// apply all three tuple fields.
+    /// </summary>
+    private static Thickness ComputeClockMargin() => ComputeClockLayout().M;
+
+    /// <summary>
+    /// Re-applies the current ClockPosition to <see cref="_clockStack"/>:
+    /// horizontal + vertical alignment, margin, AND the per-text-block
+    /// alignment so the clock numerals align to the same edge as the
+    /// stack (right-aligned text in a right-anchored stack reads as a
+    /// real corner clock instead of a left-aligned blob shoved right).
+    /// Idempotent.
+    /// </summary>
+    private void ApplyClockLayout()
+    {
+        if (_clockStack == null) return;
+        var (h, v, m) = ComputeClockLayout();
+        _clockStack.HorizontalAlignment = h;
+        _clockStack.VerticalAlignment = v;
+        _clockStack.Margin = m;
+        var textAlign = h == HorizontalAlignment.Right
+            ? TextAlignment.Right
+            : TextAlignment.Left;
+        if (_clockText != null)
+        {
+            _clockText.HorizontalAlignment = h;
+            _clockText.TextAlignment = textAlign;
+        }
+        if (_dateText != null)
+        {
+            _dateText.HorizontalAlignment = h;
+            _dateText.TextAlignment = textAlign;
+        }
+    }
+
+    private void OnClockPositionChanged(object? sender,
+        DOSI.CORE.UIComponents.WindowManagement.ClockPosition pos) => ApplyClockLayout();
+
+    /// <summary>
+    /// Bottom-right version label margin. Same dock-aware lift as the
+    /// clock so the chrome reads consistently regardless of taskbar
+    /// dock - "DAX.OSI v1.0" never gets buried under the bar.
+    /// </summary>
+    private static Thickness ComputeVersionMargin()
+    {
+        var bottom = 16d;
+        if (TaskbarMetricsPosition == DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition.Bottom)
+            bottom += TaskbarHeight;
+        return new Thickness(0, 0, 24, bottom);
     }
 
     private static void LaunchApplication(DOSIWindow window)

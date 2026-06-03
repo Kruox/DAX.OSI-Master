@@ -136,7 +136,28 @@ public static class UserManager
     /// <summary>Raised after a password is successfully changed. Argument is the username.</summary>
     public static event EventHandler<string>? PasswordChanged;
 
-    // ----- Login lockout (in-memory; resets on app restart by design) -----
+    /// <summary>
+    /// Raised when <see cref="SetUserTaskbarHeight"/> persists a new
+    /// height for the active user. <c>DesktopScreen</c> subscribes so
+    /// the taskbar resizes live (border height + chip strip resize +
+    /// downstream margin recalc) without requiring a sign-out cycle.
+    /// </summary>
+    public static event EventHandler<double>? TaskbarHeightChanged;
+
+    /// <summary>
+    /// Raised when <see cref="SetUserTaskbarPosition"/> persists a new
+    /// dock edge for the active user. Chrome subscribes so the
+    /// taskbar flips top/bottom alignment + recomputed reserves apply
+    /// live without waiting for a sign-out cycle.
+    /// </summary>
+    public static event EventHandler<string>? TaskbarPositionChanged;
+
+    /// <summary>
+    /// Raised when <see cref="SetUserClockPosition"/> persists a new
+    /// corner for the ambient clock + date overlay. DesktopScreen and
+    /// LoginScreen subscribe to re-anchor the clock without rebuilding.
+    /// </summary>
+    public static event EventHandler<string>? ClockPositionChanged;
 
     /// <summary>Failed-attempt threshold before the lockout cool-down kicks in.</summary>
     public const int FailedAttemptThreshold = 3;
@@ -316,6 +337,146 @@ public static class UserManager
         if (user == null) return false;
         user.Preferences[WallpaperFitPreferenceKey] = mode;
         return SaveUser(user);
+    }
+
+    /// <summary>
+    /// User-preference key for the taskbar height (in CSS pixels).
+    /// Persisted as the integer pixel count so a future "default size"
+    /// fallback can detect missing-vs-zero correctly. Bounded to a
+    /// sensible range by <see cref="MinTaskbarHeight"/> /
+    /// <see cref="MaxTaskbarHeight"/>; values outside are clamped on read.
+    /// </summary>
+    public const string TaskbarHeightPreferenceKey = "taskbar_height";
+    public const double DefaultTaskbarHeight = 28.0;
+    public const double MinTaskbarHeight = 24.0;
+    public const double MaxTaskbarHeight = 56.0;
+
+    public static double GetUserTaskbarHeight(DOSIUser? user)
+    {
+        if (user == null) return DefaultTaskbarHeight;
+        if (!user.Preferences.TryGetValue(TaskbarHeightPreferenceKey, out var raw)) return DefaultTaskbarHeight;
+        if (!double.TryParse(raw, System.Globalization.NumberStyles.Float,
+                             System.Globalization.CultureInfo.InvariantCulture, out var v)) return DefaultTaskbarHeight;
+        return Math.Clamp(v, MinTaskbarHeight, MaxTaskbarHeight);
+    }
+
+    public static bool SetUserTaskbarHeight(DOSIUser user, double pixels)
+    {
+        if (user == null) return false;
+        var clamped = Math.Clamp(pixels, MinTaskbarHeight, MaxTaskbarHeight);
+        user.Preferences[TaskbarHeightPreferenceKey] =
+            clamped.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture);
+        var ok = SaveUser(user);
+        if (ok)
+        {
+            // Push to the process-wide live value so chrome reacts
+            // without waiting for a sign-out cycle. Layouts subscribing
+            // to TaskbarMetrics.HeightChanged see this immediately.
+            try { DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.Height = clamped; }
+            catch { /* defensive */ }
+            TaskbarHeightChanged?.Invoke(null, clamped);
+        }
+        return ok;
+    }
+
+    /// <summary>
+    /// Where the taskbar docks. Persisted as a lowercase string ("top"
+    /// or "bottom") so the user file stays human-readable and survives
+    /// future enum reordering. Defaults to "top" - the historical
+    /// behaviour, so existing users sign in to the same layout they
+    /// had before this preference existed.
+    /// </summary>
+    public const string TaskbarPositionPreferenceKey = "taskbar_position";
+    public const string TaskbarPositionTop = "top";
+    public const string TaskbarPositionBottom = "bottom";
+
+    public static string GetUserTaskbarPosition(DOSIUser? user)
+    {
+        if (user == null) return TaskbarPositionTop;
+        if (!user.Preferences.TryGetValue(TaskbarPositionPreferenceKey, out var v)) return TaskbarPositionTop;
+        v = (v ?? string.Empty).Trim().ToLowerInvariant();
+        return v == TaskbarPositionBottom ? TaskbarPositionBottom : TaskbarPositionTop;
+    }
+
+    public static bool SetUserTaskbarPosition(DOSIUser user, string position)
+    {
+        if (user == null) return false;
+        var normalized = (position ?? string.Empty).Trim().ToLowerInvariant() == TaskbarPositionBottom
+            ? TaskbarPositionBottom
+            : TaskbarPositionTop;
+        user.Preferences[TaskbarPositionPreferenceKey] = normalized;
+        var ok = SaveUser(user);
+        if (ok)
+        {
+            try
+            {
+                DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.Position =
+                    normalized == TaskbarPositionBottom
+                        ? DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition.Bottom
+                        : DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition.Top;
+            }
+            catch { /* defensive */ }
+            TaskbarPositionChanged?.Invoke(null, normalized);
+        }
+        return ok;
+    }
+
+    /// <summary>
+    /// Where the ambient clock + date overlay anchors on the desktop /
+    /// login screen. Persisted as a lowercase string ("bottom_left",
+    /// "bottom_right", "top_left", "top_right"). Defaults to
+    /// "bottom_left" - the historical position, so existing users see
+    /// no change.
+    /// </summary>
+    public const string ClockPositionPreferenceKey = "clock_position";
+    public const string ClockPositionBottomLeft  = "bottom_left";
+    public const string ClockPositionBottomRight = "bottom_right";
+    public const string ClockPositionTopLeft     = "top_left";
+    public const string ClockPositionTopRight    = "top_right";
+
+    public static string GetUserClockPosition(DOSIUser? user)
+    {
+        if (user == null) return ClockPositionBottomLeft;
+        if (!user.Preferences.TryGetValue(ClockPositionPreferenceKey, out var v)) return ClockPositionBottomLeft;
+        v = (v ?? string.Empty).Trim().ToLowerInvariant();
+        return v switch
+        {
+            ClockPositionBottomRight => ClockPositionBottomRight,
+            ClockPositionTopLeft     => ClockPositionTopLeft,
+            ClockPositionTopRight    => ClockPositionTopRight,
+            _                         => ClockPositionBottomLeft
+        };
+    }
+
+    public static bool SetUserClockPosition(DOSIUser user, string position)
+    {
+        if (user == null) return false;
+        var normalized = (position ?? string.Empty).Trim().ToLowerInvariant() switch
+        {
+            ClockPositionBottomRight => ClockPositionBottomRight,
+            ClockPositionTopLeft     => ClockPositionTopLeft,
+            ClockPositionTopRight    => ClockPositionTopRight,
+            _                         => ClockPositionBottomLeft
+        };
+        user.Preferences[ClockPositionPreferenceKey] = normalized;
+        var ok = SaveUser(user);
+        if (ok)
+        {
+            try
+            {
+                DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.ClockPosition =
+                    normalized switch
+                    {
+                        ClockPositionBottomRight => DOSI.CORE.UIComponents.WindowManagement.ClockPosition.BottomRight,
+                        ClockPositionTopLeft     => DOSI.CORE.UIComponents.WindowManagement.ClockPosition.TopLeft,
+                        ClockPositionTopRight    => DOSI.CORE.UIComponents.WindowManagement.ClockPosition.TopRight,
+                        _                         => DOSI.CORE.UIComponents.WindowManagement.ClockPosition.BottomLeft
+                    };
+            }
+            catch { /* defensive */ }
+            ClockPositionChanged?.Invoke(null, normalized);
+        }
+        return ok;
     }
 
     /// <summary>
@@ -750,6 +911,61 @@ public static class UserManager
 
         CurrentUserChanged?.Invoke(null, user);
         LoginSucceeded?.Invoke(null, user.Username);
+
+        // Apply persisted taskbar height before the desktop chrome
+        // measures, so the first paint already reflects this user's
+        // preference (no flash of default 28 px height).
+        try
+        {
+            DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.Height =
+                GetUserTaskbarHeight(user);
+            // Position too - same reasoning. A bottom-docked user
+            // shouldn't see the bar appear at the top for a frame.
+            DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.Position =
+                GetUserTaskbarPosition(user) == TaskbarPositionBottom
+                    ? DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition.Bottom
+                    : DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition.Top;
+            DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.ClockPosition =
+                GetUserClockPosition(user) switch
+                {
+                    ClockPositionBottomRight => DOSI.CORE.UIComponents.WindowManagement.ClockPosition.BottomRight,
+                    ClockPositionTopLeft     => DOSI.CORE.UIComponents.WindowManagement.ClockPosition.TopLeft,
+                    ClockPositionTopRight    => DOSI.CORE.UIComponents.WindowManagement.ClockPosition.TopRight,
+                    _                         => DOSI.CORE.UIComponents.WindowManagement.ClockPosition.BottomLeft
+                };
+        }
+        catch { /* defensive: never let a chrome read break sign-in */ }
+
+        // Pre-warm the OPPOSITE wallpaper variant the desktop is about
+        // to need. The login screen has already faded in the blurred
+        // variant; if the user has wallpaper-blur disabled, the desktop
+        // post-handoff will want the SHARP variant - and the original
+        // pipeline left that sharp variant un-decoded until
+        // OnTransitionComplete kicked off the cross-fade, producing the
+        // visible "wallpapers adjust themselves a beat after sign-in"
+        // jolt the user reported (especially noticeable on secondary
+        // monitors that follow per-frame sync packets). Pre-warming
+        // here means the variant is already in cache by the time the
+        // desktop's transition-complete hook fires; combined with the
+        // snap-on-variant-only-change in DOSIScreen.OnTransitionComplete,
+        // the post-handoff change becomes invisible.
+        var wallpaperKey = GetUserWallpaper(user);
+        if (!string.IsNullOrEmpty(wallpaperKey) &&
+            !string.Equals(wallpaperKey, DOSI.CORE.WallpaperManagement.WallpaperManager.AccentOnlyKey,
+                System.StringComparison.OrdinalIgnoreCase))
+        {
+            bool wantsBlur = GetUserWallpaperBlur(user);
+            // Warm the variant the DESKTOP will use first - that's the
+            // one whose absence causes the visible jolt. The other
+            // variant is already cached (login screen used it) but we
+            // touch it too as a defensive belt-and-braces measure.
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                var wm = DOSI.CORE.WallpaperManagement.WallpaperManager.Instance;
+                try { wm.LoadBitmap(wallpaperKey, blurred: wantsBlur); } catch { }
+                try { wm.LoadBitmap(wallpaperKey, blurred: !wantsBlur); } catch { }
+            });
+        }
 
         // Lazy trash retention sweep: if the user has set a retention
         // window via the AutoEmptyDaysPreferenceKey preference, sweep

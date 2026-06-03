@@ -41,6 +41,17 @@ public class WindowManager
     /// </summary>
     public double TopWorkAreaInset { get; set; } = 0;
 
+    /// <summary>
+    /// Counterpart to <see cref="TopWorkAreaInset"/>: pixels reserved
+    /// at the BOTTOM of the desktop for chrome (a bottom-docked
+    /// taskbar). Maximize subtracts this from the available height so
+    /// a maximized window doesn't render under the bottom taskbar, and
+    /// new-window placement keeps clear of it. Defaults to 0 - chrome
+    /// owners (DesktopScreen, ExtensionScreen) write to it on dock and
+    /// reset to 0 on detach.
+    /// </summary>
+    public double BottomWorkAreaInset { get; set; } = 0;
+
     // Events
     public event EventHandler<DOSIWindowEventArgs>? WindowOpened;
     public event EventHandler<DOSIWindowEventArgs>? WindowClosed;

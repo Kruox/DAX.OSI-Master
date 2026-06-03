@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Generic;
+using System.Linq;
 using Avalonia;
 using Avalonia.Controls;
 using Avalonia.Controls.Presenters;
@@ -32,6 +34,31 @@ public class DOSIContextMenu : ContextMenu
 {
     private static AccentManager Accents => AccentManager.Instance;
 
+    // Process-wide tracker of every DOSIContextMenu currently open. Lets
+    // a fresh open call dismiss any prior menu so a right-click on a
+    // taskbar chip followed by a right-click on the desktop doesn't
+    // leave both menus visible at once. We track at the DOSI layer
+    // (not Avalonia's base ContextMenu) so legacy / non-DOSI menus
+    // don't get force-closed by user-defined chrome.
+    private static readonly HashSet<DOSIContextMenu> _openMenus = new();
+
+    /// <summary>
+    /// Closes every DOSIContextMenu currently shown. Call this at the
+    /// start of any custom right-click handler that opens its own menu
+    /// to prevent two menus rendering at the same time. Safe to call
+    /// when nothing is open - it's a no-op.
+    /// </summary>
+    public static void CloseAllOpen()
+    {
+        // Snapshot first - Close() mutates _openMenus via the Closed
+        // event handler we wire below.
+        var snapshot = _openMenus.ToArray();
+        foreach (var m in snapshot)
+        {
+            try { m.Close(); } catch { /* defensive: never let chrome close errors propagate */ }
+        }
+    }
+
     public DOSIContextMenu()
     {
         ApplyAccentSurfaces();
@@ -41,6 +68,29 @@ public class DOSIContextMenu : ContextMenu
         CornerRadius = new CornerRadius(10);
         Padding = new Thickness(4);
         MinWidth = 170;
+
+        // Track open / close so CloseAllOpen() can hit every live menu.
+        // Pairing on Opened/Closed (not Opening/Closing) ensures we only
+        // count menus that actually rendered - avoids leaks if Opening
+        // is cancelled by a handler.
+        Opened += (_, _) => _openMenus.Add(this);
+        Closed += (_, _) => _openMenus.Remove(this);
+
+        // When THIS menu starts opening, dismiss every other DOSI menu
+        // currently shown. Solves the "right-click taskbar chip, then
+        // right-click desktop, see both menus at once" pile-up. Single
+        // chokepoint here means every consumer (file explorer, desktop,
+        // taskbar, code editor) gets the behaviour for free.
+        Opening += (_, _) =>
+        {
+            foreach (var other in _openMenus.ToArray())
+            {
+                if (!ReferenceEquals(other, this))
+                {
+                    try { other.Close(); } catch { /* defensive */ }
+                }
+            }
+        };
 
         // Live-update the accent border. The template binds the chrome's
         // BorderBrush to ours, so reassigning BorderBrush is enough - no
@@ -78,6 +128,7 @@ public class DOSIContextMenu : ContextMenu
         // recolours menu-item text + dividers correctly.
         Styles.Clear();
         Styles.Add(BuildItemStyle());
+        Styles.Add(BuildDisabledItemStyle());
         Styles.Add(BuildSeparatorStyle());
     }
 
@@ -178,6 +229,29 @@ public class DOSIContextMenu : ContextMenu
                 Accents.CurrentAccent == DOSIAccent.Light
                     ? new SolidColorBrush(Color.FromRgb(20, 22, 28))
                     : new SolidColorBrush(Color.FromRgb(240, 242, 248)))
+        }
+    };
+
+    /// <summary>
+    /// Disabled-item style - foreground only. Items rendered in a
+    /// disabled state (e.g. "Paste" with no clipboard content, "Open
+    /// in new window" on a non-folder tile) get a softer foreground
+    /// + reduced opacity so they read as "not actionable" without
+    /// disappearing entirely. Picks accent-aware greys so the dim
+    /// state stays legible on both Light and dark surfaces - the
+    /// previous behaviour inherited Avalonia's default disabled
+    /// brush which is nearly white-on-white under our light theme
+    /// (the "hard on the eyes" complaint).
+    /// </summary>
+    private static Style BuildDisabledItemStyle() => new(s => s.OfType<MenuItem>().Class(":disabled"))
+    {
+        Setters =
+        {
+            new Setter(MenuItem.ForegroundProperty,
+                Accents.CurrentAccent == DOSIAccent.Light
+                    ? new SolidColorBrush(Color.FromRgb(140, 145, 158))
+                    : new SolidColorBrush(Color.FromRgb(150, 155, 170))),
+            new Setter(MenuItem.OpacityProperty, 0.75)
         }
     };
 

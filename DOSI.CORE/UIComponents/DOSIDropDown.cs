@@ -96,8 +96,13 @@ public class DOSIDropDown : ContentControl
         {
             Padding = new Thickness(10, 6),
             CornerRadius = new CornerRadius(4),
-            Background = new SolidColorBrush(Color.FromArgb(30, 255, 255, 255)),
-            BorderBrush = new SolidColorBrush(Color.FromArgb(60, 255, 255, 255)),
+            // Accent-aware surfaces: translucent-white over a light
+            // window surface is invisible (the "dropdown looks weird
+            // on light theme" complaint). Use ControlBackground/Border
+            // brushes so the trigger pill picks up the right contrast
+            // automatically on every accent.
+            Background = BuildIdleBackground(),
+            BorderBrush = BuildIdleBorder(),
             BorderThickness = new Thickness(1),
             Cursor = new Cursor(StandardCursorType.Hand),
             Child = rowGrid,
@@ -116,14 +121,14 @@ public class DOSIDropDown : ContentControl
         var popupChrome = new Border
         {
             Background = Accents.WindowChromeBrush,
-            BorderBrush = new SolidColorBrush(Color.FromArgb(80, 255, 255, 255)),
+            BorderBrush = new SolidColorBrush(Accents.ControlBorder),
             BorderThickness = new Thickness(1),
             CornerRadius = new CornerRadius(4),
             Padding = new Thickness(2),
             BoxShadow = new BoxShadows(new BoxShadow
             {
                 OffsetX = 0, OffsetY = 4, Blur = 12, Spread = 0,
-                Color = Color.FromArgb(120, 0, 0, 0)
+                Color = Accents.ShadowColor
             }),
             Child = _itemsHost
         };
@@ -138,11 +143,11 @@ public class DOSIDropDown : ContentControl
         };
 
         _root.PointerEntered += (_, _) =>
-            _root.Background = new SolidColorBrush(Color.FromArgb(60, 255, 255, 255));
+            _root.Background = BuildHoverBackground();
         _root.PointerExited += (_, _) =>
         {
             if (!_popup.IsOpen)
-                _root.Background = new SolidColorBrush(Color.FromArgb(30, 255, 255, 255));
+                _root.Background = BuildIdleBackground();
         };
         _root.PointerReleased += (_, e) =>
         {
@@ -157,7 +162,38 @@ public class DOSIDropDown : ContentControl
         this.GetObservable(SelectedItemProperty).Subscribe(new AnonymousObserver<string?>(_ => RefreshLabel()));
         this.GetObservable(PlaceholderProperty).Subscribe(new AnonymousObserver<string?>(_ => RefreshLabel()));
         RefreshLabel();
+
+        // Live-tint on accent change so a Light <-> dark flip while the
+        // dropdown is mounted recolours its trigger + popup chrome.
+        // Subscribe / unsubscribe in lockstep with the visual tree to
+        // avoid leaking the static accent event handler.
+        AttachedToVisualTree += (_, _) => Accents.AccentChanged += OnAccentChangedInternal;
+        DetachedFromVisualTree += (_, _) => Accents.AccentChanged -= OnAccentChangedInternal;
     }
+
+    private void OnAccentChangedInternal(object? sender, EventArgs e)
+    {
+        _root.Background = BuildIdleBackground();
+        _root.BorderBrush = BuildIdleBorder();
+        _label.Foreground = string.IsNullOrEmpty(SelectedItem)
+            ? Accents.TextSecondaryBrush
+            : Accents.TextPrimaryBrush;
+        _chevron.Fill = Accents.TextSecondaryBrush;
+    }
+
+    /// <summary>
+    /// The dropdown trigger's idle background. <see cref="AccentManager.ControlBackground"/>
+    /// is theme-aware (dark surfaces under dark accents, light under
+    /// the Light accent) so the pill stays visible on every theme.
+    /// </summary>
+    private static IBrush BuildIdleBackground()
+        => new SolidColorBrush(Accents.ControlBackground);
+
+    private static IBrush BuildHoverBackground()
+        => new SolidColorBrush(Accents.ControlBackgroundHover);
+
+    private static IBrush BuildIdleBorder()
+        => new SolidColorBrush(Accents.ControlBorder);
 
     private void RefreshLabel()
     {

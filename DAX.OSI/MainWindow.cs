@@ -749,6 +749,17 @@ public class MainWindow : Window, IDosiHost
             OpenNewTerminal();
             e.Handled = true;
         }
+        else if (e.Key == Key.F1 ||
+                 (e.Key == Key.OemQuestion && e.KeyModifiers.HasFlag(KeyModifiers.Shift)))
+        {
+            // F1 (or Shift+/ which is "?") shows the global keyboard
+            // shortcut overlay. Useful at any point in the lifecycle so
+            // we route it through the same overlay-visibility helper as
+            // the terminal hotkey above.
+            EnsureGlobalOverlayVisible();
+            ShortcutOverlay.Show(_globalOverlay);
+            e.Handled = true;
+        }
     }
 
     /// <summary>

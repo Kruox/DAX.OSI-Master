@@ -57,12 +57,18 @@ public class ExtensionScreen : DOSIScreen
     // Visual-only top taskbar that matches the primary monitor's bar.
     // No apps button, clock, user chip, or running-apps strip - just
     // the same gradient + accent border so the chrome reads as
-    // continuous across all monitors. Reserves the same 28 px work-
+    // continuous across all monitors. Reserves the same work-
     // area inset on the extension's WindowManager so DOSIWindows on
     // this monitor can't open or be dragged behind it. Mounted into
     // the owning host's PopupHost on attach so it renders above
     // DOSIWindows living in the host's window overlay.
-    private const double TaskbarHeight = 28;
+    private static double TaskbarHeight =>
+        DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.Height;
+    private static bool TaskbarIsTop =>
+        DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.Position
+            == DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition.Top;
+    private static double OffScreenSlideY =>
+        TaskbarIsTop ? -TaskbarHeight : TaskbarHeight;
     private Border? _visualTaskbar;
     private IDosiHost? _ownerHost;
     // Drives the slide-in/out animation. The Border's Y translation
@@ -305,35 +311,32 @@ public class ExtensionScreen : DOSIScreen
 
         _ownerHost = ResolveOwnerHost();
 
-        // Reserve the inset on this monitor's WindowManager. Falling back
-        // to WindowManager.Instance keeps behaviour stable for hosts that
-        // don't expose a per-monitor manager (designer / tests).
+        // Reserve the inset on this monitor's WindowManager on the side
+        // that matches the user's dock preference.
         var wm = _ownerHost?.WindowManager ?? WindowManager.Instance;
-        if (wm != null && wm.TopWorkAreaInset < TaskbarHeight)
-            wm.TopWorkAreaInset = TaskbarHeight;
+        ApplyWmInset(wm);
 
-        // Slide-in transform - born off-screen at Y = -TaskbarHeight so
-        // the bar isn't visible before the entrance animation runs. The
-        // animation below tweens Y back to 0. Identical to the primary
-        // monitor's _taskbarSlide pattern.
-        _visualTaskbarSlide = new TranslateTransform(0, -TaskbarHeight);
+        // Slide-in transform - born off-screen on the side we're docking
+        // against. Top dock => -Height, bottom dock => +Height. The
+        // animation below tweens Y back to 0.
+        _visualTaskbarSlide = new TranslateTransform(0, OffScreenSlideY);
 
         _visualTaskbar = new Border
         {
             Height = TaskbarHeight,
             // NOTE: PopupHost is a Canvas on every IDosiHost - Canvas
             // ignores HorizontalAlignment.Stretch / VerticalAlignment.Top
-            // and sizes children to their own content. Without an
-            // explicit Width sync below, the bar would be born zero
-            // pixels wide and stay invisible (you'd still see the
-            // reserved 28 px gap when maximizing a DOSIWindow though,
-            // because the inset is enforced independently). Canvas.Left
-            // / Canvas.Top = 0 pins us to the top-left; the LayoutUpdated
-            // hook resizes us to follow the popup canvas's live width on
-            // every layout pass so the bar tracks monitor / DPI changes.
+            // and sizes children to their own content. We pin via
+            // Canvas.Left / Canvas.Top in SyncBarLayout (top dock = 0,
+            // bottom dock = canvasHeight - TaskbarHeight) which also
+            // tracks DPI / monitor changes.
             Background = DesktopScreen.BuildTaskbarBackground(),
             BorderBrush = DesktopScreen.BuildTaskbarBorderBrush(),
-            BorderThickness = new Thickness(0, 0, 0, 1),
+            // Border line on the inside edge: bottom for top dock, top
+            // for bottom dock.
+            BorderThickness = TaskbarIsTop
+                ? new Thickness(0, 0, 0, 1)
+                : new Thickness(0, 1, 0, 0),
             IsHitTestVisible = false, // pure visual continuity; no clicks
             RenderTransform = _visualTaskbarSlide
         };
@@ -345,14 +348,16 @@ public class ExtensionScreen : DOSIScreen
         {
             popup.Children.Add(_visualTaskbar);
 
-            // Width sync - Canvas-children don't auto-stretch.
-            void SyncWidth(object? _, EventArgs __)
+            // Width + top-anchor sync - Canvas-children don't auto-stretch.
+            void SyncBarLayout(object? _, EventArgs __)
             {
-                if (_visualTaskbar != null)
-                    _visualTaskbar.Width = popup.Bounds.Width;
+                if (_visualTaskbar == null) return;
+                _visualTaskbar.Width = popup.Bounds.Width;
+                Canvas.SetTop(_visualTaskbar,
+                    TaskbarIsTop ? 0 : Math.Max(0, popup.Bounds.Height - TaskbarHeight));
             }
-            popup.LayoutUpdated += SyncWidth;
-            SyncWidth(null, EventArgs.Empty);
+            popup.LayoutUpdated += SyncBarLayout;
+            SyncBarLayout(null, EventArgs.Empty);
         }
         else
         {
@@ -383,11 +388,64 @@ public class ExtensionScreen : DOSIScreen
             // a re-mount (rare) doesn't leave the bar off-screen.
             _visualTaskbarSlide.Y = 0;
         }
+
+        // React to live taskbar-height + position changes from
+        // Settings: resize the bar, flip alignment when the dock edge
+        // changes, re-publish the work-area inset on the right side
+        // so DOSIWindow maximize / drag-clamp respect the new geometry.
+        DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.HeightChanged += OnTaskbarHeightChanged;
+        DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.PositionChanged += OnTaskbarPositionChanged;
+    }
+
+    private void ApplyWmInset(WindowManager? wm)
+    {
+        if (wm == null) return;
+        if (TaskbarIsTop)
+        {
+            if (wm.TopWorkAreaInset < TaskbarHeight) wm.TopWorkAreaInset = TaskbarHeight;
+            wm.BottomWorkAreaInset = 0;
+        }
+        else
+        {
+            wm.TopWorkAreaInset = 0;
+            if (wm.BottomWorkAreaInset < TaskbarHeight) wm.BottomWorkAreaInset = TaskbarHeight;
+        }
+    }
+
+    private void OnTaskbarHeightChanged(object? sender, double newHeight)
+    {
+        if (_visualTaskbar != null) _visualTaskbar.Height = newHeight;
+        if (_visualTaskbarSlide != null && Math.Abs(_visualTaskbarSlide.Y) > 0.5)
+            _visualTaskbarSlide.Y = OffScreenSlideY;
+        // Reposition for bottom dock - the canvas-anchor uses height.
+        if (_visualTaskbar?.Parent is Panel popup)
+            Canvas.SetTop(_visualTaskbar,
+                TaskbarIsTop ? 0 : Math.Max(0, popup.Bounds.Height - newHeight));
+        ApplyWmInset(_ownerHost?.WindowManager ?? WindowManager.Instance);
+    }
+
+    private void OnTaskbarPositionChanged(object? sender,
+        DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition pos)
+    {
+        if (_visualTaskbar != null)
+        {
+            _visualTaskbar.BorderThickness = TaskbarIsTop
+                ? new Thickness(0, 0, 0, 1)
+                : new Thickness(0, 1, 0, 0);
+            if (_visualTaskbar.Parent is Panel popup)
+                Canvas.SetTop(_visualTaskbar,
+                    TaskbarIsTop ? 0 : Math.Max(0, popup.Bounds.Height - TaskbarHeight));
+        }
+        if (_visualTaskbarSlide != null) _visualTaskbarSlide.Y = 0;
+        ApplyWmInset(_ownerHost?.WindowManager ?? WindowManager.Instance);
     }
 
     private void UnmountVisualTaskbar()
     {
         if (_visualTaskbar == null) return;
+
+        DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.HeightChanged -= OnTaskbarHeightChanged;
+        DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.PositionChanged -= OnTaskbarPositionChanged;
 
         _visualTaskbarAnimTimer?.Stop();
         _visualTaskbarAnimTimer = null;
@@ -396,8 +454,16 @@ public class ExtensionScreen : DOSIScreen
             parent.Children.Remove(_visualTaskbar);
 
         var wm = _ownerHost?.WindowManager ?? WindowManager.Instance;
-        if (wm != null && Math.Abs(wm.TopWorkAreaInset - TaskbarHeight) < 0.5)
-            wm.TopWorkAreaInset = 0;
+        if (wm != null)
+        {
+            // Clear whichever side is currently reserving for our bar -
+            // we don't know which dock was active when we last applied,
+            // so clear both edges if they match TaskbarHeight.
+            if (Math.Abs(wm.TopWorkAreaInset - TaskbarHeight) < 0.5)
+                wm.TopWorkAreaInset = 0;
+            if (Math.Abs(wm.BottomWorkAreaInset - TaskbarHeight) < 0.5)
+                wm.BottomWorkAreaInset = 0;
+        }
 
         _visualTaskbar = null;
         _visualTaskbarSlide = null;

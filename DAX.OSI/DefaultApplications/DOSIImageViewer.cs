@@ -70,6 +70,12 @@ public sealed class DOSIImageViewer : DOSIWindow
     // ----- Image / navigation state -----
     private Bitmap? _bitmap;
     private string? _currentPath;
+    // Most recently requested path (set at LoadImage start, read inside
+    // the async decode callback). Lets us ignore stale decodes that land
+    // after the user has navigated to a newer image - without this, fast
+    // arrow-key paging visibly snaps backward when an older decode wins
+    // the race against a newer one.
+    private string? _pendingPath;
     private List<string> _siblings = new();
     private int _siblingIndex = -1;
 
@@ -290,6 +296,14 @@ public sealed class DOSIImageViewer : DOSIWindow
     {
         if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) return;
 
+        // Snapshot the requested path so we can ignore stale callbacks
+        // when the user mashes Next/Prev faster than decodes complete -
+        // without this guard, an older decode landing AFTER a newer one
+        // would clobber the on-screen image with a previous frame.
+        // _pendingPath is the most-recently-requested path; the
+        // callback only commits if it still matches.
+        _pendingPath = path;
+
         // Decode off the UI thread via the shared ImageCache so a
         // 24 MP+ phone photo doesn't freeze the dispatcher for several
         // hundred ms (which is exactly the lag the user reported when
@@ -301,6 +315,11 @@ public sealed class DOSIImageViewer : DOSIWindow
             next =>
             {
                 if (next == null) return; // decode failure - keep prior image
+
+                // Stale-callback guard: if the user has navigated away
+                // since this load was kicked off, drop the result on the
+                // floor instead of overwriting the now-current image.
+                if (!string.Equals(_pendingPath, path, StringComparison.Ordinal)) return;
 
                 // The previous bitmap was potentially shared via the cache,
                 // so don't dispose it here - the cache owns its lifetime.

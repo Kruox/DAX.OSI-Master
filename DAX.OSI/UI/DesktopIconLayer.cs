@@ -57,11 +57,40 @@ public sealed class DesktopIconLayer : Canvas
     private const double GridGapX = 12;
     private const double GridGapY = 16;
     private const double GridStartX = 16;
-    // Push the first row clear of the taskbar (28 px tall, docked at top)
-    // plus a small breathing margin. Without this the auto-placed first
-    // row of new icons rendered half-tucked under the taskbar.
-    private const double TaskbarHeight = 28;
-    private const double GridStartY = TaskbarHeight + 12;
+    // Push the first row clear of the taskbar plus a small breathing
+    // margin. Without this the auto-placed first row of new icons
+    // rendered half-tucked under the taskbar. Reads live from
+    // TaskbarMetrics so resizing the taskbar in Settings updates the
+    // grid origin too.
+    private static double TaskbarHeight =>
+        DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.Height;
+    private static bool TaskbarIsTop =>
+        DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.Position
+            == DOSI.CORE.UIComponents.WindowManagement.TaskbarPosition.Top;
+    /// <summary>
+    /// Y for the first auto-placed icon row. Top dock reserves the top
+    /// edge; bottom dock keeps icons starting at the top of the canvas
+    /// (the taskbar lives at the bottom and the bottom-edge clamp in
+    /// MaxIconY handles overflow).
+    /// </summary>
+    private static double GridStartY => TaskbarIsTop ? TaskbarHeight + 12 : 12;
+
+    /// <summary>
+    /// Minimum legal Y for an icon's top edge. Anything above this is
+    /// behind the taskbar (top dock) or just clamped to the canvas edge.
+    /// </summary>
+    private static double MinIconY => TaskbarIsTop ? TaskbarHeight + 4 : 4;
+
+    /// <summary>
+    /// Maximum legal Y for an icon's top edge given the canvas height
+    /// and tile height. Subtracts the bottom taskbar reserve when the
+    /// taskbar is bottom-docked so dragged icons can't slide under it.
+    /// </summary>
+    private static double MaxIconY(double canvasHeight, double tileHeight)
+    {
+        var bottomReserve = TaskbarIsTop ? 0 : TaskbarHeight + 4;
+        return Math.Max(MinIconY, canvasHeight - tileHeight - bottomReserve);
+    }
 
     // Snap-to-grid is a session-scoped toggle shared across every layer
     // (primary + secondary monitors) so flipping it on the primary
@@ -457,7 +486,7 @@ public sealed class DesktopIconLayer : Canvas
                 // Forward-migrate any pre-existing positions that fall under
                 // the taskbar (saved before the taskbar inset existed).
                 var sx = saved.X;
-                var sy = Math.Max(TaskbarHeight + 4, saved.Y);
+                var sy = Math.Max(MinIconY, saved.Y);
                 Canvas.SetLeft(tile, sx);
                 Canvas.SetTop(tile, sy);
                 if (sy != saved.Y) DesktopIconLayout.Save(name, sx, sy);
@@ -542,7 +571,7 @@ public sealed class DesktopIconLayer : Canvas
             if (saved != null)
             {
                 var sx = saved.X;
-                var sy = Math.Max(TaskbarHeight + 4, saved.Y);
+                var sy = Math.Max(MinIconY, saved.Y);
                 Canvas.SetLeft(tile, sx);
                 Canvas.SetTop(tile, sy);
                 Children.Add(tile);
@@ -1182,9 +1211,11 @@ public sealed class DesktopIconLayer : Canvas
             foreach (var (tile, start) in _dragStartPositions)
             {
                 var nx = Math.Max(0, start.X + dx);
-                // Clamp Y to the taskbar bottom so a user can't accidentally
-                // drop an icon into the dead zone behind the taskbar.
-                var ny = Math.Max(TaskbarHeight + 4, start.Y + dy);
+                // Clamp Y to keep the tile clear of the taskbar regardless
+                // of which edge it's docked on. MinIconY = top reserve
+                // (top dock) or 4 (bottom dock); the bottom-edge clamp
+                // happens at drop-time via MaxIconY below.
+                var ny = Math.Max(MinIconY, start.Y + dy);
                 Canvas.SetLeft(tile, nx);
                 Canvas.SetTop(tile, ny);
             }
@@ -1594,7 +1625,7 @@ public sealed class DesktopIconLayer : Canvas
             // so any future arithmetic mistake can't silently lose icons.
             var anchorPt = layerHit.Value.LocalPoint;
             double maxX = Math.Max(0, target.Bounds.Width  - TileWidth);
-            double maxY = Math.Max(TaskbarHeight + 4, target.Bounds.Height - TileHeight);
+            double maxY = MaxIconY(target.Bounds.Height, TileHeight);
             foreach (var (tile, startPos) in _dragStartPositions)
             {
                 if (tile.Tag is not TileMeta m) continue;
@@ -1603,7 +1634,7 @@ public sealed class DesktopIconLayer : Canvas
                 var targetX = anchorPt.X - grabOffsetX;
                 var targetY = anchorPt.Y - grabOffsetY;
                 targetX = Math.Clamp(targetX, 0, maxX);
-                targetY = Math.Clamp(targetY, TaskbarHeight + 4, maxY);
+                targetY = Math.Clamp(targetY, MinIconY, maxY);
                 DesktopIconLayout.Save(m.Name, targetX, targetY);
             }
             // revertLocalPositions: false - we DON'T want the source tiles

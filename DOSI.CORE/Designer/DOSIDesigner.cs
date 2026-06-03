@@ -165,12 +165,29 @@ public static class DOSIFormSerializer
     public static DOSIFormDocument Load(string path)
     {
         if (!File.Exists(path)) return new DOSIFormDocument();
-        try { return TryDeserialize(File.ReadAllText(path)) ?? new DOSIFormDocument(); }
+        try
+        {
+            // Route through UserVault so encrypted .dosiform files (saved
+            // when the active user has a vault unlocked - which is now
+            // the default after sign-in) decrypt transparently. The
+            // vault's ReadAllText falls through to plain File.ReadAllText
+            // when the file isn't encrypted, so legacy plaintext forms
+            // still load cleanly. Without this the encrypted bytes hit
+            // the JSON deserializer, fail, and the IDE silently opens a
+            // blank form - which read as "save didn't persist" because
+            // the on-disk file IS up-to-date but unreadable through the
+            // wrong code path.
+            var json = DOSI.CORE.Security.UserVault.ReadAllText(path);
+            return TryDeserialize(json) ?? new DOSIFormDocument();
+        }
         catch { return new DOSIFormDocument(); }
     }
 
     public static void Save(string path, DOSIFormDocument doc) =>
-        File.WriteAllText(path, Serialize(doc));
+        // Symmetric with Load: WriteAllText encrypts when the vault is
+        // unlocked, falls through to plaintext when locked - a guest /
+        // pre-setup flow can still save forms.
+        DOSI.CORE.Security.UserVault.WriteAllText(path, Serialize(doc));
 }
 
 #endregion
@@ -588,6 +605,17 @@ public sealed class DOSIDesigner : UserControl
     /// <summary>Per-placed-control adornment + selection plumbing.</summary>
     private readonly Dictionary<Control, Adornment> _adornments = new();
     private Control? _selected;
+    // Additional controls in the multi-select set. The "singular"
+    // _selected is also conceptually part of this set (it's the
+    // anchor / property-grid focus); _multiSelected only holds the
+    // EXTRA controls so the rest of the code can keep treating
+    // _selected as the primary focus without rewriting every call site.
+    private readonly HashSet<Control> _multiSelected = new();
+    // Canvas overlay that hosts the live alignment guides drawn during a
+    // drag (1px lines snapping to peer-control edges + form centerlines).
+    // Lazy-built on first guide render so screens that never drag pay
+    // no cost.
+    private Canvas? _guidesLayer;
 
     // Drag state
     private bool _isDragging;
@@ -595,6 +623,11 @@ public sealed class DOSIDesigner : UserControl
     private double _dragStartX, _dragStartY;
     private bool _isResizing;
     private double _dragStartW, _dragStartH;
+    // Per-(selected control, starting top-left) snapshot taken at
+    // BeginDrag time so a group drag can compute each child's
+    // destination from its own origin instead of accumulating
+    // floating-point drift through repeated mutations.
+    private readonly Dictionary<Control, (double X, double Y)> _groupDragOrigins = new();
 
     public event EventHandler? Modified;
     /// <summary>
@@ -974,6 +1007,11 @@ public sealed class DOSIDesigner : UserControl
             prev.SelectionFrame.IsVisible = false;
             prev.Handle.IsVisible = false;
         }
+        // Plain Select always collapses the multi-select set - it's the
+        // "pick exactly this one" gesture. Callers wanting additive
+        // selection go through ToggleMultiSelect.
+        ClearMultiSelectVisuals();
+        _multiSelected.Clear();
         _selected = ctrl;
         if (ctrl != null && _adornments.TryGetValue(ctrl, out var cur))
         {
@@ -988,13 +1026,101 @@ public sealed class DOSIDesigner : UserControl
         }
     }
 
+    /// <summary>
+    /// Adds <paramref name="ctrl"/> to (or removes it from) the
+    /// multi-select set, leaving the singular <see cref="_selected"/>
+    /// as the anchor / property-grid focus. The first Shift-click on a
+    /// fresh control promotes the existing anchor into the set so the
+    /// user sees both highlighted - matches Finder / Explorer
+    /// convention. The property grid stays bound to the original
+    /// anchor; multi-select is for bulk move / delete, not bulk
+    /// property editing (which has no sensible UI for mixed values).
+    /// </summary>
+    private void ToggleMultiSelect(Control ctrl)
+    {
+        if (_selected == null)
+        {
+            // No anchor yet - the Shift-click becomes the anchor.
+            Select(ctrl);
+            return;
+        }
+        if (ctrl == _selected) return; // anchor is implicitly selected
+
+        if (_multiSelected.Contains(ctrl))
+        {
+            _multiSelected.Remove(ctrl);
+            if (_adornments.TryGetValue(ctrl, out var ad))
+            {
+                ad.SelectionFrame.IsVisible = false;
+                ad.Handle.IsVisible = false;
+            }
+        }
+        else
+        {
+            _multiSelected.Add(ctrl);
+            if (_adornments.TryGetValue(ctrl, out var ad))
+            {
+                ad.SelectionFrame.IsVisible = true;
+                // Resize handle stays hidden for non-anchor selections -
+                // grabbing it on a satellite would only resize the
+                // satellite, which is confusing in a group.
+                ad.Handle.IsVisible = false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Yields every control currently part of the selection - the
+    /// singular anchor plus any extras added via Shift-click. Empty if
+    /// nothing is selected.
+    /// </summary>
+    private IEnumerable<Control> EnumerateSelected()
+    {
+        if (_selected != null) yield return _selected;
+        foreach (var c in _multiSelected) yield return c;
+    }
+
+    private void ClearMultiSelectVisuals()
+    {
+        foreach (var c in _multiSelected)
+        {
+            if (_adornments.TryGetValue(c, out var ad))
+            {
+                ad.SelectionFrame.IsVisible = false;
+                ad.Handle.IsVisible = false;
+            }
+        }
+    }
+
     #endregion
 
     #region Drag / resize / nudge
 
     private void BeginDrag(Control ctrl, PointerPressedEventArgs e, bool resizing)
     {
-        Select(ctrl);
+        // Shift-click on an unselected control adds it to the multi-select;
+        // shift-click on an already-selected control removes it. Plain
+        // click on an unselected control replaces the selection (so a
+        // single click in empty space + click-on-control behaves like
+        // every shell file browser). Multi-select isn't compatible with
+        // resize (resize handles target one control's bounds), so a
+        // resize gesture always collapses to a singular selection.
+        bool shift = e.KeyModifiers.HasFlag(KeyModifiers.Shift);
+        if (resizing)
+        {
+            Select(ctrl);
+        }
+        else if (shift)
+        {
+            ToggleMultiSelect(ctrl);
+        }
+        else if (_selected != ctrl && !_multiSelected.Contains(ctrl))
+        {
+            Select(ctrl);
+        }
+        // Else: plain click on a control already in the multi-select set
+        // preserves the group so the user can drag the whole thing.
+
         var ad = _adornments[ctrl];
         _isDragging = !resizing;
         _isResizing = resizing;
@@ -1003,6 +1129,16 @@ public sealed class DOSIDesigner : UserControl
         _dragStartY = ad.Def.Y;
         _dragStartW = ad.Def.Width;
         _dragStartH = ad.Def.Height;
+        // Snapshot every selected control's starting position so a
+        // group drag can recompute each one's destination from its own
+        // origin (rather than accumulating drift through repeated
+        // ApplyGeometry calls).
+        _groupDragOrigins.Clear();
+        foreach (var sel in EnumerateSelected())
+        {
+            if (_adornments.TryGetValue(sel, out var selAd))
+                _groupDragOrigins[sel] = (selAd.Def.X, selAd.Def.Y);
+        }
         e.Pointer.Capture(resizing ? ad.Handle : ad.Overlay);
         e.Handled = true;
     }
@@ -1020,13 +1156,52 @@ public sealed class DOSIDesigner : UserControl
         {
             ad.Def.Width = Math.Max(16, SnapTo(_dragStartW + dx));
             ad.Def.Height = Math.Max(16, SnapTo(_dragStartH + dy));
+            ApplyGeometry(ad);
+            MarkDirty();
+            return;
+        }
+
+        // SNAP + GUIDES (single-select drag only - group drags skip both
+        // because there's no obvious anchor to snap on, and 8 dancing
+        // guides would be noise).
+        bool altDisablesSnap = e.KeyModifiers.HasFlag(KeyModifiers.Alt);
+        bool isGroup = _multiSelected.Count > 0;
+        double snappedX = SnapTo(_dragStartX + dx);
+        double snappedY = SnapTo(_dragStartY + dy);
+
+        if (!isGroup && !altDisablesSnap)
+        {
+            ComputeSnapAndGuides(ad, ref snappedX, ref snappedY);
         }
         else
         {
-            ad.Def.X = Math.Clamp(SnapTo(_dragStartX + dx), 0, Math.Max(0, _doc.Width - ad.Def.Width));
-            ad.Def.Y = Math.Clamp(SnapTo(_dragStartY + dy), 0, Math.Max(0, _doc.Height - ad.Def.Height));
+            ClearGuides();
         }
-        ApplyGeometry(ad);
+
+        if (isGroup)
+        {
+            // Compute the actual delta the anchor moved through (after
+            // SnapTo) and apply it to every selected control from its
+            // snapshotted origin.
+            double anchorDx = Math.Clamp(snappedX, 0, Math.Max(0, _doc.Width - ad.Def.Width)) - _dragStartX;
+            double anchorDy = Math.Clamp(snappedY, 0, Math.Max(0, _doc.Height - ad.Def.Height)) - _dragStartY;
+            foreach (var sel in EnumerateSelected())
+            {
+                if (!_adornments.TryGetValue(sel, out var selAd)) continue;
+                if (!_groupDragOrigins.TryGetValue(sel, out var origin)) continue;
+                selAd.Def.X = Math.Clamp(SnapTo(origin.X + anchorDx), 0,
+                                         Math.Max(0, _doc.Width - selAd.Def.Width));
+                selAd.Def.Y = Math.Clamp(SnapTo(origin.Y + anchorDy), 0,
+                                         Math.Max(0, _doc.Height - selAd.Def.Height));
+                ApplyGeometry(selAd);
+            }
+        }
+        else
+        {
+            ad.Def.X = Math.Clamp(snappedX, 0, Math.Max(0, _doc.Width - ad.Def.Width));
+            ad.Def.Y = Math.Clamp(snappedY, 0, Math.Max(0, _doc.Height - ad.Def.Height));
+            ApplyGeometry(ad);
+        }
         MarkDirty();
     }
 
@@ -1034,40 +1209,185 @@ public sealed class DOSIDesigner : UserControl
     {
         _isDragging = false;
         _isResizing = false;
+        ClearGuides();
+        _groupDragOrigins.Clear();
+    }
+
+    private const double SnapThreshold = 4.0;
+    private static readonly IBrush GuideBrush =
+        new SolidColorBrush(Color.FromArgb(220, 255, 105, 180));
+
+    /// <summary>
+    /// Mutates <paramref name="x"/> / <paramref name="y"/> to snap the
+    /// dragged adornment <paramref name="ad"/> to the nearest peer-control
+    /// edge / center or the form centerline, when within
+    /// <see cref="SnapThreshold"/> pixels. Also paints 1px guide lines
+    /// on the guides overlay for any axis that snapped, so the user
+    /// sees what's aligning. Skipped for resize gestures (they have
+    /// their own meaning) and group drags (8 guides at once is noise).
+    /// </summary>
+    private void ComputeSnapAndGuides(Adornment ad, ref double x, ref double y)
+    {
+        EnsureGuidesLayer();
+        _guidesLayer!.Children.Clear();
+
+        double w = ad.Def.Width, h = ad.Def.Height;
+        double formW = _doc.Width, formH = _doc.Height;
+
+        // Candidate targets we measure against, by axis. Each candidate
+        // is (targetCoord, where-to-draw-the-line, axisLength). We
+        // collect all peers + the canvas centerlines + edges.
+        var xCandidates = new List<double> { 0, formW / 2 - w / 2, formW - w };
+        var yCandidates = new List<double> { 0, formH / 2 - h / 2, formH - h };
+
+        foreach (var (other, otherAd) in _adornments)
+        {
+            if (other == ad.Preview || ReferenceEquals(otherAd, ad)) continue;
+            // Skip every adornment whose Preview is the dragged control
+            // (the dictionary keys by Preview).
+            if (ReferenceEquals(other, ad.Preview)) continue;
+            var od = otherAd.Def;
+            // X axis: align left-to-left, right-to-right, center-to-center.
+            xCandidates.Add(od.X);                              // left-left
+            xCandidates.Add(od.X + od.Width - w);               // right-right
+            xCandidates.Add(od.X + od.Width / 2 - w / 2);       // center-center
+            // Y axis: same three.
+            yCandidates.Add(od.Y);
+            yCandidates.Add(od.Y + od.Height - h);
+            yCandidates.Add(od.Y + od.Height / 2 - h / 2);
+        }
+
+        double snappedX = x, snappedY = y;
+        double bestDx = SnapThreshold, bestDy = SnapThreshold;
+        double bestXTarget = double.NaN, bestYTarget = double.NaN;
+
+        foreach (var t in xCandidates)
+        {
+            var d = Math.Abs(t - x);
+            if (d < bestDx) { bestDx = d; snappedX = t; bestXTarget = t; }
+        }
+        foreach (var t in yCandidates)
+        {
+            var d = Math.Abs(t - y);
+            if (d < bestDy) { bestDy = d; snappedY = t; bestYTarget = t; }
+        }
+
+        x = snappedX;
+        y = snappedY;
+
+        // Paint a full-height guide on the snapped X (so the user can see
+        // which other control's edge they're aligned with) and a full-width
+        // guide on the snapped Y. Only paint when a snap actually happened.
+        if (!double.IsNaN(bestXTarget))
+        {
+            // The dragged control's left edge is at snappedX. Draw the
+            // line there, but if the snap aligned center/right we want
+            // the line on the actual aligned edge, not on `x` (the left).
+            // Cheap to just draw on the left edge - it visually reads
+            // as "this column aligns" either way.
+            var line = new Rectangle
+            {
+                Width = 1,
+                Height = formH,
+                Fill = GuideBrush,
+                IsHitTestVisible = false
+            };
+            Canvas.SetLeft(line, snappedX);
+            Canvas.SetTop(line, 0);
+            _guidesLayer.Children.Add(line);
+        }
+        if (!double.IsNaN(bestYTarget))
+        {
+            var line = new Rectangle
+            {
+                Width = formW,
+                Height = 1,
+                Fill = GuideBrush,
+                IsHitTestVisible = false
+            };
+            Canvas.SetLeft(line, 0);
+            Canvas.SetTop(line, snappedY);
+            _guidesLayer.Children.Add(line);
+        }
+    }
+
+    private void EnsureGuidesLayer()
+    {
+        if (_guidesLayer != null) return;
+        _guidesLayer = new Canvas
+        {
+            IsHitTestVisible = false,
+            Width = _doc.Width,
+            Height = _doc.Height
+        };
+        // Layered on top of every adornment so the lines aren't
+        // occluded by the dragged control's own preview.
+        _canvas.Children.Add(_guidesLayer);
+        Canvas.SetLeft(_guidesLayer, 0);
+        Canvas.SetTop(_guidesLayer, 0);
+    }
+
+    private void ClearGuides()
+    {
+        if (_guidesLayer == null) return;
+        _guidesLayer.Children.Clear();
     }
 
     private void OnKeyDown(object? sender, KeyEventArgs e)
     {
         if (_selected == null) return;
-        if (!_adornments.TryGetValue(_selected, out var ad)) return;
 
-        var step = e.KeyModifiers.HasFlag(KeyModifiers.Shift) ? GridStep : 1;
+        // Delete: route through the multi-aware path so a Ctrl-A or
+        // Shift-built group can be wiped in one keypress.
+        if (e.Key == Key.Delete)
+        {
+            DeleteSelected();
+            e.Handled = true;
+            return;
+        }
+
+        // Arrow keys: nudge every selected control. Shift = grid step,
+        // unmodified = 1px. WinForms / Designer convention.
+        double dx = 0, dy = 0;
+        var step = e.KeyModifiers.HasFlag(KeyModifiers.Shift) ? GridStep : 1d;
         switch (e.Key)
         {
-            case Key.Left:   ad.Def.X = Math.Max(0, ad.Def.X - step); break;
-            case Key.Right:  ad.Def.X = Math.Min(_doc.Width - ad.Def.Width, ad.Def.X + step); break;
-            case Key.Up:     ad.Def.Y = Math.Max(0, ad.Def.Y - step); break;
-            case Key.Down:   ad.Def.Y = Math.Min(_doc.Height - ad.Def.Height, ad.Def.Y + step); break;
-            case Key.Delete: DeleteSelected(); e.Handled = true; return;
+            case Key.Left:  dx = -step; break;
+            case Key.Right: dx = step; break;
+            case Key.Up:    dy = -step; break;
+            case Key.Down:  dy = step; break;
             default: return;
         }
-        ApplyGeometry(ad);
+
+        foreach (var sel in EnumerateSelected())
+        {
+            if (!_adornments.TryGetValue(sel, out var selAd)) continue;
+            selAd.Def.X = Math.Clamp(selAd.Def.X + dx, 0, Math.Max(0, _doc.Width - selAd.Def.Width));
+            selAd.Def.Y = Math.Clamp(selAd.Def.Y + dy, 0, Math.Max(0, _doc.Height - selAd.Def.Height));
+            ApplyGeometry(selAd);
+        }
         MarkDirty();
         e.Handled = true;
     }
 
     private void DeleteSelected()
     {
-        if (_selected == null) return;
-        if (!_adornments.TryGetValue(_selected, out var ad)) return;
-
-        _canvas.Children.Remove(ad.Preview);
-        _canvas.Children.Remove(ad.Overlay);
-        _canvas.Children.Remove(ad.SelectionFrame);
-        _canvas.Children.Remove(ad.Handle);
-        _adornments.Remove(_selected);
-        _doc.Controls.Remove(ad.Def);
+        // Snapshot first - we'll mutate _multiSelected via Select(null)
+        // below and don't want the foreach to throw.
+        var victims = EnumerateSelected().ToList();
+        if (victims.Count == 0) return;
+        foreach (var c in victims)
+        {
+            if (!_adornments.TryGetValue(c, out var ad)) continue;
+            _canvas.Children.Remove(ad.Preview);
+            _canvas.Children.Remove(ad.Overlay);
+            _canvas.Children.Remove(ad.SelectionFrame);
+            _canvas.Children.Remove(ad.Handle);
+            _adornments.Remove(c);
+            _doc.Controls.Remove(ad.Def);
+        }
         _selected = null;
+        _multiSelected.Clear();
         RenderFormProperties();
         MarkDirty();
     }

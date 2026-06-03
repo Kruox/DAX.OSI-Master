@@ -27,7 +27,7 @@ public class SystemSettings
 public static class SystemCore
 {
     public static string Name => "DOSI.CORE";
-    public static string Version => "1.0.0.0";
+    public static string Version => "1.0.2.1";
 
     private static readonly string SettingsFileName = "SystemSettings.json";
     private static readonly JsonSerializerOptions JsonOptions = new()

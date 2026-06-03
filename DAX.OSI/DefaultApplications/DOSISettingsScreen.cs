@@ -241,13 +241,107 @@ public class DOSISettingsScreen : DOSIWindow
         return grid;
     }
 
-    private static DOSIScrollViewer WrapInScroller(Control content) => new()
+    private static Control WrapInScroller(Control content)
     {
-        Content = content,
-        VerticalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto,
-        HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled,
-        ShowScrollButtons = false
-    };
+        // Wrap the per-tab content StackPanel in a search-aware shell.
+        // The search box filters direct section children of the inner
+        // StackPanel by their first-child TextBlock (the title), the
+        // optional second-child subtitle, and the visible TextBlocks
+        // inside their bodies. Non-matching sections collapse so the
+        // remaining ones float to the top - exactly the "type to find
+        // a setting" UX every modern shell ships.
+        var scroller = new DOSIScrollViewer
+        {
+            Content = content,
+            VerticalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = Avalonia.Controls.Primitives.ScrollBarVisibility.Disabled,
+            ShowScrollButtons = false
+        };
+
+        // Only apply the search header to StackPanel content (the shape
+        // every tab's BuildXxxTab method returns). Anything else is
+        // probably a custom layout that already provides its own header
+        // - skip injecting search there and just return the scroller
+        // bare so we don't double-up.
+        if (content is not StackPanel sectionStack)
+            return scroller;
+
+        var searchBox = new DOSITextBox
+        {
+            PlaceholderText = "Search settings...",
+            FontSize = 13,
+            Padding = new Thickness(10, 6),
+            Height = 30,
+            CornerRadius = new CornerRadius(6),
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            Margin = new Thickness(24, 16, 24, 0)
+        };
+        searchBox.TextChanged += (_, _) => ApplySettingsSearch(sectionStack, searchBox.Text ?? string.Empty);
+
+        var shell = new Grid
+        {
+            RowDefinitions = new RowDefinitions("Auto,*")
+        };
+        shell.Children.Add(searchBox); Grid.SetRow(searchBox, 0);
+        shell.Children.Add(scroller);  Grid.SetRow(scroller, 1);
+        return shell;
+    }
+
+    /// <summary>
+    /// Filters a settings tab's section StackPanel by <paramref name="needle"/>.
+    /// Empty needle = all sections visible. Otherwise, each section
+    /// stays visible only if its title, subtitle, or any TextBlock
+    /// inside its body contains the needle (case-insensitive). Walks
+    /// the section's visual subtree once per keystroke - O(N) in total
+    /// text-block count, fine for the handful of sections per tab.
+    /// </summary>
+    private static void ApplySettingsSearch(StackPanel sectionStack, string needle)
+    {
+        var trimmed = needle?.Trim() ?? string.Empty;
+        bool matchAll = trimmed.Length == 0;
+        foreach (var child in sectionStack.Children)
+        {
+            if (child is not Control c) continue;
+            if (matchAll) { c.IsVisible = true; continue; }
+            c.IsVisible = SectionMatches(c, trimmed);
+        }
+    }
+
+    private static bool SectionMatches(Control section, string needle)
+    {
+        // Walk descendants; any TextBlock whose Text contains the needle
+        // is enough to keep the whole section visible. Stops at the
+        // first match for cheap early exit.
+        return EnumerateTextBlocks(section)
+            .Any(tb => !string.IsNullOrEmpty(tb.Text) &&
+                       tb.Text.Contains(needle, StringComparison.OrdinalIgnoreCase));
+    }
+
+    private static IEnumerable<TextBlock> EnumerateTextBlocks(Control root)
+    {
+        var stack = new Stack<Control>();
+        stack.Push(root);
+        while (stack.Count > 0)
+        {
+            var c = stack.Pop();
+            if (c is TextBlock tb) yield return tb;
+            // Avalonia's logical-tree walker would do this for us but
+            // pulling in Avalonia.LogicalTree just for this is silly
+            // when every section is built from a known set of panels.
+            switch (c)
+            {
+                case Panel p:
+                    foreach (var ch in p.Children) if (ch is Control cc) stack.Push(cc);
+                    break;
+                case Border b when b.Child is Control bc:
+                    stack.Push(bc);
+                    break;
+                case ContentControl cc when cc.Content is Control cc2:
+                    stack.Push(cc2);
+                    break;
+            }
+        }
+    }
 
     // =====================================================================
     // Profile tab
@@ -526,9 +620,187 @@ public class DOSISettingsScreen : DOSIWindow
         stack.Children.Add(BuildWallpaperFitSection());
         stack.Children.Add(BuildWallpaperBlurSection());
         stack.Children.Add(BuildWindowOpacitySection());
+        stack.Children.Add(BuildTaskbarSection());
+        stack.Children.Add(BuildClockSection());
 
         return WrapInScroller(stack);
     }
+
+    /// <summary>
+    /// Settings for the top taskbar: currently just the height slider
+    /// (24 - 56 px). Future additions (position, auto-hide, density)
+    /// slot in here without restructuring the section. Hidden when no
+    /// user is signed in (per-user preference).
+    /// </summary>
+    private Border BuildTaskbarSection()
+    {
+        if (_user == null)
+        {
+            return BuildSection(
+                "Taskbar",
+                "Sign in to customize the taskbar.");
+        }
+
+        // ===== Position row =====
+        var positionLabel = new TextBlock
+        {
+            Text = "Position",
+            FontSize = 13,
+            FontWeight = FontWeight.SemiBold,
+            Foreground = Accents.TextPrimaryBrush,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+        var positionDropdown = new DOSI.CORE.UIComponents.DOSIDropDown
+        {
+            Width = 160,
+            Height = 30,
+            HorizontalAlignment = HorizontalAlignment.Right
+        };
+        var positionOptions = new (string Label, string Key)[]
+        {
+            ("Top",    UserManager.TaskbarPositionTop),
+            ("Bottom", UserManager.TaskbarPositionBottom)
+        };
+        positionDropdown.SetItems(positionOptions.Select(o => o.Label).ToArray());
+        var currentPos = UserManager.GetUserTaskbarPosition(_user);
+        positionDropdown.SelectedItem = positionOptions.First(o => o.Key == currentPos).Label;
+        positionDropdown.SelectionChanged += (_, label) =>
+        {
+            var match = positionOptions.FirstOrDefault(o => o.Label == label);
+            UserManager.SetUserTaskbarPosition(_user, match.Key);
+        };
+        var positionRow = new Grid
+        {
+            ColumnDefinitions = new ColumnDefinitions("*,Auto"),
+            Margin = new Thickness(0, 4, 0, 4)
+        };
+        positionRow.Children.Add(positionLabel); Grid.SetColumn(positionLabel, 0);
+        positionRow.Children.Add(positionDropdown); Grid.SetColumn(positionDropdown, 1);
+
+        // ===== Height row =====
+        var initial = UserManager.GetUserTaskbarHeight(_user);
+        var valueText = new TextBlock
+        {
+            Text = FormatPx(initial),
+            FontSize = 12,
+            FontWeight = FontWeight.Bold,
+            Foreground = Accents.AccentPrimaryBrush,
+            VerticalAlignment = VerticalAlignment.Center,
+            MinWidth = 48,
+            TextAlignment = TextAlignment.Right
+        };
+        var slider = new DOSISlider
+        {
+            Minimum = UserManager.MinTaskbarHeight,
+            Maximum = UserManager.MaxTaskbarHeight,
+            Step = 1,
+            Value = initial,
+            ValueFormat = "0 px",
+            HorizontalAlignment = HorizontalAlignment.Stretch,
+            Margin = new Thickness(0, 4, 12, 4)
+        };
+        slider.ValueChanged += (_, v) =>
+        {
+            // Live preview: write to TaskbarMetrics so chrome resizes
+            // immediately as the user drags. Persisting on every tick
+            // is fine - SaveUser writes a small JSON file. The setter
+            // pushes back to TaskbarMetrics too, so the live preview
+            // value matches the persisted value with no double-update.
+            DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.Height = v;
+            valueText.Text = FormatPx(v);
+            UserManager.SetUserTaskbarHeight(_user, v);
+        };
+        var heightLabel = new TextBlock
+        {
+            Text = "Height",
+            FontSize = 13,
+            FontWeight = FontWeight.SemiBold,
+            Foreground = Accents.TextPrimaryBrush,
+            Margin = new Thickness(0, 12, 0, 0)
+        };
+        var sliderRow = new Grid
+        {
+            ColumnDefinitions = new ColumnDefinitions("*,Auto"),
+            Margin = new Thickness(0, 2, 0, 0)
+        };
+        sliderRow.Children.Add(slider); Grid.SetColumn(slider, 0);
+        sliderRow.Children.Add(valueText); Grid.SetColumn(valueText, 1);
+
+        var stack = new StackPanel
+        {
+            Orientation = Orientation.Vertical,
+            Spacing = 0,
+            Children = { positionRow, heightLabel, sliderRow }
+        };
+
+        return BuildSection(
+            "Taskbar",
+            "Customize where the taskbar lives and how tall it is. Changes apply live and persist across sessions.",
+            stack);
+    }
+
+    /// <summary>
+    /// Section for the ambient clock + date overlay. One control:
+    /// a four-corner picker (BottomLeft / BottomRight / TopLeft /
+    /// TopRight). Persisted per-user, applies live on both the
+    /// desktop and the login screen.
+    /// </summary>
+    private Border BuildClockSection()
+    {
+        if (_user == null)
+        {
+            return BuildSection(
+                "Clock",
+                "Sign in to choose where the clock lives.");
+        }
+
+        var label = new TextBlock
+        {
+            Text = "Position",
+            FontSize = 13,
+            FontWeight = FontWeight.SemiBold,
+            Foreground = Accents.TextPrimaryBrush,
+            VerticalAlignment = VerticalAlignment.Center
+        };
+
+        var dropdown = new DOSI.CORE.UIComponents.DOSIDropDown
+        {
+            Width = 180,
+            Height = 30,
+            HorizontalAlignment = HorizontalAlignment.Right
+        };
+        var options = new (string Label, string Key)[]
+        {
+            ("Bottom-Left",  UserManager.ClockPositionBottomLeft),
+            ("Bottom-Right", UserManager.ClockPositionBottomRight),
+            ("Top-Left",     UserManager.ClockPositionTopLeft),
+            ("Top-Right",    UserManager.ClockPositionTopRight)
+        };
+        dropdown.SetItems(options.Select(o => o.Label).ToArray());
+        var current = UserManager.GetUserClockPosition(_user);
+        dropdown.SelectedItem = options.First(o => o.Key == current).Label;
+        dropdown.SelectionChanged += (_, selected) =>
+        {
+            var match = options.FirstOrDefault(o => o.Label == selected);
+            UserManager.SetUserClockPosition(_user, match.Key);
+        };
+
+        var row = new Grid
+        {
+            ColumnDefinitions = new ColumnDefinitions("*,Auto"),
+            Margin = new Thickness(0, 4, 0, 4)
+        };
+        row.Children.Add(label); Grid.SetColumn(label, 0);
+        row.Children.Add(dropdown); Grid.SetColumn(dropdown, 1);
+
+        return BuildSection(
+            "Clock",
+            "Where the time + date overlay anchors on the desktop and login screen.",
+            row);
+    }
+
+    private static string FormatPx(double v) =>
+        ((int)Math.Round(v)).ToString(System.Globalization.CultureInfo.InvariantCulture) + " px";
 
     /// <summary>
     /// Raised whenever the user toggles the desktop wallpaper-blur
@@ -744,6 +1016,7 @@ public class DOSISettingsScreen : DOSIWindow
         DOSIAccent.DarkRed => Color.FromRgb(220, 50, 70),
         DOSIAccent.DarkTeal => Color.FromRgb(0, 188, 212),
         DOSIAccent.Light => Color.FromRgb(0, 120, 215),
+        DOSIAccent.Dark => Color.FromRgb(35, 35, 38),
         DOSIAccent.Midnight => Color.FromRgb(100, 100, 255),
         DOSIAccent.RoseGold => Color.FromRgb(183, 110, 121),
         DOSIAccent.Coral => Color.FromRgb(255, 127, 80),
@@ -1350,6 +1623,8 @@ public class DOSISettingsScreen : DOSIWindow
             "Settings applied the next time DAX.OSI starts.",
             startupRow));
 
+        stack.Children.Add(BuildTrashRetentionSection());
+
         // Settings file location
         var pathText = new TextBlock
         {
@@ -1380,6 +1655,101 @@ public class DOSISettingsScreen : DOSIWindow
             usersText));
 
         return WrapInScroller(stack);
+    }
+
+    // =====================================================================
+    // Trash retention (System tab)
+    // =====================================================================
+
+    /// <summary>
+    /// Section that lets the user pick how long deleted items linger in
+    /// the trash before the auto-empty sweep runs (lazy, on next sign-in).
+    /// Backend is in <see cref="FileTrash.SweepUsingUserPreference"/>;
+    /// this is just the UI for the preference key. Hidden when no user
+    /// is signed in (per-user preference, no anonymous default).
+    /// </summary>
+    private Control BuildTrashRetentionSection()
+    {
+        if (_user == null)
+        {
+            return BuildSection(
+                "Trash",
+                "Sign in to manage automatic Trash clean-up.");
+        }
+
+        // Persisted as the integer day count under the well-known
+        // FileTrash.AutoEmptyDaysPreferenceKey. 0 / missing = keep
+        // forever (matches the sweep helper's "<=0 is no-op" contract).
+        int currentDays = 0;
+        if (_user.Preferences.TryGetValue(FileTrash.AutoEmptyDaysPreferenceKey, out var raw) &&
+            int.TryParse(raw, out var parsed) && parsed > 0)
+        {
+            currentDays = parsed;
+        }
+
+        var options = new (string Label, int Days)[]
+        {
+            ("Keep forever", 0),
+            ("Empty after 7 days", 7),
+            ("Empty after 14 days", 14),
+            ("Empty after 30 days", 30),
+            ("Empty after 90 days", 90)
+        };
+
+        var dropdown = new DOSI.CORE.UIComponents.DOSIDropDown
+        {
+            Width = 220,
+            Height = 30,
+            HorizontalAlignment = HorizontalAlignment.Left
+        };
+        dropdown.SetItems(options.Select(o => o.Label).ToArray());
+        dropdown.SelectedItem = options.First(o => o.Days == currentDays).Label;
+        dropdown.SelectionChanged += (_, label) =>
+        {
+            var match = options.FirstOrDefault(o => o.Label == label);
+            int days = match.Days;
+            if (days <= 0)
+            {
+                _user.Preferences.Remove(FileTrash.AutoEmptyDaysPreferenceKey);
+            }
+            else
+            {
+                _user.Preferences[FileTrash.AutoEmptyDaysPreferenceKey] =
+                    days.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            }
+            UserManager.SaveUser(_user);
+            // Best-effort immediate sweep so a user who just lowered the
+            // retention sees the result without having to sign out and
+            // back in. Off-thread because a deep delete on a giant
+            // recursive folder shouldn't block the settings UI.
+            System.Threading.Tasks.Task.Run(() =>
+            {
+                try { FileTrash.SweepUsingUserPreference(_user); }
+                catch { /* sweep is best-effort */ }
+            });
+        };
+
+        var description = new TextBlock
+        {
+            Text = "Items older than this are permanently deleted next time you sign in. " +
+                   "Choose 'Keep forever' to disable automatic clean-up.",
+            FontSize = 11,
+            Foreground = Accents.TextSecondaryBrush,
+            TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(0, 6, 0, 0)
+        };
+
+        var rowStack = new StackPanel
+        {
+            Orientation = Orientation.Vertical,
+            Spacing = 4,
+            Children = { dropdown, description }
+        };
+
+        return BuildSection(
+            "Trash",
+            "Automatically empty deleted items after a set period.",
+            rowStack);
     }
 
     // =====================================================================

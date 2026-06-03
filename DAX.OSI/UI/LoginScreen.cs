@@ -132,7 +132,12 @@ public class LoginScreen : DOSIScreen
         _clockStack = new StackPanel
         {
             Orientation = Orientation.Vertical,
-            Margin = new Thickness(36, 0, 0, 28),
+            // Lifted a little (28 -> 50) so the clock breathes off the
+            // bottom edge AND lands at the same on-screen Y as the
+            // desktop's clock, which is also at 50 px from the bottom.
+            // Visual continuity through sign-in: the clock appears to
+            // not move at all as the screen swaps under it.
+            Margin = new Thickness(36, 0, 0, 50),
             HorizontalAlignment = HorizontalAlignment.Left,
             VerticalAlignment = VerticalAlignment.Bottom,
             Spacing = 2,
@@ -533,12 +538,19 @@ public class LoginScreen : DOSIScreen
         {
             Accents.AccentChanged += OnAccentChanged;
             UserManager.UserCreated += OnUserCreated;
+            DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.ClockPositionChanged += OnClockPositionChanged;
+            // Apply the saved corner the moment we mount - if a user
+            // signed out with the clock in the bottom-right, the login
+            // screen should match (visual continuity across sign-in /
+            // sign-out boundaries).
+            ApplyClockLayout();
             _clockTimer.Start();
         };
         DetachedFromVisualTree += (_, _) =>
         {
             Accents.AccentChanged -= OnAccentChanged;
             UserManager.UserCreated -= OnUserCreated;
+            DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.ClockPositionChanged -= OnClockPositionChanged;
             _clockTimer.Stop();
             // Snap any in-flight tweens to their final state. Critical for
             // the brief screen-manager reparent that happens at the end of
@@ -1118,10 +1130,19 @@ public class LoginScreen : DOSIScreen
         from.IsHitTestVisible = false;
         to.IsHitTestVisible   = false;
 
-        // Defensive: clear any leftover transform from a prior animation so
-        // neither panel can accidentally start off-position.
-        from.RenderTransform = null;
-        to.RenderTransform   = null;
+        // Direction: picker -> sign-in is "forward" (slide leftward),
+        // sign-in -> picker is "backward" (slide rightward). The motion
+        // is small (16 px) - just enough that the cross-fade doesn't
+        // read as a flat dissolve. The picker step IS the picker, the
+        // sign-in step IS the sign-in - showing them advance / retreat
+        // gives the user a sense of being IN a sign-in flow rather
+        // than watching two card states swap.
+        const double slideDistance = 16d;
+        bool forward = ReferenceEquals(from, _pickerPanel);
+        var fromTranslate = new TranslateTransform(0, 0);
+        var toTranslate = new TranslateTransform(forward ? slideDistance : -slideDistance, 0);
+        from.RenderTransform = fromTranslate;
+        to.RenderTransform = toTranslate;
 
         from.Opacity = 1;
         to.Opacity   = 0;
@@ -1131,11 +1152,18 @@ public class LoginScreen : DOSIScreen
             {
                 from.Opacity = 1 - t;
                 to.Opacity   = t;
+                // Outgoing slides FURTHER in the same direction the
+                // incoming came from, so they appear to physically
+                // swap places rather than fade in the same cell.
+                fromTranslate.X = (forward ? -slideDistance : slideDistance) * t;
+                toTranslate.X   = (forward ? slideDistance : -slideDistance) * (1 - t);
             },
             onCompleted: () =>
             {
                 from.Opacity = 0;
                 to.Opacity   = 1;
+                from.RenderTransform = null;
+                to.RenderTransform = null;
                 to.IsHitTestVisible = true;
                 _panelFadeFrom = null;
                 _panelFadeTo   = null;
@@ -1236,9 +1264,53 @@ public class LoginScreen : DOSIScreen
     private void UpdateClock()
     {
         var now = DateTime.Now;
+        // Match DesktopScreen exactly so the clock looks identical on
+        // both screens - no seconds (would feel busy in chrome) and the
+        // same long-form date underneath.
         _clockText.Text = now.ToString("h:mm tt");
         _dateText.Text = now.ToString("dddd, MMMM d");
     }
+
+    /// <summary>
+    /// Re-anchors <see cref="_clockStack"/> to the user-preferred
+    /// corner. Mirrors DesktopScreen.ApplyClockLayout so the login
+    /// clock lands at the same on-screen Y as the desktop clock for
+    /// any of the four corner choices - keeps sign-in feeling like
+    /// the screens never moved the clock at all.
+    /// </summary>
+    private void ApplyClockLayout()
+    {
+        if (_clockStack == null) return;
+        var pos = DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.ClockPosition;
+        bool top = pos == DOSI.CORE.UIComponents.WindowManagement.ClockPosition.TopLeft
+                || pos == DOSI.CORE.UIComponents.WindowManagement.ClockPosition.TopRight;
+        bool left = pos == DOSI.CORE.UIComponents.WindowManagement.ClockPosition.TopLeft
+                 || pos == DOSI.CORE.UIComponents.WindowManagement.ClockPosition.BottomLeft;
+
+        // Login screen has no taskbar so the lift is a flat 50 px on
+        // whichever edge - matches DesktopScreen.ComputeClockLayout
+        // when no taskbar shares that edge.
+        const double topLift = 50;
+        const double bottomLift = 50;
+        const double sideMargin = 36;
+
+        _clockStack.HorizontalAlignment = left ? HorizontalAlignment.Left : HorizontalAlignment.Right;
+        _clockStack.VerticalAlignment = top ? VerticalAlignment.Top : VerticalAlignment.Bottom;
+        _clockStack.Margin = new Thickness(
+            left ? sideMargin : 0,
+            top ? topLift : 0,
+            left ? 0 : sideMargin,
+            top ? 0 : bottomLift);
+
+        var textAlign = left ? TextAlignment.Left : TextAlignment.Right;
+        _clockText.HorizontalAlignment = _clockStack.HorizontalAlignment;
+        _clockText.TextAlignment = textAlign;
+        _dateText.HorizontalAlignment = _clockStack.HorizontalAlignment;
+        _dateText.TextAlignment = textAlign;
+    }
+
+    private void OnClockPositionChanged(object? sender,
+        DOSI.CORE.UIComponents.WindowManagement.ClockPosition pos) => ApplyClockLayout();
 
     private LinearGradientBrush BuildAvatarBrush() => new()
     {
@@ -1433,6 +1505,7 @@ internal static class InitialStartup_AccentColors
         DOSIAccent.DarkRed => (Color.FromRgb(220, 50, 70), Color.FromRgb(170, 30, 50)),
         DOSIAccent.DarkTeal => (Color.FromRgb(0, 188, 212), Color.FromRgb(0, 140, 160)),
         DOSIAccent.Light => (Color.FromRgb(0, 120, 215), Color.FromRgb(0, 90, 170)),
+        DOSIAccent.Dark => (Color.FromRgb(120, 160, 220), Color.FromRgb(85, 120, 175)),
         DOSIAccent.Midnight => (Color.FromRgb(100, 100, 255), Color.FromRgb(70, 70, 200)),
         DOSIAccent.RoseGold => (Color.FromRgb(183, 110, 121), Color.FromRgb(150, 85, 95)),
         DOSIAccent.Coral => (Color.FromRgb(255, 127, 80), Color.FromRgb(210, 100, 60)),

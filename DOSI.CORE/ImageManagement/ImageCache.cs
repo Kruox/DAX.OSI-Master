@@ -114,11 +114,26 @@ public static class ImageCache
         }
         if (maxDimension <= 0) maxDimension = ViewMaxDimension;
 
-        // Fast path: already cached - skip the Task hop.
+        // Fast path: already cached. POST the callback through the
+        // dispatcher (don't invoke it synchronously) so callers can rely
+        // on the same timing contract as a cache miss: "the callback
+        // fires AFTER you've finished wiring the receiving control into
+        // the visual tree."
+        //
+        // Why: most callers build an Image, hand it to LoadAsync, and
+        // only THEN add it to a parent panel. A synchronous cache-hit
+        // callback fires while img.Parent is still null, so any "is the
+        // host still alive?" guard inside the callback (e.g.
+        // DOSIFileExplorer's details preview, the wallpaper tile loader)
+        // rejects the assign and the image silently never appears. This
+        // exact race was the cause of "click an image, preview shows;
+        // click out, click again, preview is blank" - the second click
+        // hits the warm cache and invokes the callback synchronously
+        // before UpdateDetailsContent has parented the Image control.
         var key = KeyFor(path, maxDimension);
         if (_cache.TryGetValue(key, out var cached))
         {
-            onLoaded(cached);
+            Avalonia.Threading.Dispatcher.UIThread.Post(() => onLoaded(cached));
             return;
         }
 

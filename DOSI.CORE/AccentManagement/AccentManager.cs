@@ -347,6 +347,7 @@ public sealed class AccentManager
         DOSIAccent.DarkRed => 30,
         DOSIAccent.DarkTeal => 25,
         DOSIAccent.Light => 240,
+        DOSIAccent.Dark => 22,
         _ => 25
     };
 
@@ -386,6 +387,7 @@ public sealed class AccentManager
         DOSIAccent.DarkRed => "Dark Red",
         DOSIAccent.DarkTeal => "Dark Teal",
         DOSIAccent.Light => "Light",
+        DOSIAccent.Dark => "Dark",
         DOSIAccent.Midnight => "Midnight",
         DOSIAccent.RoseGold => "Rose Gold",
         DOSIAccent.Coral => "Coral",
@@ -541,6 +543,26 @@ public sealed class AccentManager
             ListBg: Rgb(252, 253, 255), ListHover: Rgb(235, 240, 248), ListSelectedUnfocused: Rgb(208, 215, 228),
             Desktop1: Rgb(180, 200, 225), Desktop2: Rgb(155, 180, 215), Desktop3: Rgb(168, 190, 220),
             Shadow: Rgba(0, 0, 0, 50)),
+
+        // Dark - the neutral counterpart to Light. Pure greyscale chrome
+        // with no color tint anywhere - distinct from Midnight (blue
+        // undertone), Charcoal (slate-blue undertone), and Onyx (very
+        // near-black). Darker than the auto-tinted dark accents so it
+        // reads as "true dark mode" rather than an accent color over
+        // dark chrome. Accent is a soft white-blue so highlights stay
+        // visible without introducing a color cast on the chrome.
+        DOSIAccent.Dark => new(
+            Accent: Rgb(120, 160, 220), AccentDark: Rgb(85, 120, 175),
+            WinBg: Rgb(20, 20, 22), WinBorderUnfocused: Rgb(40, 40, 42),
+            Chrome: Rgb(16, 16, 18), ChromeUnfocused: Rgb(24, 24, 26), Content: Rgb(13, 13, 15),
+            TextPrimary: Rgb(238, 240, 245), TextSecondary: Rgb(160, 162, 170),
+            TextDisabled: Rgb(95, 97, 105), TextOnAccent: Rgb(255, 255, 255),
+            CtrlBg: Rgb(28, 28, 30), CtrlHover: Rgb(42, 42, 45),
+            CtrlPressed: Rgb(22, 22, 24), CtrlBorder: Rgb(56, 56, 60),
+            BtnBg: Rgb(30, 30, 32), BtnHover: Rgb(45, 45, 48), BtnPressed: Rgb(24, 24, 26),
+            ListBg: Rgb(14, 14, 16), ListHover: Rgb(34, 34, 36), ListSelectedUnfocused: Rgb(46, 46, 48),
+            Desktop1: Rgb(12, 12, 14), Desktop2: Rgb(20, 20, 22), Desktop3: Rgb(15, 15, 17),
+            Shadow: Rgba(0, 0, 0, 130)),
 
         DOSIAccent.Midnight => new(
             Accent: Rgb(100, 100, 255), AccentDark: Rgb(70, 70, 200),
@@ -1539,6 +1561,7 @@ public enum DOSIAccent
     DarkRed,
     DarkTeal,
     Light,
+    Dark,
     Midnight,
     // New accents
     RoseGold,

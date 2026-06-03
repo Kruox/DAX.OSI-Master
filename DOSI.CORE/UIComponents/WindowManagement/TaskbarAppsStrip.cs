@@ -339,7 +339,18 @@ public sealed class TaskbarAppsStrip : Border
         };
         chip.PointerPressed += (_, e) =>
         {
-            if (!e.GetCurrentPoint(chip).Properties.IsLeftButtonPressed) return;
+            var props = e.GetCurrentPoint(chip).Properties;
+            if (props.IsRightButtonPressed)
+            {
+                // Right-click opens the per-app context menu so users
+                // can Restore / Minimize / Close without having to
+                // switch focus into the window first - matches every
+                // mainstream taskbar's affordance.
+                e.Handled = true;
+                OpenChipContextMenu(chip, window);
+                return;
+            }
+            if (!props.IsLeftButtonPressed) return;
             e.Handled = true;
             ClosePreview(immediate: true);
             ActivateChip(window);
@@ -375,6 +386,78 @@ public sealed class TaskbarAppsStrip : Border
 
         mgr.BringToFront(window);
         mgr.SetFocus(window);
+    }
+
+    /// <summary>
+    /// Builds and shows a per-chip context menu (Restore / Minimize /
+    /// Close) anchored to the chip. Hooks each item up to the same
+    /// WindowManager helpers <see cref="ActivateChip"/> uses so the
+    /// state transitions stay consistent across left-click and
+    /// right-click paths.
+    /// </summary>
+    private void OpenChipContextMenu(Border chip, DOSIWindow window)
+    {
+        var mgr = _boundManager;
+        if (mgr == null) return;
+
+        // Close any other DOSI context menu before opening ours. Without
+        // this, right-clicking a taskbar chip then right-clicking the
+        // desktop would leave both menus visible - the global tracker
+        // dismisses the prior menu cleanly.
+        DOSIContextMenu.CloseAllOpen();
+
+        var menu = new DOSIContextMenu();
+        bool isMinimized = window.WindowState == DOSIWindowState.Minimized;
+
+        var restoreItem = new MenuItem
+        {
+            Header = isMinimized ? "Restore" : "Bring to front"
+        };
+        restoreItem.Click += (_, _) =>
+        {
+            if (window.WindowState == DOSIWindowState.Minimized) window.Restore();
+            mgr.BringToFront(window);
+            mgr.SetFocus(window);
+        };
+        menu.Items.Add(restoreItem);
+
+        if (!isMinimized)
+        {
+            var minimizeItem = new MenuItem { Header = "Minimize" };
+            minimizeItem.Click += (_, _) => window.WindowState = DOSIWindowState.Minimized;
+            menu.Items.Add(minimizeItem);
+        }
+
+        // Maximize / Restore size toggle - only meaningful on resizable
+        // windows; we skip it for fixed-size windows (CanResize == false)
+        // because clicking it would surprise the user.
+        if (window.CanResize)
+        {
+            var maxItem = new MenuItem
+            {
+                Header = window.WindowState == DOSIWindowState.Maximized
+                    ? "Restore size"
+                    : "Maximize"
+            };
+            maxItem.Click += (_, _) =>
+            {
+                window.WindowState = window.WindowState == DOSIWindowState.Maximized
+                    ? DOSIWindowState.Normal
+                    : DOSIWindowState.Maximized;
+                mgr.BringToFront(window);
+                mgr.SetFocus(window);
+            };
+            menu.Items.Add(maxItem);
+        }
+
+        menu.Items.Add(new Separator());
+
+        var closeItem = new MenuItem { Header = "Close" };
+        closeItem.Click += (_, _) => mgr.CloseWindow(window);
+        menu.Items.Add(closeItem);
+
+        chip.ContextMenu = menu;
+        menu.Open(chip);
     }
 
     private void RefreshActiveTint()

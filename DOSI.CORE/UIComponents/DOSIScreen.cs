@@ -502,7 +502,34 @@ public abstract class DOSIScreen : UserControl
     {
         var desired = ResolveWallpaperBitmap();
         if (ReferenceEquals(GetLayerSource(_wallpaperFront), desired)) return;
-        AnimateWallpaperTransition(desired);
+        // Screen-level cross-fade already covered the visible change
+        // for us, so any wallpaper-bitmap delta we detect AT this point
+        // doesn't need its own ~550ms cross-fade - that's where the
+        // "wallpapers visibly adjust themselves a beat after sign-in"
+        // symptom came from. Snapping the front layer to the desired
+        // bitmap is invisible to the user (the screen-level fade has
+        // just finished; nothing else is moving) AND keeps secondary
+        // monitors that follow WallpaperSyncBroadcast in lockstep,
+        // because they receive a single final-frame sync packet
+        // instead of an out-of-phase tail-end animation.
+        SetWallpaperFrontSourceImmediate(desired);
+        // Broadcast a final sync frame so follower screens flip in the
+        // same compositor tick as us (master), preventing the visible
+        // "primary already settled, secondaries still fading" tearing
+        // the original animation path produced.
+        if (IsWallpaperBroadcaster)
+        {
+            try
+            {
+                WallpaperSyncBroadcast?.Invoke(this,
+                    new WallpaperSyncFrame(desired,
+                        FrontOpacity: desired != null ? 1 : 0,
+                        BackOpacity: 0,
+                        UseFrontForTarget: true,
+                        IsFinal: true));
+            }
+            catch { /* never let a listener break the primary handoff */ }
+        }
     }
 
     /// <summary>

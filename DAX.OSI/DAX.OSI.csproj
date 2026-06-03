@@ -12,6 +12,8 @@
     <AnalysisLevel>latest</AnalysisLevel>
     <AnalysisMode>Recommended</AnalysisMode>
     <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
+    <Description>Developer API Operating System Interface.</Description>
+    <AssemblyVersion>1.0.2.1</AssemblyVersion>
   </PropertyGroup>
 
   <ItemGroup>
