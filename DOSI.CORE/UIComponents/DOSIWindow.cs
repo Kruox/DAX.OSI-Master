@@ -196,7 +196,13 @@ public class DOSIWindow : UserControl
         // on the CURRENT monitor.
         set
         {
-            var inset = OwnerManager?.TopWorkAreaInset ?? 0;
+            // Immersive fullscreen intentionally fills the entire desktop
+            // canvas (taskbar's reserved area included) - the taskbar is
+            // hidden for the duration. Without this bypass, setting Y=0
+            // here gets clamped UP to TopWorkAreaInset and the window
+            // starts a taskbar-height below the screen top, which looks
+            // exactly like the taskbar is still occupying that space.
+            var inset = _isImmersiveFullScreen ? 0 : (OwnerManager?.TopWorkAreaInset ?? 0);
             var clamped = (value >= 0 && value < inset) ? inset : value;
             Canvas.SetTop(this, clamped - ShadowMargin);
         }
