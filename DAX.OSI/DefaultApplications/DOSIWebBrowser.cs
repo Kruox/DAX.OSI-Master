@@ -62,6 +62,14 @@ public class DOSIWebBrowser : DOSIWindow
     private bool _isExternalPage;
     private bool _isFullScreen;
 
+    // Saved native (host OS) window state from before we forced FullScreen.
+    // The browser's fullscreen has two layers: the inner DOSIWindow expands to
+    // fill the simulated desktop, AND the real Avalonia Window goes FullScreen
+    // so the user's actual Windows taskbar / host title bar are hidden too -
+    // otherwise "fullscreen" still leaves real-OS chrome on screen.
+    private Avalonia.Controls.Window? _hostWindow;
+    private Avalonia.Controls.WindowState? _savedHostWindowState;
+
     // ----- Tabbed browsing -----
     // Each BrowserTab snapshots the per-tab navigation state (url + history +
     // webview + rendered content). The instance fields above always mirror
@@ -750,6 +758,18 @@ public class DOSIWebBrowser : DOSIWindow
         _tabStripContainer.IsVisible = false;
         _toolbarBorder.IsVisible = false;
         _statusBar.IsVisible = false;
+
+        // ALSO drive the real host OS window into native fullscreen so the
+        // user's actual Windows taskbar and the host title bar disappear.
+        // Without this, "fullscreen video" still has a Windows taskbar
+        // strip + window chrome visible at the edges of the monitor, which
+        // is what users mean when they say "this isn't actual fullscreen".
+        _hostWindow = Avalonia.Controls.TopLevel.GetTopLevel(this) as Avalonia.Controls.Window;
+        if (_hostWindow != null)
+        {
+            _savedHostWindowState = _hostWindow.WindowState;
+            _hostWindow.WindowState = Avalonia.Controls.WindowState.FullScreen;
+        }
     }
 
     /// <summary>
@@ -769,6 +789,16 @@ public class DOSIWebBrowser : DOSIWindow
         _tabStripContainer.IsVisible = true;
         _toolbarBorder.IsVisible = true;
         _statusBar.IsVisible = true;
+
+        // Restore the host OS window to whatever state it was in before we
+        // forced it into FullScreen on enter. If the user had it Maximized
+        // they get Maximized back, etc.
+        if (_hostWindow != null && _savedHostWindowState.HasValue)
+        {
+            _hostWindow.WindowState = _savedHostWindowState.Value;
+        }
+        _hostWindow = null;
+        _savedHostWindowState = null;
 
         // Drive the page out of HTML5 fullscreen too so YouTube etc. update
         // their player UI to match. notifyPage is false when the page itself
