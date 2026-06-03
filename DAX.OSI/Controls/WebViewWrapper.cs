@@ -1453,6 +1453,41 @@ public class WebViewWrapper : UserControl, IDisposable
             try { e.preventDefault(); e.stopPropagation(); } catch (err) {}
         }
     }, true);
+
+    // Double-click on a <video> toggles fullscreen. Native YouTube does this
+    // via Element.requestFullscreen() which our shim already handles, but
+    // some embedded players (and YT in some UA-detected modes) skip the
+    // API and just toggle their own CSS - leaving DOSI's simulated taskbar
+    // hovering over the player. We intercept dblclick globally and route
+    // it through enter()/exit() so the host C# side ALWAYS gets the
+    // dosi-fullscreen message and hides its chrome accordingly.
+    document.addEventListener('dblclick', function(e) {
+        try {
+            var t = e.target;
+            // Walk up a few levels in case the click landed on an overlay
+            // child of the <video> (player controls, captions overlay).
+            var v = null;
+            for (var n = t, hops = 0; n && hops < 5; n = n.parentNode, hops++) {
+                if (n.tagName === 'VIDEO') { v = n; break; }
+            }
+            if (!v && fsElement && fsElement.tagName === 'VIDEO') v = fsElement;
+            if (!v) return;
+
+            if (fsElement) {
+                exit();
+            } else {
+                // Prefer fullscreening the player container (so player controls
+                // remain interactive), falling back to the <video> itself.
+                var target = v;
+                for (var p = v.parentElement, hops2 = 0; p && hops2 < 4; p = p.parentElement, hops2++) {
+                    var cls = (p.className || '') + '';
+                    if (cls.indexOf('player') >= 0 || cls.indexOf('html5-video') >= 0) { target = p; break; }
+                }
+                enter(target);
+            }
+            try { e.preventDefault(); e.stopPropagation(); } catch (err) {}
+        } catch (err) {}
+    }, true);
 })();
 ";
 
