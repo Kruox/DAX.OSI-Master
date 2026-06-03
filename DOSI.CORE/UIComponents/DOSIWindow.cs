@@ -2296,7 +2296,7 @@ public class DOSIWindow : UserControl
         // windows feel disabled. Skipped while a drag/resize/animation
         // is in flight - changing alpha mid-tween would jitter the
         // composite.
-        if (!_isAnimating)
+        if (!_isAnimating && _windowBorder != null)
         {
             _windowBorder.Opacity = _isFocused ? 1.0 : 0.92;
         }

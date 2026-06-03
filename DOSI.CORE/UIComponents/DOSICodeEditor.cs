@@ -935,7 +935,7 @@ public class DOSICodeEditor : Control
         if (HasSelection) DeleteSelection();
 
         // Multi-line paste: split on newline so each piece goes onto its own line.
-        if (text.IndexOf('\n') >= 0)
+        if (text.Contains('\n'))
         {
             var pieces = text.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
             var line = _lines[_caretLine];

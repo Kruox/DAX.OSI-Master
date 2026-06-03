@@ -644,8 +644,10 @@ public class DesktopScreen : DOSIScreen
             // inset on the right canvas in a multi-monitor setup.
             var detachWm = _ownerHost?.WindowManager ?? WindowManager.Instance;
             if (detachWm != null)
+            {
                 detachWm.TopWorkAreaInset = 0;
                 detachWm.BottomWorkAreaInset = 0;
+            }
 
             DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.HeightChanged -= OnTaskbarHeightChanged;
             DOSI.CORE.UIComponents.WindowManagement.TaskbarMetrics.PositionChanged -= OnTaskbarPositionChanged;
